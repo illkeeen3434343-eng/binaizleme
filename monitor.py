@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Apartment monitor for Bina.az -> Telegram.
-Tracks new listings and highlights price drops/updates.
-Memory lives in seen.json via the GitHub Contents API.
+Exclusively tracks:
+  1. Price drops
+  2. Price increases
+  3. Field modifications on existing listings (rooms, area, floor, etc.)
 """
 import base64
 import datetime as dt
@@ -16,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 # --------------------------------------------------------------------------- #
-# SEARCH URL & SOURCES (Exclusively Bina.az)
+# SEARCH URL & CONFIGURATIONS
 # --------------------------------------------------------------------------- #
 BINA_SEARCH_URL = os.environ.get(
     "BINA_SEARCH_URL",
@@ -33,7 +35,6 @@ SOURCES = [
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": ""}
 ]
 
-# Bina.az GraphQL configuration
 CITY_ID = os.environ.get("BINA_CITY_ID", "1")
 CATEGORY_ID = os.environ.get("BINA_CATEGORY_ID", "1")
 PERSISTED_HASH = os.environ.get(
@@ -46,18 +47,13 @@ SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
 SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "6"))
 
-# General configurations
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 MAX_SEEN = 8000
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
 
-# Price-drop settings
-PRICE_DROP_MIN_ABS = int(os.environ.get("PRICE_DROP_MIN_ABS", "0"))  # Ignore drop <= 0 AZN
-DROP_ANOMALY_FLOOR = float(
-    os.environ.get("DROP_ANOMALY_FLOOR", "0.4")
-)  # Filter out anomalies (>60% drop)
+PRICE_DROP_MIN_ABS = int(os.environ.get("PRICE_DROP_MIN_ABS", "0"))
+DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))
 
-# Telegram and GitHub settings
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -65,7 +61,6 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()
 GH_REPO = os.environ.get("GH_REPO", "").strip()
 GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip()
 USE_API = bool(GH_TOKEN and GH_REPO)
-IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -169,7 +164,6 @@ def bina_filter_vars(url):
         f["hasBillOfSale"] = b(one("has_bill_of_sale"))
     if b(one("has_mortgage")) is not None:
         f["hasMortgage"] = b(one("has_mortgage"))
-
     if one("floor_first") is not None:
         f["floorFirst"] = b(one("floor_first"))
     if one("floor_last") is not None:
@@ -229,42 +223,8 @@ def _bina_node(node):
     }
 
 
-def bina_check(url):
-    q = parse_qs(urlparse(url).query)
-
-    def one(k):
-        v = q.get(k)
-        return v[0] if v else None
-
-    def i(v):
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
-    return {
-        "rooms": {i(v) for v in q.get("room_ids[]", []) if i(v) is not None},
-        "locs": {i(v) for v in q.get("location_ids[]", []) if i(v) is not None},
-        "price_to": i(one("price_to")),
-        "area_from": float(one("area_from")) if one("area_from") else None,
-    }
-
-
-def bina_passes(l, c):
-    if c["rooms"] and l.get("rooms") not in c["rooms"]:
-        return False
-    if c["price_to"] is not None and (l.get("price") is None or l["price"] > c["price_to"]):
-        return False
-    if c["area_from"] is not None and (l.get("area") is None or l["area"] < c["area_from"]):
-        return False
-    if c["locs"] and (l.get("location_id") is None or l["location_id"] not in c["locs"]):
-        return False
-    return True
-
-
 def fetch_bina(url):
     fv = bina_filter_vars(url)
-    check = bina_check(url)
     out, cursor = [], None
 
     for _ in range(SCAN_PAGES):
@@ -290,9 +250,7 @@ def fetch_bina(url):
             node = edge.get("node")
             if node and node.get("id") is not None:
                 try:
-                    l = _bina_node(node)
-                    if bina_passes(l, check):
-                        out.append(l)
+                    out.append(_bina_node(node))
                 except Exception as e:
                     log("Skip node error:", e)
 
@@ -305,7 +263,7 @@ def fetch_bina(url):
 
 
 # --------------------------------------------------------------------------- #
-# State & GitHub Persistence
+# State & Persistence
 # --------------------------------------------------------------------------- #
 def _gh_headers():
     return {
@@ -379,14 +337,7 @@ def save_state(state, sha):
                 latest.setdefault("listings", {})
 
                 for k, v in state["listings"].items():
-                    if k not in latest["listings"]:
-                        latest["listings"][k] = v
-                    else:
-                        ours = v.get("price")
-                        theirs = latest["listings"][k].get("price")
-                        if isinstance(ours, (int, float)) and isinstance(theirs, (int, float)) and ours < theirs:
-                            latest["listings"][k]["price"] = ours
-                            latest["listings"][k]["price_dropped_at"] = v.get("price_dropped_at")
+                    latest["listings"][k] = v
 
                 if state.get("source_status"):
                     latest["source_status"] = state["source_status"]
@@ -416,7 +367,7 @@ def body_bytes(state, sha):
 
 
 # --------------------------------------------------------------------------- #
-# Notifications Formatting
+# Modification Tracking & Formatting
 # --------------------------------------------------------------------------- #
 def _fmt_pub(v):
     if not v:
@@ -427,21 +378,81 @@ def _fmt_pub(v):
         return str(v)
 
 
-def format_message(l, source_name, kind="new", old_price=None):
+def detect_changes(old_data, new_item):
+    """
+    Compares the existing record against the freshly fetched listing.
+    Returns: (kind, changes_dict)
+    kind options: 'drop', 'increase', 'modified', or None
+    """
+    changes = {}
+
+    # 1. Price checks
+    old_p = old_data.get("price")
+    new_p = new_item.get("price")
+
+    if isinstance(old_p, (int, float)) and isinstance(new_p, (int, float)) and old_p != new_p:
+        diff = new_p - old_p
+        if new_p < old_p:
+            if (old_p - new_p) >= PRICE_DROP_MIN_ABS and new_p >= (old_p * DROP_ANOMALY_FLOOR):
+                return "drop", {"old_price": old_p, "new_price": new_p, "diff": abs(diff)}
+        else:
+            return "increase", {"old_price": old_p, "new_price": new_p, "diff": diff}
+
+    # 2. Field modifications check
+    field_labels = {
+        "rooms": "Rooms",
+        "area": "Area",
+        "floor": "Floor",
+        "floors": "Total Floors",
+        "has_bill_of_sale": "Kupça",
+        "has_mortgage": "Mortgage",
+        "has_repair": "Repair Status",
+        "location": "Location",
+    }
+
+    for key, label in field_labels.items():
+        old_val = old_data.get(key)
+        new_val = new_item.get(key)
+        if old_val is not None and new_val is not None and old_val != new_val:
+            changes[label] = (old_val, new_val)
+
+    if changes:
+        return "modified", changes
+
+    return None, {}
+
+
+def format_message(l, source_name, kind, change_details):
+    cur = l.get("currency", "AZN")
+
     if kind == "drop":
         lines = [f"🔻 <b>PRICE DROP</b> · {html.escape(source_name)}", ""]
-    else:
-        lines = [f"🏠 <b>NEW APARTMENT FOUND</b> · {html.escape(source_name)}", ""]
-
-    cur = l.get("currency", "AZN")
-    if kind == "drop" and isinstance(old_price, (int, float)) and l.get("price") is not None:
-        diff = int(old_price) - int(l["price"])
+        old_p = change_details["old_price"]
+        new_p = change_details["new_price"]
+        diff = change_details["diff"]
         lines.append(
-            f"💰 <b>Price:</b> <s>{int(old_price):,}</s> → <b>{l['price']:,}</b> {cur} (−{diff:,})".replace(",", " ")
+            f"💰 <b>Price:</b> <s>{old_p:,}</s> → <b>{new_p:,}</b> {cur} (−{diff:,})".replace(",", " ")
         )
-    elif l.get("price") is not None:
-        lines.append(f"💰 <b>Price:</b> {l['price']:,} {cur}".replace(",", " "))
 
+    elif kind == "increase":
+        lines = [f"🔺 <b>PRICE INCREASE</b> · {html.escape(source_name)}", ""]
+        old_p = change_details["old_price"]
+        new_p = change_details["new_price"]
+        diff = change_details["diff"]
+        lines.append(
+            f"💰 <b>Price:</b> <s>{old_p:,}</s> → <b>{new_p:,}</b> {cur} (+{diff:,})".replace(",", " ")
+        )
+
+    elif kind == "modified":
+        lines = [f"✏️ <b>LISTING MODIFIED</b> · {html.escape(source_name)}", ""]
+        lines.append("<b>What changed:</b>")
+        for field, (old_v, new_v) in change_details.items():
+            lines.append(f"  • <b>{field}:</b> <s>{old_v}</s> → <b>{new_v}</b>")
+        lines.append("")
+        if l.get("price") is not None:
+            lines.append(f"💰 <b>Current Price:</b> {l['price']:,} {cur}".replace(",", " "))
+
+    # General overview details
     lines.append(f"🛏 <b>Rooms:</b> {l.get('rooms') if l.get('rooms') is not None else '-'}")
 
     if l.get("area") is not None:
@@ -450,51 +461,24 @@ def format_message(l, source_name, kind="new", old_price=None):
 
     if l.get("floor") and l.get("floors"):
         lines.append(f"🏢 <b>Floor:</b> {l['floor']}/{l['floors']}")
-    elif l.get("floor"):
-        lines.append(f"🏢 <b>Floor:</b> {l['floor']}")
 
     if l.get("location"):
         lines.append(f"📍 <b>Location:</b> {html.escape(str(l['location']))}")
 
     pub = _fmt_pub(l.get("updated_at"))
     if pub:
-        label = "Updated" if kind == "drop" else "Published"
-        lines.append(f"📅 <b>{label}:</b> {html.escape(pub)}")
-
-    tags = [
-        t
-        for t, on in (
-            ("kupçalı", l.get("has_bill_of_sale")),
-            ("ipoteka", l.get("has_mortgage")),
-            ("təmirli", l.get("has_repair")),
-        )
-        if on
-    ]
-    if tags:
-        lines.append("✅ " + ", ".join(tags))
+        lines.append(f"📅 <b>Updated:</b> {html.escape(pub)}")
 
     lines.append("")
     lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
     return "\n".join(lines)
 
 
-def notify(l, source_name, kind="new", old_price=None):
-    text = format_message(l, source_name, kind=kind, old_price=old_price)
+def notify(l, source_name, kind, change_details):
+    text = format_message(l, source_name, kind, change_details)
     if SEND_PHOTOS and l.get("photo"):
         return tg_send_photo(l["photo"], text)
     return tg_send_message(text)
-
-
-def is_real_drop(old_price, new_price):
-    if not isinstance(old_price, (int, float)) or not isinstance(new_price, (int, float)):
-        return False
-    if new_price <= 0 or new_price >= old_price:
-        return False
-    if (old_price - new_price) < PRICE_DROP_MIN_ABS:
-        return False
-    if new_price < old_price * DROP_ANOMALY_FLOOR:
-        return False
-    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -503,45 +487,24 @@ def is_real_drop(old_price, new_price):
 def process_source(items, source, seen):
     prefix, name = source["prefix"], source["name"]
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    fresh, drops = [], []
+    notified = 0
 
     for l in items:
         key = prefix + str(l["id"])
-        cur_price = l.get("price")
 
-        if key in seen:
-            old_price = seen[key].get("price")
-            if is_real_drop(old_price, cur_price):
-                drops.append((key, l, old_price))
-            elif isinstance(cur_price, (int, float)) and cur_price != old_price:
-                # Update baseline price quietly if it increases or was empty
-                if not isinstance(old_price, (int, float)) or cur_price > old_price:
-                    seen[key]["price"] = cur_price
+        if key not in seen:
+            # Seed/record new listing silently without triggering Telegram notification
+            seen[key] = {**l, "first_seen": now}
             continue
 
-        # New listing detected
-        fresh.append((key, l))
+        # Detect modifications/price changes on existing items
+        kind, details = detect_changes(seen[key], l)
 
-    notified = 0
-    # Process New Listings
-    for key, l in fresh:
-        if notify(l, name, kind="new"):
-            seen[key] = {
-                "url": l["url"],
-                "price": l.get("price"),
-                "first_seen": now,
-                "notification_sent": True,
-                "matched": True,
-                "source": name,
-            }
-            notified += 1
-
-    # Process Price Drops
-    for key, l, old_price in drops:
-        if notify(l, name, kind="drop", old_price=old_price):
-            seen[key]["price"] = l.get("price")
-            seen[key]["price_dropped_at"] = now
-            notified += 1
+        if kind in ("drop", "increase", "modified"):
+            if notify(l, name, kind, details):
+                # Update saved listing state after successful alert
+                seen[key] = {**l, "last_updated": now}
+                notified += 1
 
     return notified
 
