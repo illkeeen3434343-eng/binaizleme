@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Apartment monitor for Bina.az -> Telegram.
-Exclusively tracks:
-  1. Price drops
-  2. Price increases
-  3. Field modifications on existing listings (rooms, area, floor, etc.)
+Bina.az change monitor — standalone, single-source.
+
+Watches ONE bina.az search and messages you about every meaningful change:
+  🏠 new listing        🔻 price drop        🔺 price increase        ✏️ updated
+Price drops are the headline; pure "bumps" (only the timestamp changes) are ignored
+so you aren't spammed.
+
+Independent from any other bot: use its OWN GitHub repo, OWN bot token, OWN seen.json.
+Runs on GitHub Actions (triggered every 15 min); memory is saved via the GitHub
+Contents API (atomic, no git races).
 """
 import base64
 import datetime as dt
@@ -17,60 +22,44 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-# --------------------------------------------------------------------------- #
-# SEARCH URL & CONFIGURATIONS
-# --------------------------------------------------------------------------- #
-BINA_SEARCH_URL = os.environ.get(
-    "BINA_SEARCH_URL",
-    (
-      "https://bina.az/baki/alqi-satqi/menziller?has_repair=true&location_ids%5B%5D=51&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=100&location_ids%5B%5D=99&location_ids%5B%5D=200"
-    ),
-)
-
-SOURCES = [
-    {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": ""}
-]
-
+# ---- YOUR bina.az search (paste any bina.az search URL from the address bar) ----
+BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
+    "https://bina.az/baki/alqi-satqi/menziller?location_ids%5B%5D=51&location_ids%5B%5D=100&location_ids%5B%5D=16&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=99&location_ids%5B%5D=200"
+))
 CITY_ID = os.environ.get("BINA_CITY_ID", "1")
 CATEGORY_ID = os.environ.get("BINA_CATEGORY_ID", "1")
-PERSISTED_HASH = os.environ.get(
-    "BINA_PERSISTED_HASH",
-    "b781511a943a4d710eefdf811a24dd4ae353e55d836952603ce0b37fde97d073",
-)
+# Current bina request signature. If the bot says it expired, capture a fresh one
+# from the browser Network tab (DevTools → graphql → SearchItems → sha256Hash).
+PERSISTED_HASH = os.environ.get("BINA_PERSISTED_HASH",
+    "b781511a943a4d710eefdf811a24dd4ae353e55d836952603ce0b37fde97d073")
+
 GRAPHQL_URL = "https://bina.az/graphql"
-OPERATION = "SearchItems"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "6"))
-
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))   # broad search -> scan a bit deeper
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
-MAX_SEEN = 8000
+MAX_SEEN = 12000
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
-
-PRICE_DROP_MIN_ABS = int(os.environ.get("PRICE_DROP_MIN_ABS", "0"))
-DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))
+DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))   # ignore >60% "drops"
+RISE_ANOMALY_CEIL = float(os.environ.get("RISE_ANOMALY_CEIL", "3.0"))     # ignore >3x "rises"
+NOTIFY_INCREASES = os.environ.get("NOTIFY_INCREASES", "true").lower() == "true"
+NOTIFY_UPDATES = os.environ.get("NOTIFY_UPDATES", "true").lower() == "true"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-
 GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()
 GH_REPO = os.environ.get("GH_REPO", "").strip()
 GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip()
 USE_API = bool(GH_TOKEN and GH_REPO)
+IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
-)
-API_HEADERS = {
-    "User-Agent": UA,
-    "Accept": "*/*",
-    "Accept-Language": "az,en-US;q=0.9,en;q=0.8,ru;q=0.7",
-    "Content-Type": "application/json",
-    "Referer": "https://bina.az/baki/alqi-satqi/menziller",
-    "Origin": "https://bina.az",
-    "x-platform": "desktop",
-}
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+API_HEADERS = {"User-Agent": UA, "Accept": "*/*",
+               "Accept-Language": "az,en-US;q=0.9,en;q=0.8,ru;q=0.7",
+               "Content-Type": "application/json",
+               "Referer": "https://bina.az/baki/alqi-satqi/menziller",
+               "Origin": "https://bina.az", "x-platform": "desktop"}
 
 
 def log(*a):
@@ -82,21 +71,17 @@ class PersistedQueryError(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# Telegram Utilities
+# Telegram
 # --------------------------------------------------------------------------- #
 def tg_send_message(text):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
-            timeout=30,
-        )
-        return r.status_code == 200
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                          json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                                "disable_web_page_preview": False}, timeout=30)
+        if r.status_code == 200:
+            return True
+        log("Telegram sendMessage failed:", r.status_code, r.text[:200])
+        return False
     except requests.RequestException as e:
         log("Telegram error:", e)
         return False
@@ -104,16 +89,9 @@ def tg_send_message(text):
 
 def tg_send_photo(photo_url, caption):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-            json={
-                "chat_id": CHAT_ID,
-                "photo": photo_url,
-                "caption": caption,
-                "parse_mode": "HTML",
-            },
-            timeout=30,
-        )
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                          json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
+                                "parse_mode": "HTML"}, timeout=30)
         if r.status_code == 200:
             return True
         return tg_send_message(caption)
@@ -122,9 +100,9 @@ def tg_send_photo(photo_url, caption):
 
 
 # --------------------------------------------------------------------------- #
-# Bina.az GraphQL Logic
+# bina.az GraphQL
 # --------------------------------------------------------------------------- #
-def bina_filter_vars(url):
+def _filter_vars(url):
     q = parse_qs(urlparse(url).query)
 
     def one(k):
@@ -148,125 +126,131 @@ def bina_filter_vars(url):
     locs = [str(v) for v in q.get("location_ids[]", []) if str(v).strip()]
     if locs:
         f["locationIds"] = locs
-    if num(one("price_to")) is not None:
-        f["priceTo"] = num(one("price_to"))
-    if num(one("price_from")) is not None:
-        f["priceFrom"] = num(one("price_from"))
-    if num(one("area_from")) is not None:
-        f["areaFrom"] = num(one("area_from"))
-    if num(one("area_to")) is not None:
-        f["areaTo"] = num(one("area_to"))
+    for src, dst in (("price_to", "priceTo"), ("price_from", "priceFrom"),
+                     ("area_from", "areaFrom"), ("area_to", "areaTo")):
+        if num(one(src)) is not None:
+            f[dst] = num(one(src))
     if b(one("has_bill_of_sale")) is not None:
         f["hasBillOfSale"] = b(one("has_bill_of_sale"))
     if b(one("has_mortgage")) is not None:
         f["hasMortgage"] = b(one("has_mortgage"))
-    if one("floor_first") is not None:
-        f["floorFirst"] = b(one("floor_first"))
-    if one("floor_last") is not None:
-        f["floorLast"] = b(one("floor_last"))
-
+    f["floorFirst"] = b(one("floor_first")) is True
+    f["floorLast"] = b(one("floor_last")) is True
     return f
 
 
-def _bina_params(filter_vars, cursor):
-    variables = {"first": PAGE_SIZE, "filter": filter_vars, "sort": SORT}
-    if cursor:
-        variables["cursor"] = cursor
-    return {
-        "operationName": OPERATION,
-        "variables": json.dumps(variables, separators=(",", ":"), ensure_ascii=False),
-        "extensions": json.dumps(
-            {"persistedQuery": {"version": 1, "sha256Hash": PERSISTED_HASH}},
-            separators=(",", ":"),
-        ),
-    }
+def _check(url):
+    q = parse_qs(urlparse(url).query)
+
+    def i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    pt = q.get("price_to", [None])[0]
+    af = q.get("area_from", [None])[0]
+    return {"rooms": {i(v) for v in q.get("room_ids[]", []) if i(v) is not None},
+            "locs": {i(v) for v in q.get("location_ids[]", []) if i(v) is not None},
+            "price_to": i(pt), "area_from": float(af) if af else None}
 
 
-def _bina_node(node):
+def _passes(l, c):
+    if c["rooms"] and l.get("rooms") not in c["rooms"]:
+        return False
+    if c["price_to"] is not None and (l.get("price") is None or l["price"] > c["price_to"]):
+        return False
+    if c["area_from"] is not None and (l.get("area") is None or l["area"] < c["area_from"]):
+        return False
+    if c["locs"] and (l.get("location_id") is None or l["location_id"] not in c["locs"]):
+        return False
+    return True
+
+
+def _node(node):
     def sub(k, fld):
         o = node.get(k)
         return o.get(fld) if isinstance(o, dict) else None
 
     preview = node.get("preview") or {}
     photo = preview.get("f460x345") or preview.get("thumbnail")
-
-    def parse_num(val, cast_fn):
-        try:
-            return cast_fn(float(val)) if val is not None else None
-        except (TypeError, ValueError):
-            return None
-
+    area = sub("area", "value")
+    try:
+        area = float(area) if area is not None else None
+    except (TypeError, ValueError):
+        area = None
+    price = sub("price", "total")
+    try:
+        price = int(float(price)) if price is not None else None
+    except (TypeError, ValueError):
+        price = None
+    loc_id = sub("location", "id")
+    try:
+        loc_id = int(loc_id) if loc_id is not None else None
+    except (TypeError, ValueError):
+        loc_id = None
     path = node.get("path")
-    return {
-        "id": str(node["id"]),
-        "rooms": node.get("rooms"),
-        "area": parse_num(sub("area", "value"), float),
-        "area_units": sub("area", "units") or "m²",
-        "floor": node.get("floor"),
-        "floors": node.get("floors"),
-        "price": parse_num(sub("price", "total"), int),
-        "currency": sub("price", "currency") or "AZN",
-        "location_id": parse_num(sub("location", "id"), int),
-        "location": sub("location", "fullName")
-        or sub("location", "name")
-        or sub("city", "name"),
-        "has_bill_of_sale": node.get("hasBillOfSale"),
-        "has_mortgage": node.get("hasMortgage"),
-        "has_repair": node.get("hasRepair"),
-        "updated_at": node.get("updatedAt"),
-        "url": f"https://bina.az{path}" if path else f"https://bina.az/items/{node['id']}",
-        "photo": photo,
-    }
+    iid = str(node["id"])
+    return {"id": iid, "rooms": node.get("rooms"), "area": area,
+            "area_units": sub("area", "units") or "m²", "floor": node.get("floor"),
+            "floors": node.get("floors"), "price": price,
+            "currency": sub("price", "currency") or "AZN", "location_id": loc_id,
+            "location": sub("location", "fullName") or sub("location", "name") or sub("city", "name"),
+            "has_bill_of_sale": node.get("hasBillOfSale"), "has_mortgage": node.get("hasMortgage"),
+            "has_repair": node.get("hasRepair"), "updated_at": node.get("updatedAt"),
+            "url": f"https://bina.az{path}" if path else f"https://bina.az/items/{iid}",
+            "photo": photo}
 
 
-def fetch_bina(url):
-    fv = bina_filter_vars(url)
+def fetch_listings():
+    fv = _filter_vars(BINA_SEARCH_URL)
+    chk = _check(BINA_SEARCH_URL)
     out, cursor = [], None
-
     for _ in range(SCAN_PAGES):
-        r = requests.get(GRAPHQL_URL, params=_bina_params(fv, cursor), headers=API_HEADERS, timeout=30)
+        variables = {"first": PAGE_SIZE, "filter": fv, "sort": SORT}
+        if cursor:
+            variables["cursor"] = cursor
+        params = {"operationName": "SearchItems",
+                  "variables": json.dumps(variables, separators=(",", ":"), ensure_ascii=False),
+                  "extensions": json.dumps(
+                      {"persistedQuery": {"version": 1, "sha256Hash": PERSISTED_HASH}},
+                      separators=(",", ":"))}
+        r = requests.get(GRAPHQL_URL, params=params, headers=API_HEADERS, timeout=30)
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code}")
         try:
             payload = r.json()
         except ValueError:
-            raise RuntimeError("Response was not JSON")
-
+            raise RuntimeError("non-JSON response (blocked?)")
         if payload.get("errors"):
             msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
-            if "PersistedQueryNotFound" in msg or "PERSISTED_QUERY_NOT_FOUND" in msg:
+            if "PersistedQueryNotFound" in msg:
                 raise PersistedQueryError(msg)
             raise RuntimeError(f"GraphQL error: {msg}")
-
         conn = (payload.get("data") or {}).get("itemsConnection")
         if not conn:
-            raise RuntimeError("No itemsConnection found")
-
+            raise RuntimeError("no itemsConnection")
         for edge in conn.get("edges", []):
             node = edge.get("node")
             if node and node.get("id") is not None:
                 try:
-                    out.append(_bina_node(node))
+                    l = _node(node)
+                    if _passes(l, chk):
+                        out.append(l)
                 except Exception as e:
-                    log("Skip node error:", e)
-
+                    log("skip node:", e)
         info = conn.get("pageInfo") or {}
         if not info.get("hasNextPage") or not info.get("endCursor"):
             break
         cursor = info["endCursor"]
-
     return out
 
 
 # --------------------------------------------------------------------------- #
-# State & Persistence
+# State (GitHub Contents API, atomic + transient-retry)
 # --------------------------------------------------------------------------- #
 def _gh_headers():
-    return {
-        "Authorization": f"Bearer {GH_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    return {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
 
 
 def _gh_url():
@@ -281,12 +265,10 @@ def load_state():
             data = json.load(fh)
         data.setdefault("listings", {})
         return data, None
-
     r = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=30)
     if r.status_code == 404:
         return {"listings": {}}, None
     r.raise_for_status()
-
     j = r.json()
     raw = base64.b64decode(j.get("content", "")).decode("utf-8") if j.get("content") else ""
     state = json.loads(raw) if raw.strip() else {"listings": {}}
@@ -304,26 +286,26 @@ def _prune(state):
 def save_state(state, sha):
     _prune(state)
     if not USE_API:
-        try:
-            with open(STATE_FILE, "w", encoding="utf-8") as fh:
-                json.dump(state, fh, ensure_ascii=False, indent=1)
-            return True, "local"
-        except Exception as e:
-            return False, f"local write: {e}"
-
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=1)
+        return True, "local"
     reason = "unknown"
     for attempt in range(6):
+        body = {"message": "Update seen listings", "branch": GH_BRANCH,
+                "content": base64.b64encode(
+                    json.dumps(state, ensure_ascii=False).encode("utf-8")).decode("ascii")}
+        if sha:
+            body["sha"] = sha
         try:
-            r = requests.put(_gh_url(), headers=_gh_headers(), json=body_bytes(state, sha), timeout=30)
+            r = requests.put(_gh_url(), headers=_gh_headers(), json=body, timeout=30)
         except requests.RequestException as e:
-            reason = f"network error: {e}"
+            reason = f"network: {e}"
             time.sleep(2 * (attempt + 1))
             continue
-
         if r.status_code in (200, 201):
             return True, "saved"
-
         if r.status_code in (409, 422):
+            reason = f"HTTP {r.status_code} (retry)"
             g = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=30)
             if g.status_code == 200:
                 j = g.json()
@@ -331,40 +313,51 @@ def save_state(state, sha):
                 raw = base64.b64decode(j.get("content", "")).decode("utf-8") if j.get("content") else ""
                 latest = json.loads(raw) if raw.strip() else {"listings": {}}
                 latest.setdefault("listings", {})
-
                 for k, v in state["listings"].items():
-                    latest["listings"][k] = v
-
-                if state.get("source_status"):
-                    latest["source_status"] = state["source_status"]
-
+                    if k not in latest["listings"]:
+                        latest["listings"][k] = v
+                    else:
+                        op = v.get("price")
+                        lp = latest["listings"][k].get("price")
+                        if isinstance(op, (int, float)) and isinstance(lp, (int, float)) and op < lp:
+                            latest["listings"][k] = v
                 state = latest
                 _prune(state)
                 continue
-
+            reason = f"re-read HTTP {g.status_code}"
+            break
         if r.status_code in (500, 502, 503, 504, 429):
+            reason = f"HTTP {r.status_code} (GitHub temporary)"
+            log("save transient:", reason)
             time.sleep(3 * (attempt + 1))
             continue
-
-        return False, f"HTTP {r.status_code}: {r.text[:140]}"
-
+        reason = f"HTTP {r.status_code}: {r.text[:140]}"
+        return False, reason
     return False, reason
 
 
-def body_bytes(state, sha):
-    body = {
-        "message": "Update seen listings",
-        "branch": GH_BRANCH,
-        "content": base64.b64encode(json.dumps(state, ensure_ascii=False).encode("utf-8")).decode("ascii"),
-    }
-    if sha:
-        body["sha"] = sha
-    return body
+# --------------------------------------------------------------------------- #
+# Change detection + messages
+# --------------------------------------------------------------------------- #
+def snapshot_of(l):
+    return {"rooms": l.get("rooms"), "area": l.get("area"),
+            "floor": l.get("floor"), "floors": l.get("floors")}
 
 
-# --------------------------------------------------------------------------- #
-# Modification Tracking & Formatting
-# --------------------------------------------------------------------------- #
+def is_real_drop(old, new):
+    return (isinstance(old, (int, float)) and isinstance(new, (int, float))
+            and 0 < new < old and new >= old * DROP_ANOMALY_FLOOR)
+
+
+def is_real_rise(old, new):
+    return (isinstance(old, (int, float)) and isinstance(new, (int, float))
+            and new > old > 0 and new <= old * RISE_ANOMALY_CEIL)
+
+
+def _spaced(n):
+    return f"{int(n):,}".replace(",", " ")
+
+
 def _fmt_pub(v):
     if not v:
         return None
@@ -374,139 +367,61 @@ def _fmt_pub(v):
         return str(v)
 
 
-def detect_changes(old_data, new_item):
-    """
-    Compares the existing record against the freshly fetched listing.
-    Returns: (kind, changes_dict)
-    kind options: 'drop', 'increase', 'modified', or None
-    """
-    changes = {}
-
-    # 1. Price checks
-    old_p = old_data.get("price")
-    new_p = new_item.get("price")
-
-    if isinstance(old_p, (int, float)) and isinstance(new_p, (int, float)) and old_p != new_p:
-        diff = new_p - old_p
-        if new_p < old_p:
-            if (old_p - new_p) >= PRICE_DROP_MIN_ABS and new_p >= (old_p * DROP_ANOMALY_FLOOR):
-                return "drop", {"old_price": old_p, "new_price": new_p, "diff": abs(diff)}
-        else:
-            return "increase", {"old_price": old_p, "new_price": new_p, "diff": diff}
-
-    # 2. Field modifications check
-    field_labels = {
-        "rooms": "Rooms",
-        "area": "Area",
-        "floor": "Floor",
-        "floors": "Total Floors",
-        "has_bill_of_sale": "Kupça",
-        "has_mortgage": "Mortgage",
-        "has_repair": "Repair Status",
-        "location": "Location",
-    }
-
-    for key, label in field_labels.items():
-        old_val = old_data.get(key)
-        new_val = new_item.get(key)
-        if old_val is not None and new_val is not None and old_val != new_val:
-            changes[label] = (old_val, new_val)
-
-    if changes:
-        return "modified", changes
-
-    return None, {}
+def describe_changes(old_snap, new_snap):
+    labels = {"rooms": "Rooms", "area": "Area", "floor": "Floor", "floors": "Floors"}
+    out = []
+    for k in ("rooms", "area", "floor", "floors"):
+        o, n = old_snap.get(k), new_snap.get(k)
+        if o != n and n is not None:
+            out.append(f"{labels[k]} {o}→{n}")
+    return out
 
 
-def format_message(l, source_name, kind, change_details):
+def format_message(l, kind, old_price=None, changes=None):
+    heads = {"new": "🏠 <b>NEW LISTING</b>", "drop": "🔻 <b>PRICE DROP</b>",
+             "increase": "🔺 <b>PRICE INCREASE</b>", "update": "✏️ <b>LISTING UPDATED</b>"}
+    lines = [f"{heads.get(kind, heads['new'])} · bina.az", ""]
     cur = l.get("currency", "AZN")
-
-    if kind == "drop":
-        lines = [f"🔻 <b>PRICE DROP</b> · {html.escape(source_name)}", ""]
-        old_p = change_details["old_price"]
-        new_p = change_details["new_price"]
-        diff = change_details["diff"]
-        lines.append(
-            f"💰 <b>Price:</b> <s>{old_p:,}</s> → <b>{new_p:,}</b> {cur} (−{diff:,})".replace(",", " ")
-        )
-
-    elif kind == "increase":
-        lines = [f"🔺 <b>PRICE INCREASE</b> · {html.escape(source_name)}", ""]
-        old_p = change_details["old_price"]
-        new_p = change_details["new_price"]
-        diff = change_details["diff"]
-        lines.append(
-            f"💰 <b>Price:</b> <s>{old_p:,}</s> → <b>{new_p:,}</b> {cur} (+{diff:,})".replace(",", " ")
-        )
-
-    elif kind == "modified":
-        lines = [f"✏️ <b>LISTING MODIFIED</b> · {html.escape(source_name)}", ""]
-        lines.append("<b>What changed:</b>")
-        for field, (old_v, new_v) in change_details.items():
-            lines.append(f"  • <b>{field}:</b> <s>{old_v}</s> → <b>{new_v}</b>")
-        lines.append("")
-        if l.get("price") is not None:
-            lines.append(f"💰 <b>Current Price:</b> {l['price']:,} {cur}".replace(",", " "))
-
-    # General overview details
+    if kind in ("drop", "increase") and isinstance(old_price, (int, float)) and l.get("price") is not None:
+        diff = int(l["price"]) - int(old_price)
+        sign = "−" if diff < 0 else "+"
+        oldtxt = f"<s>{_spaced(old_price)}</s>" if kind == "drop" else _spaced(old_price)
+        lines.append(f"💰 <b>Price:</b> {oldtxt} → <b>{_spaced(l['price'])}</b> {cur} "
+                     f"({sign}{_spaced(abs(diff))})")
+    elif l.get("price") is not None:
+        lines.append(f"💰 <b>Price:</b> {_spaced(l['price'])} {cur}")
+    if kind == "update" and changes:
+        lines.append("🔧 <b>Changed:</b> " + ", ".join(changes))
     lines.append(f"🛏 <b>Rooms:</b> {l.get('rooms') if l.get('rooms') is not None else '-'}")
-
     if l.get("area") is not None:
         area = int(l["area"]) if float(l["area"]).is_integer() else l["area"]
         lines.append(f"📐 <b>Area:</b> {area} {l.get('area_units', 'm²')}")
-
     if l.get("floor") and l.get("floors"):
         lines.append(f"🏢 <b>Floor:</b> {l['floor']}/{l['floors']}")
-
     if l.get("location"):
         lines.append(f"📍 <b>Location:</b> {html.escape(str(l['location']))}")
-
     pub = _fmt_pub(l.get("updated_at"))
     if pub:
-        lines.append(f"📅 <b>Updated:</b> {html.escape(pub)}")
-
+        lines.append(f"📅 <b>{'Published' if kind == 'new' else 'Updated'}:</b> {html.escape(pub)}")
+    tags = [t for t, on in (("kupçalı", l.get("has_bill_of_sale")),
+                            ("ipoteka", l.get("has_mortgage")),
+                            ("təmirli", l.get("has_repair"))) if on]
+    if tags:
+        lines.append("✅ " + ", ".join(tags))
     lines.append("")
     lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
     return "\n".join(lines)
 
 
-def notify(l, source_name, kind, change_details):
-    text = format_message(l, source_name, kind, change_details)
+def notify(l, kind, old_price=None, changes=None):
+    text = format_message(l, kind, old_price, changes)
     if SEND_PHOTOS and l.get("photo"):
         return tg_send_photo(l["photo"], text)
     return tg_send_message(text)
 
 
 # --------------------------------------------------------------------------- #
-# Process Bina.az Items
-# --------------------------------------------------------------------------- #
-def process_source(items, source, seen):
-    prefix, name = source["prefix"], source["name"]
-    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    notified = 0
-
-    for l in items:
-        key = prefix + str(l["id"])
-
-        if key not in seen:
-            # Seed/record new listing silently without triggering Telegram notification
-            seen[key] = {**l, "first_seen": now}
-            continue
-
-        # Detect modifications/price changes on existing items
-        kind, details = detect_changes(seen[key], l)
-
-        if kind in ("drop", "increase", "modified"):
-            if notify(l, name, kind, details):
-                # Update saved listing state after successful alert
-                seen[key] = {**l, "last_updated": now}
-                notified += 1
-
-    return notified
-
-
-# --------------------------------------------------------------------------- #
-# Main Execution
+# Main
 # --------------------------------------------------------------------------- #
 def main():
     if not BOT_TOKEN or not CHAT_ID:
@@ -516,38 +431,75 @@ def main():
     try:
         state, sha = load_state()
     except Exception as e:
-        log("Error loading state:", e)
+        log("Could not load state; skipping:", e)
+        if IN_ACTIONS:
+            tg_send_message(f"⚠️ Could not read memory this run ({html.escape(str(e))}). Skipping.")
+        return
+    seen = state["listings"]
+    first_run = len(seen) == 0
+
+    try:
+        items = fetch_listings()
+    except PersistedQueryError:
+        tg_send_message("⚠️ bina.az signature expired — capture a fresh one (DevTools → "
+                        "graphql → SearchItems → sha256Hash) and update BINA_PERSISTED_HASH.")
+        return
+    except Exception as e:
+        if first_run:
+            tg_send_message("🟡 <b>Bot is running</b>, but couldn't read bina.az yet.\n"
+                            f"Reason: {html.escape(str(e))}\nRetrying next run.")
+        else:
+            log("fetch failed:", e)
         return
 
-    seen = state["listings"]
-    status = state.setdefault("source_status", {})
-    total_notified = 0
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    events = []          # (kind, listing, old_price, changes)
+    for l in items:
+        key = l["id"]
+        cur = l.get("price")
+        snap = snapshot_of(l)
+        if key not in seen:
+            if first_run:
+                seen[key] = {"url": l["url"], "price": cur, "snapshot": snap,
+                             "first_seen": now}
+            else:
+                events.append(("new", l, None, None))
+        else:
+            rec = seen[key]
+            old_price = rec.get("price")
+            old_snap = rec.get("snapshot") or {}
+            if is_real_drop(old_price, cur):
+                events.append(("drop", l, old_price, None))
+            elif NOTIFY_INCREASES and is_real_rise(old_price, cur):
+                events.append(("increase", l, old_price, None))
+            else:
+                changed = describe_changes(old_snap, snap)
+                if NOTIFY_UPDATES and changed:
+                    events.append(("update", l, None, changed))
+                elif isinstance(cur, (int, float)) and cur != old_price:
+                    rec["price"] = cur          # tiny/again change: track silently
+                    rec["snapshot"] = snap
 
-    for source in SOURCES:
-        name = source["name"]
-        try:
-            items = fetch_bina(source["url"])
-        except PersistedQueryError:
-            err = "BINA_PERSISTED_HASH signature expired."
-            if status.get(name) != "PQ":
-                tg_send_message(f"⚠️ <b>{html.escape(name)}</b> stopped working: {err}")
-                status[name] = "PQ"
-            continue
-        except Exception as e:
-            err = str(e)[:200]
-            if status.get(name) != err:
-                tg_send_message(f"⚠️ Error fetching <b>{html.escape(name)}</b>: {html.escape(err)}")
-                status[name] = err
-            continue
+    if first_run:
+        ok, reason = save_state(state, sha)
+        msg = (f"✅ <b>Monitoring started</b> (bina.az).\nRecorded {len(items)} current "
+               f"listings. You'll now get new listings, price drops, increases and edits.")
+        tg_send_message(msg if ok else f"🟡 Seeded {len(items)} but save failed: {reason}")
+        return
 
-        if status.get(name):
-            tg_send_message(f"✅ <b>{html.escape(name)}</b> recovered and is working.")
-        status[name] = ""
-
-        total_notified += process_source(items, source, seen)
+    notified = 0
+    for kind, l, old_price, changes in events:
+        if notify(l, kind, old_price, changes):
+            seen[l["id"]] = {"url": l["url"], "price": l.get("price"),
+                             "snapshot": snapshot_of(l), "first_seen": now}
+            notified += 1
+        else:
+            log("send failed, retry next run:", l["id"])
 
     ok, reason = save_state(state, sha)
-    log(f"Done. Notified: {total_notified}, Memory Saved: {ok} ({reason})")
+    if not ok:
+        tg_send_message(f"⚠️ Read fine but couldn't save memory — may repeat.\nReason: {html.escape(reason)}")
+    log(f"Done. scanned={len(items)} notified={notified} saved={ok}({reason}) seen={len(seen)}")
 
 
 if __name__ == "__main__":
