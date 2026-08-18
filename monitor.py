@@ -44,6 +44,7 @@ DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))   # igno
 RISE_ANOMALY_CEIL = float(os.environ.get("RISE_ANOMALY_CEIL", "3.0"))     # ignore >3x "rises"
 NOTIFY_INCREASES = os.environ.get("NOTIFY_INCREASES", "true").lower() == "true"
 NOTIFY_UPDATES = os.environ.get("NOTIFY_UPDATES", "true").lower() == "true"
+NOTIFY_NEW = os.environ.get("NOTIFY_NEW", "false").lower() == "true"   # off: only report changes
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -344,6 +345,15 @@ def snapshot_of(l):
             "floor": l.get("floor"), "floors": l.get("floors")}
 
 
+def merge_snap(old, new):
+    """Keep known values; only fill/overwrite with real (non-None) new values."""
+    out = dict(old) if old else {}
+    for k, v in (new or {}).items():
+        if v is not None:
+            out[k] = v
+    return out
+
+
 def is_real_drop(old, new):
     return (isinstance(old, (int, float)) and isinstance(new, (int, float))
             and 0 < new < old and new >= old * DROP_ANOMALY_FLOOR)
@@ -372,7 +382,9 @@ def describe_changes(old_snap, new_snap):
     out = []
     for k in ("rooms", "area", "floor", "floors"):
         o, n = old_snap.get(k), new_snap.get(k)
-        if o != n and n is not None:
+        if o is None or n is None:   # data appearing/vanishing is not a real edit
+            continue
+        if o != n:
             out.append(f"{labels[k]} {o}→{n}")
     return out
 
@@ -459,39 +471,46 @@ def main():
         cur = l.get("price")
         snap = snapshot_of(l)
         if key not in seen:
-            if first_run:
-                seen[key] = {"url": l["url"], "price": cur, "snapshot": snap,
-                             "first_seen": now}
+            # brand-new listing: record it silently so we can track its future
+            # changes, but don't announce it (only changes are wanted).
+            if first_run or not NOTIFY_NEW:
+                seen[key] = {"url": l["url"], "price": cur, "snapshot": snap, "first_seen": now}
             else:
                 events.append(("new", l, None, None))
+            continue
+        rec = seen[key]
+        old_price = rec.get("price")
+        old_snap = rec.get("snapshot") or {}
+        if is_real_drop(old_price, cur):
+            events.append(("drop", l, old_price, None))
+        elif NOTIFY_INCREASES and is_real_rise(old_price, cur):
+            events.append(("increase", l, old_price, None))
         else:
-            rec = seen[key]
-            old_price = rec.get("price")
-            old_snap = rec.get("snapshot") or {}
-            if is_real_drop(old_price, cur):
-                events.append(("drop", l, old_price, None))
-            elif NOTIFY_INCREASES and is_real_rise(old_price, cur):
-                events.append(("increase", l, old_price, None))
+            changed = describe_changes(old_snap, snap) if NOTIFY_UPDATES else []
+            if changed:
+                events.append(("update", l, None, changed))
             else:
-                changed = describe_changes(old_snap, snap)
-                if NOTIFY_UPDATES and changed:
-                    events.append(("update", l, None, changed))
-                elif isinstance(cur, (int, float)) and cur != old_price:
-                    rec["price"] = cur          # tiny/again change: track silently
-                    rec["snapshot"] = snap
+                # nothing to alert -> just keep memory current (backfill missing
+                # fields, track a tiny price move) without ever losing known values.
+                if isinstance(cur, (int, float)):
+                    rec["price"] = cur
+                rec["snapshot"] = merge_snap(old_snap, snap)
 
     if first_run:
         ok, reason = save_state(state, sha)
         msg = (f"✅ <b>Monitoring started</b> (bina.az).\nRecorded {len(items)} current "
-               f"listings. You'll now get new listings, price drops, increases and edits.")
+               f"listings. You'll now get <b>price drops, price increases and listing "
+               f"edits</b> — new listings are tracked silently, not announced.")
         tg_send_message(msg if ok else f"🟡 Seeded {len(items)} but save failed: {reason}")
         return
 
     notified = 0
     for kind, l, old_price, changes in events:
         if notify(l, kind, old_price, changes):
+            prev = seen.get(l["id"], {})
             seen[l["id"]] = {"url": l["url"], "price": l.get("price"),
-                             "snapshot": snapshot_of(l), "first_seen": now}
+                             "snapshot": merge_snap(prev.get("snapshot") or {}, snapshot_of(l)),
+                             "first_seen": prev.get("first_seen", now)}
             notified += 1
         else:
             log("send failed, retry next run:", l["id"])
