@@ -38,7 +38,7 @@ PERSISTED_HASH = os.environ.get("BINA_PERSISTED_HASH",
 GRAPHQL_URL = "https://bina.az/graphql"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "800"))   # broad search -> scan a bit deeper
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))   # broad search -> scan a bit deeper
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 # Pruning disabled – keep ALL historical data forever
 MAX_SEEN = 0          # 0 = never prune
@@ -292,6 +292,20 @@ def _prune(state):
 
 def save_state(state, sha):
     _prune(state)
+  # Safety: never replace a large history with a tiny one
+    if USE_API and sha:
+        try:
+            g = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=15)
+            if g.status_code == 200:
+                old_raw = base64.b64decode(g.json().get("content", "")).decode("utf-8")
+                old_state = json.loads(old_raw) if old_raw.strip() else {"listings": {}}
+                old_count = len(old_state.get("listings", {}))
+                new_count = len(state.get("listings", {}))
+                if old_count > 500 and new_count < old_count * 0.5:
+                    log(f"SAFETY: refusing to overwrite {old_count} entries with only {new_count}")
+                    return False, "safety-refuse-small-overwrite"
+        except Exception as e:
+            log("safety check failed:", e)
     if not USE_API:
         with open(STATE_FILE, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=1)
