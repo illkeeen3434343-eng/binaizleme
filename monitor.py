@@ -38,7 +38,7 @@ PERSISTED_HASH = os.environ.get("BINA_PERSISTED_HASH",
 GRAPHQL_URL = "https://bina.az/graphql"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))   # broad search -> scan a bit deeper
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "800"))   # broad search -> scan a bit deeper
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 # Pruning disabled – keep ALL historical data forever
 MAX_SEEN = 0          # 0 = never prune
