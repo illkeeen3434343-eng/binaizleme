@@ -2,7 +2,6 @@
 """
 Bina.az change monitor — keeps ALL historical data forever.
 """
-import base64
 import datetime as dt
 import html
 import json
@@ -59,7 +58,7 @@ class PersistedQueryError(Exception):
 
 def tg_send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
-        log("Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+        log("Telegram notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
         return False
     try:
         r = requests.post(
@@ -256,7 +255,7 @@ def load_state():
             data.setdefault("listings", {})
             return data
     except Exception as e:
-        log(f"Error reading {STATE_FILE}: {e}")
+        log(f"Error reading state file {STATE_FILE}: {e}")
         return {"listings": {}}
 
 
@@ -266,7 +265,7 @@ def save_state(state):
             json.dump(state, fh, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
-        log(f"Error saving {STATE_FILE}: {e}")
+        log(f"Error writing to {STATE_FILE}: {e}")
         return False
 
 
@@ -282,21 +281,10 @@ def merge_snap(old, new):
     return out
 
 
-def is_real_drop(old, new):
-    return (isinstance(old, (int, float)) and isinstance(new, (int, float))
-            and 0 < new < old and new >= old * DROP_ANOMALY_FLOOR)
-
-
-def is_real_rise(old, new):
-    return (isinstance(old, (int, float)) and isinstance(new, (int, float))
-            and new > old > 0 and new <= old * RISE_ANOMALY_CEIL)
-
-
 def main():
     state = load_state()
     seen = state["listings"]
     original_count = len(seen)
-    first_run = original_count == 0
     log(f"Loaded {original_count} historical listings from {STATE_FILE}")
 
     try:
@@ -310,8 +298,8 @@ def main():
         return
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    
-    # Merge newly scraped items into historical memory
+
+    # Accumulate all items in seen dictionary without dropping old ones
     for l in items:
         key = str(l["id"])
         cur = l.get("price")
