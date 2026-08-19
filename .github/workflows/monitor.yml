@@ -1,28 +1,40 @@
-name: Bina Monitor
+name: Bina.az Monitor
+
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"   # backup only, offset off the hour to reduce drops
-  workflow_dispatch: {}             # the reliable external trigger uses this
-permissions:
-  contents: write
-concurrency:
-  group: bina-monitor
-  cancel-in-progress: false
+    - cron: '*/30 * * * *'  # Runs every 30 minutes
+  workflow_dispatch:        # Allows manual run from GitHub UI
+
 jobs:
-  monitor:
+  run-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10             # a stuck run can never block future runs
+    permissions:
+      contents: write       # CRITICAL: Allows Git to commit seen.json back to repo
+
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install requests
-      - name: Run monitor
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Monitor Script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          GH_BRANCH: ${{ github.ref_name }}
-        run: python monitor.py
+          # Do NOT set GH_TOKEN or GH_REPO here. Let Git push handle it below.
+        run: python main.py
+
+      - name: Commit and push updated seen.json
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || (git commit -m "chore: auto-update historical seen.json [skip ci]" && git push)
