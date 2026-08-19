@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
 """
-Bina.az change monitor — standalone, single-source.
-
-Watches ONE bina.az search and messages you about every meaningful change:
-  🏠 new listing        🔻 price drop        🔺 price increase        ✏️ updated
-Price drops are the headline; pure "bumps" (only the timestamp changes) are ignored
-so you aren't spammed.
-
-Independent from any other bot: use its OWN GitHub repo, OWN bot token, OWN seen.json.
-Runs on GitHub Actions (triggered every 15 min); memory is saved via the GitHub
-Contents API (atomic, no git races).
-
-MODIFIED: Never prunes older data. All historical listings stay in seen.json forever.
+Bina.az change monitor — keeps ALL historical data forever.
 """
 import base64
 import datetime as dt
@@ -24,30 +13,26 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-# ---- YOUR bina.az search (paste any bina.az search URL from the address bar) ----
 BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
     "https://bina.az/baki/alqi-satqi/menziller?has_bill_of_sale=true&has_repair=true&location_ids%5B%5D=51&location_ids%5B%5D=100&location_ids%5B%5D=16&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=99&location_ids%5B%5D=200"
 ))
 CITY_ID = os.environ.get("BINA_CITY_ID", "1")
 CATEGORY_ID = os.environ.get("BINA_CATEGORY_ID", "1")
-# Current bina request signature. If the bot says it expired, capture a fresh one
-# from the browser Network tab (DevTools → graphql → SearchItems → sha256Hash).
 PERSISTED_HASH = os.environ.get("BINA_PERSISTED_HASH",
     "b781511a943a4d710eefdf811a24dd4ae353e55d836952603ce0b37fde97d073")
 
 GRAPHQL_URL = "https://bina.az/graphql"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))   # broad search -> scan a bit deeper
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
-# Pruning disabled – keep ALL historical data forever
-MAX_SEEN = 0          # 0 = never prune
+MAX_SEEN = 0          # never prune
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
-DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))   # ignore >60% "drops"
-RISE_ANOMALY_CEIL = float(os.environ.get("RISE_ANOMALY_CEIL", "3.0"))     # ignore >3x "rises"
+DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))
+RISE_ANOMALY_CEIL = float(os.environ.get("RISE_ANOMALY_CEIL", "3.0"))
 NOTIFY_INCREASES = os.environ.get("NOTIFY_INCREASES", "true").lower() == "true"
 NOTIFY_UPDATES = os.environ.get("NOTIFY_UPDATES", "false").lower() == "true"
-NOTIFY_NEW = os.environ.get("NOTIFY_NEW", "false").lower() == "true"   # off: only report changes
+NOTIFY_NEW = os.environ.get("NOTIFY_NEW", "false").lower() == "true"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -74,19 +59,13 @@ class PersistedQueryError(Exception):
     pass
 
 
-# --------------------------------------------------------------------------- #
-# Telegram
-# --------------------------------------------------------------------------- #
 def tg_send_message(text):
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
                                 "disable_web_page_preview": False}, timeout=30)
-        if r.status_code == 200:
-            return True
-        log("Telegram sendMessage failed:", r.status_code, r.text[:200])
-        return False
-    except requests.RequestException as e:
+        return r.status_code == 200
+    except Exception as e:
         log("Telegram error:", e)
         return False
 
@@ -99,30 +78,23 @@ def tg_send_photo(photo_url, caption):
         if r.status_code == 200:
             return True
         return tg_send_message(caption)
-    except requests.RequestException:
+    except Exception:
         return tg_send_message(caption)
 
 
-# --------------------------------------------------------------------------- #
-# bina.az GraphQL
-# --------------------------------------------------------------------------- #
 def _filter_vars(url):
     q = parse_qs(urlparse(url).query)
-
     def one(k):
         v = q.get(k)
         return v[0] if v else None
-
     def b(v):
         return str(v).lower() in ("1", "true", "yes", "on") if v is not None else None
-
     def num(v):
         try:
             f = float(v)
             return int(f) if f.is_integer() else f
-        except (TypeError, ValueError):
+        except Exception:
             return None
-
     f = {"cityId": CITY_ID, "categoryId": CATEGORY_ID, "leased": False}
     rooms = [str(v) for v in q.get("room_ids[]", []) if str(v).strip()]
     if rooms:
@@ -145,11 +117,10 @@ def _filter_vars(url):
 
 def _check(url):
     q = parse_qs(urlparse(url).query)
-
     def i(v):
         try:
             return int(v)
-        except (TypeError, ValueError):
+        except Exception:
             return None
     pt = q.get("price_to", [None])[0]
     af = q.get("area_from", [None])[0]
@@ -174,23 +145,22 @@ def _node(node):
     def sub(k, fld):
         o = node.get(k)
         return o.get(fld) if isinstance(o, dict) else None
-
     preview = node.get("preview") or {}
     photo = preview.get("f460x345") or preview.get("thumbnail")
     area = sub("area", "value")
     try:
         area = float(area) if area is not None else None
-    except (TypeError, ValueError):
+    except Exception:
         area = None
     price = sub("price", "total")
     try:
         price = int(float(price)) if price is not None else None
-    except (TypeError, ValueError):
+    except Exception:
         price = None
     loc_id = sub("location", "id")
     try:
         loc_id = int(loc_id) if loc_id is not None else None
-    except (TypeError, ValueError):
+    except Exception:
         loc_id = None
     path = node.get("path")
     iid = str(node["id"])
@@ -221,10 +191,7 @@ def fetch_listings():
         r = requests.get(GRAPHQL_URL, params=params, headers=API_HEADERS, timeout=30)
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code}")
-        try:
-            payload = r.json()
-        except ValueError:
-            raise RuntimeError("non-JSON response (blocked?)")
+        payload = r.json()
         if payload.get("errors"):
             msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
             if "PersistedQueryNotFound" in msg:
@@ -249,9 +216,6 @@ def fetch_listings():
     return out
 
 
-# --------------------------------------------------------------------------- #
-# State (GitHub Contents API, atomic + transient-retry)
-# --------------------------------------------------------------------------- #
 def _gh_headers():
     return {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"}
@@ -281,7 +245,6 @@ def load_state():
 
 
 def _prune(state):
-    """Pruning disabled – keep every historical listing forever."""
     if MAX_SEEN <= 0:
         return
     L = state["listings"]
@@ -290,26 +253,27 @@ def _prune(state):
         state["listings"] = dict(kept)
 
 
-def save_state(state, sha):
+def save_state(state, sha, original_count=0):
+    """
+    original_count = number of listings that were loaded at the beginning of the run.
+    We refuse to save if we would destroy a large history.
+    """
     _prune(state)
-  # Safety: never replace a large history with a tiny one
-    if USE_API and sha:
-        try:
-            g = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=15)
-            if g.status_code == 200:
-                old_raw = base64.b64decode(g.json().get("content", "")).decode("utf-8")
-                old_state = json.loads(old_raw) if old_raw.strip() else {"listings": {}}
-                old_count = len(old_state.get("listings", {}))
-                new_count = len(state.get("listings", {}))
-                if old_count > 500 and new_count < old_count * 0.5:
-                    log(f"SAFETY: refusing to overwrite {old_count} entries with only {new_count}")
-                    return False, "safety-refuse-small-overwrite"
-        except Exception as e:
-            log("safety check failed:", e)
+    new_count = len(state.get("listings", {}))
+
+    # ========== SAFETY CHECK ==========
+    if original_count > 300 and new_count < original_count * 0.6:
+        msg = f"SAFETY: refusing to overwrite {original_count} entries with only {new_count}"
+        log(msg)
+        if IN_ACTIONS:
+            tg_send_message(f"⚠️ {msg}\nBot refused to destroy history.")
+        return False, "safety-refuse"
+
     if not USE_API:
         with open(STATE_FILE, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=1)
         return True, "local"
+
     reason = "unknown"
     for attempt in range(6):
         body = {"message": "Update seen listings", "branch": GH_BRANCH,
@@ -319,7 +283,7 @@ def save_state(state, sha):
             body["sha"] = sha
         try:
             r = requests.put(_gh_url(), headers=_gh_headers(), json=body, timeout=30)
-        except requests.RequestException as e:
+        except Exception as e:
             reason = f"network: {e}"
             time.sleep(2 * (attempt + 1))
             continue
@@ -334,20 +298,19 @@ def save_state(state, sha):
                 raw = base64.b64decode(j.get("content", "")).decode("utf-8") if j.get("content") else ""
                 latest = json.loads(raw) if raw.strip() else {"listings": {}}
                 latest.setdefault("listings", {})
-                # Merge carefully: never drop existing keys, prefer lower price
+                # Always keep existing keys
                 for k, v in state["listings"].items():
                     if k not in latest["listings"]:
                         latest["listings"][k] = v
                     else:
+                        # prefer lower price, keep extra fields
                         op = v.get("price")
                         lp = latest["listings"][k].get("price")
                         if isinstance(op, (int, float)) and isinstance(lp, (int, float)) and op < lp:
-                            # Keep the lower price version but preserve extra fields
                             merged = dict(latest["listings"][k])
                             merged.update(v)
                             latest["listings"][k] = merged
                         else:
-                            # Keep existing, only fill missing fields from new
                             for fk, fv in v.items():
                                 if fk not in latest["listings"][k] or latest["listings"][k][fk] is None:
                                     latest["listings"][k][fk] = fv
@@ -357,8 +320,7 @@ def save_state(state, sha):
             reason = f"re-read HTTP {g.status_code}"
             break
         if r.status_code in (500, 502, 503, 504, 429):
-            reason = f"HTTP {r.status_code} (GitHub temporary)"
-            log("save transient:", reason)
+            reason = f"HTTP {r.status_code}"
             time.sleep(3 * (attempt + 1))
             continue
         reason = f"HTTP {r.status_code}: {r.text[:140]}"
@@ -366,16 +328,12 @@ def save_state(state, sha):
     return False, reason
 
 
-# --------------------------------------------------------------------------- #
-# Change detection + messages
-# --------------------------------------------------------------------------- #
 def snapshot_of(l):
     return {"rooms": l.get("rooms"), "area": l.get("area"),
             "floor": l.get("floor"), "floors": l.get("floors")}
 
 
 def merge_snap(old, new):
-    """Keep known values; only fill/overwrite with real (non-None) new values."""
     out = dict(old) if old else {}
     for k, v in (new or {}).items():
         if v is not None:
@@ -411,7 +369,7 @@ def describe_changes(old_snap, new_snap):
     out = []
     for k in ("rooms", "area", "floor", "floors"):
         o, n = old_snap.get(k), new_snap.get(k)
-        if o is None or n is None:   # data appearing/vanishing is not a real edit
+        if o is None or n is None:
             continue
         if o != n:
             out.append(f"{labels[k]} {o}→{n}")
@@ -461,9 +419,6 @@ def notify(l, kind, old_price=None, changes=None):
     return tg_send_message(text)
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         log("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
@@ -476,39 +431,35 @@ def main():
         if IN_ACTIONS:
             tg_send_message(f"⚠️ Could not read memory this run ({html.escape(str(e))}). Skipping.")
         return
+
     seen = state["listings"]
-    first_run = len(seen) == 0
+    original_count = len(seen)
+    first_run = original_count == 0
+    log(f"Loaded {original_count} historical listings")
 
     try:
         items = fetch_listings()
     except PersistedQueryError:
-        tg_send_message("⚠️ bina.az signature expired — capture a fresh one (DevTools → "
-                        "graphql → SearchItems → sha256Hash) and update BINA_PERSISTED_HASH.")
+        tg_send_message("⚠️ bina.az signature expired — update BINA_PERSISTED_HASH.")
         return
     except Exception as e:
         if first_run:
-            tg_send_message("🟡 <b>Bot is running</b>, but couldn't read bina.az yet.\n"
-                            f"Reason: {html.escape(str(e))}\nRetrying next run.")
+            tg_send_message(f"🟡 Bot running but could not read bina.az: {html.escape(str(e))}")
         else:
             log("fetch failed:", e)
         return
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    events = []          # (kind, listing, old_price, changes)
+    events = []
     for l in items:
         key = l["id"]
         cur = l.get("price")
         snap = snapshot_of(l)
         if key not in seen:
-            # brand-new listing: record it silently so we can track its future
-            # changes, but don't announce it (only changes are wanted).
             if first_run or not NOTIFY_NEW:
                 seen[key] = {
-                    "url": l["url"],
-                    "price": cur,
-                    "snapshot": snap,
-                    "first_seen": now,
-                    "source": "bina.az",
+                    "url": l["url"], "price": cur, "snapshot": snap,
+                    "first_seen": now, "source": "bina.az"
                 }
             else:
                 events.append(("new", l, None, None))
@@ -525,29 +476,23 @@ def main():
             if changed:
                 events.append(("update", l, None, changed))
             else:
-                # nothing to alert -> just keep memory current (backfill missing
-                # fields, track a tiny price move) without ever losing known values.
                 if isinstance(cur, (int, float)):
                     rec["price"] = cur
                 rec["snapshot"] = merge_snap(old_snap, snap)
-                # Preserve any extra historical fields
                 if "source" not in rec:
                     rec["source"] = "bina.az"
 
     if first_run:
-        ok, reason = save_state(state, sha)
-        msg = (f"✅ <b>Monitoring started</b> (bina.az).\nRecorded {len(items)} current "
-               f"listings. You'll now get <b>price drops, price increases and listing "
-               f"edits</b> — new listings are tracked silently, not announced.\n"
-               f"(All historical data will be kept forever.)")
-        tg_send_message(msg if ok else f"🟡 Seeded {len(items)} but save failed: {reason}")
+        ok, reason = save_state(state, sha, original_count)
+        msg = (f"✅ Monitoring started. Recorded {len(items)} listings. "
+               f"All future history will be kept forever.")
+        tg_send_message(msg if ok else f"🟡 Seeded but save failed: {reason}")
         return
 
     notified = 0
     for kind, l, old_price, changes in events:
         if notify(l, kind, old_price, changes):
             prev = seen.get(l["id"], {})
-            # Preserve all existing fields, only update the ones we care about
             updated = dict(prev)
             updated.update({
                 "url": l["url"],
@@ -559,12 +504,12 @@ def main():
             seen[l["id"]] = updated
             notified += 1
         else:
-            log("send failed, retry next run:", l["id"])
+            log("send failed:", l["id"])
 
-    ok, reason = save_state(state, sha)
+    ok, reason = save_state(state, sha, original_count)
     if not ok:
-        tg_send_message(f"⚠️ Read fine but couldn't save memory — may repeat.\nReason: {html.escape(reason)}")
-    log(f"Done. scanned={len(items)} notified={notified} saved={ok}({reason}) seen={len(seen)}")
+        tg_send_message(f"⚠️ Could not save memory: {html.escape(reason)}")
+    log(f"Done. scanned={len(items)} notified={notified} saved={ok}({reason}) total_seen={len(seen)}")
 
 
 if __name__ == "__main__":
