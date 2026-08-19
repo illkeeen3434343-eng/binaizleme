@@ -10,6 +10,8 @@ so you aren't spammed.
 Independent from any other bot: use its OWN GitHub repo, OWN bot token, OWN seen.json.
 Runs on GitHub Actions (triggered every 15 min); memory is saved via the GitHub
 Contents API (atomic, no git races).
+
+MODIFIED: Never prunes older data. All historical listings stay in seen.json forever.
 """
 import base64
 import datetime as dt
@@ -38,7 +40,8 @@ SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
 SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))   # broad search -> scan a bit deeper
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
-MAX_SEEN = 12000
+# Pruning disabled – keep ALL historical data forever
+MAX_SEEN = 0          # 0 = never prune
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
 DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))   # ignore >60% "drops"
 RISE_ANOMALY_CEIL = float(os.environ.get("RISE_ANOMALY_CEIL", "3.0"))     # ignore >3x "rises"
@@ -278,6 +281,9 @@ def load_state():
 
 
 def _prune(state):
+    """Pruning disabled – keep every historical listing forever."""
+    if MAX_SEEN <= 0:
+        return
     L = state["listings"]
     if len(L) > MAX_SEEN:
         kept = sorted(L.items(), key=lambda kv: kv[1].get("first_seen", ""), reverse=True)[:MAX_SEEN]
@@ -314,6 +320,7 @@ def save_state(state, sha):
                 raw = base64.b64decode(j.get("content", "")).decode("utf-8") if j.get("content") else ""
                 latest = json.loads(raw) if raw.strip() else {"listings": {}}
                 latest.setdefault("listings", {})
+                # Merge carefully: never drop existing keys, prefer lower price
                 for k, v in state["listings"].items():
                     if k not in latest["listings"]:
                         latest["listings"][k] = v
@@ -321,7 +328,15 @@ def save_state(state, sha):
                         op = v.get("price")
                         lp = latest["listings"][k].get("price")
                         if isinstance(op, (int, float)) and isinstance(lp, (int, float)) and op < lp:
-                            latest["listings"][k] = v
+                            # Keep the lower price version but preserve extra fields
+                            merged = dict(latest["listings"][k])
+                            merged.update(v)
+                            latest["listings"][k] = merged
+                        else:
+                            # Keep existing, only fill missing fields from new
+                            for fk, fv in v.items():
+                                if fk not in latest["listings"][k] or latest["listings"][k][fk] is None:
+                                    latest["listings"][k][fk] = fv
                 state = latest
                 _prune(state)
                 continue
@@ -474,7 +489,13 @@ def main():
             # brand-new listing: record it silently so we can track its future
             # changes, but don't announce it (only changes are wanted).
             if first_run or not NOTIFY_NEW:
-                seen[key] = {"url": l["url"], "price": cur, "snapshot": snap, "first_seen": now}
+                seen[key] = {
+                    "url": l["url"],
+                    "price": cur,
+                    "snapshot": snap,
+                    "first_seen": now,
+                    "source": "bina.az",
+                }
             else:
                 events.append(("new", l, None, None))
             continue
@@ -495,12 +516,16 @@ def main():
                 if isinstance(cur, (int, float)):
                     rec["price"] = cur
                 rec["snapshot"] = merge_snap(old_snap, snap)
+                # Preserve any extra historical fields
+                if "source" not in rec:
+                    rec["source"] = "bina.az"
 
     if first_run:
         ok, reason = save_state(state, sha)
         msg = (f"✅ <b>Monitoring started</b> (bina.az).\nRecorded {len(items)} current "
                f"listings. You'll now get <b>price drops, price increases and listing "
-               f"edits</b> — new listings are tracked silently, not announced.")
+               f"edits</b> — new listings are tracked silently, not announced.\n"
+               f"(All historical data will be kept forever.)")
         tg_send_message(msg if ok else f"🟡 Seeded {len(items)} but save failed: {reason}")
         return
 
@@ -508,9 +533,16 @@ def main():
     for kind, l, old_price, changes in events:
         if notify(l, kind, old_price, changes):
             prev = seen.get(l["id"], {})
-            seen[l["id"]] = {"url": l["url"], "price": l.get("price"),
-                             "snapshot": merge_snap(prev.get("snapshot") or {}, snapshot_of(l)),
-                             "first_seen": prev.get("first_seen", now)}
+            # Preserve all existing fields, only update the ones we care about
+            updated = dict(prev)
+            updated.update({
+                "url": l["url"],
+                "price": l.get("price"),
+                "snapshot": merge_snap(prev.get("snapshot") or {}, snapshot_of(l)),
+                "first_seen": prev.get("first_seen", now),
+                "source": prev.get("source", "bina.az"),
+            })
+            seen[l["id"]] = updated
             notified += 1
         else:
             log("send failed, retry next run:", l["id"])
