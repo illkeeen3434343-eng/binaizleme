@@ -24,7 +24,7 @@ import requests
 
 # ---- YOUR bina.az search (paste any bina.az search URL from the address bar) ----
 BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
-    "https://bina.az/baki/alqi-satqi/menziller?location_ids%5B%5D=51&location_ids%5B%5D=100&location_ids%5B%5D=16&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=99&location_ids%5B%5D=200"
+    "https://bina.az/baki/alqi-satqi/menziller?has_bill_of_sale=true&has_repair=true&location_ids%5B%5D=51&location_ids%5B%5D=100&location_ids%5B%5D=16&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=99&location_ids%5B%5D=200"
 ))
 CITY_ID = os.environ.get("BINA_CITY_ID", "1")
 CATEGORY_ID = os.environ.get("BINA_CATEGORY_ID", "1")
