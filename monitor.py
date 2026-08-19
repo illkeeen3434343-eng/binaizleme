@@ -60,6 +60,9 @@ class PersistedQueryError(Exception):
 
 
 def tg_send_message(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        log("Telegram notification skipped: missing BOT_TOKEN or CHAT_ID")
+        return False
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
@@ -71,6 +74,9 @@ def tg_send_message(text):
 
 
 def tg_send_photo(photo_url, caption):
+    if not BOT_TOKEN or not CHAT_ID:
+        log("Telegram photo skipped: missing BOT_TOKEN or CHAT_ID")
+        return False
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
                           json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
@@ -229,10 +235,14 @@ def load_state():
     if not USE_API:
         if not os.path.exists(STATE_FILE):
             return {"listings": {}}, None
-        with open(STATE_FILE, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        data.setdefault("listings", {})
-        return data, None
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            data.setdefault("listings", {})
+            return data, None
+        except Exception:
+            return {"listings": {}}, None
+
     r = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=30)
     if r.status_code == 404:
         return {"listings": {}}, None
@@ -244,35 +254,18 @@ def load_state():
     return state, j["sha"]
 
 
-def _prune(state):
-    if MAX_SEEN <= 0:
-        return
-    L = state["listings"]
-    if len(L) > MAX_SEEN:
-        kept = sorted(L.items(), key=lambda kv: kv[1].get("first_seen", ""), reverse=True)[:MAX_SEEN]
-        state["listings"] = dict(kept)
-
-
 def save_state(state, sha, original_count=0):
-    """
-    original_count = number of listings that were loaded at the beginning of the run.
-    We refuse to save if we would destroy a large history.
-    """
-    _prune(state)
     new_count = len(state.get("listings", {}))
 
-    # ========== SAFETY CHECK ==========
-    if original_count > 300 and new_count < original_count * 0.6:
-        msg = f"SAFETY: refusing to overwrite {original_count} entries with only {new_count}"
-        log(msg)
-        if IN_ACTIONS:
-            tg_send_message(f"⚠️ {msg}\nBot refused to destroy history.")
-        return False, "safety-refuse"
+    # Ensures local directory exists
+    dirname = os.path.dirname(STATE_FILE)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
 
     if not USE_API:
         with open(STATE_FILE, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=1)
-        return True, "local"
+        return True, f"saved locally ({new_count} items)"
 
     reason = "unknown"
     for attempt in range(6):
@@ -288,7 +281,7 @@ def save_state(state, sha, original_count=0):
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code in (200, 201):
-            return True, "saved"
+            return True, "saved via API"
         if r.status_code in (409, 422):
             reason = f"HTTP {r.status_code} (retry)"
             g = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=30)
@@ -298,12 +291,12 @@ def save_state(state, sha, original_count=0):
                 raw = base64.b64decode(j.get("content", "")).decode("utf-8") if j.get("content") else ""
                 latest = json.loads(raw) if raw.strip() else {"listings": {}}
                 latest.setdefault("listings", {})
-                # Always keep existing keys
+                
+                # Merge existing listings to retain history across branch collisions
                 for k, v in state["listings"].items():
                     if k not in latest["listings"]:
                         latest["listings"][k] = v
                     else:
-                        # prefer lower price, keep extra fields
                         op = v.get("price")
                         lp = latest["listings"][k].get("price")
                         if isinstance(op, (int, float)) and isinstance(lp, (int, float)) and op < lp:
@@ -315,7 +308,6 @@ def save_state(state, sha, original_count=0):
                                 if fk not in latest["listings"][k] or latest["listings"][k][fk] is None:
                                     latest["listings"][k][fk] = fv
                 state = latest
-                _prune(state)
                 continue
             reason = f"re-read HTTP {g.status_code}"
             break
@@ -420,10 +412,6 @@ def notify(l, kind, old_price=None, changes=None):
 
 
 def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        log("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
-        sys.exit(1)
-
     try:
         state, sha = load_state()
     except Exception as e:
@@ -435,7 +423,7 @@ def main():
     seen = state["listings"]
     original_count = len(seen)
     first_run = original_count == 0
-    log(f"Loaded {original_count} historical listings")
+    log(f"Loaded {original_count} historical listings from {STATE_FILE}")
 
     try:
         items = fetch_listings()
@@ -451,36 +439,41 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     events = []
+    
+    # Process scraped items
     for l in items:
         key = l["id"]
         cur = l.get("price")
         snap = snapshot_of(l)
         if key not in seen:
-            if first_run or not NOTIFY_NEW:
-                seen[key] = {
-                    "url": l["url"], "price": cur, "snapshot": snap,
-                    "first_seen": now, "source": "bina.az"
-                }
-            else:
+            seen[key] = {
+                "url": l["url"], "price": cur, "snapshot": snap,
+                "first_seen": now, "source": "bina.az"
+            }
+            if not first_run and NOTIFY_NEW:
                 events.append(("new", l, None, None))
             continue
+
         rec = seen[key]
         old_price = rec.get("price")
         old_snap = rec.get("snapshot") or {}
         if is_real_drop(old_price, cur):
             events.append(("drop", l, old_price, None))
+            rec["price"] = cur
+            rec["snapshot"] = merge_snap(old_snap, snap)
         elif NOTIFY_INCREASES and is_real_rise(old_price, cur):
             events.append(("increase", l, old_price, None))
+            rec["price"] = cur
+            rec["snapshot"] = merge_snap(old_snap, snap)
         else:
             changed = describe_changes(old_snap, snap) if NOTIFY_UPDATES else []
             if changed:
                 events.append(("update", l, None, changed))
-            else:
-                if isinstance(cur, (int, float)):
-                    rec["price"] = cur
-                rec["snapshot"] = merge_snap(old_snap, snap)
-                if "source" not in rec:
-                    rec["source"] = "bina.az"
+            if isinstance(cur, (int, float)):
+                rec["price"] = cur
+            rec["snapshot"] = merge_snap(old_snap, snap)
+            if "source" not in rec:
+                rec["source"] = "bina.az"
 
     if first_run:
         ok, reason = save_state(state, sha, original_count)
@@ -492,16 +485,6 @@ def main():
     notified = 0
     for kind, l, old_price, changes in events:
         if notify(l, kind, old_price, changes):
-            prev = seen.get(l["id"], {})
-            updated = dict(prev)
-            updated.update({
-                "url": l["url"],
-                "price": l.get("price"),
-                "snapshot": merge_snap(prev.get("snapshot") or {}, snapshot_of(l)),
-                "first_seen": prev.get("first_seen", now),
-                "source": prev.get("source", "bina.az"),
-            })
-            seen[l["id"]] = updated
             notified += 1
         else:
             log("send failed:", l["id"])
