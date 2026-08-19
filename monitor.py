@@ -43,7 +43,7 @@ SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
 DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))   # ignore >60% "drops"
 RISE_ANOMALY_CEIL = float(os.environ.get("RISE_ANOMALY_CEIL", "3.0"))     # ignore >3x "rises"
 NOTIFY_INCREASES = os.environ.get("NOTIFY_INCREASES", "true").lower() == "true"
-NOTIFY_UPDATES = os.environ.get("NOTIFY_UPDATES", "true").lower() == "true"
+NOTIFY_UPDATES = os.environ.get("NOTIFY_UPDATES", "false").lower() == "true"
 NOTIFY_NEW = os.environ.get("NOTIFY_NEW", "false").lower() == "true"   # off: only report changes
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
