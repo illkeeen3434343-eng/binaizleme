@@ -27,19 +27,12 @@ import requests
 # YOUR SEARCHES  (paste the normal search URL from each site's address bar)
 # --------------------------------------------------------------------------- #
 BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
-    "https://bina.az/baki/alqi-satqi/menziller?room_ids%5B%5D=2&room_ids%5B%5D=3&room_ids%5B%5D=4&price_to=190000&area_from=55&has_bill_of_sale=true&has_mortgage=true&floor_first=false&floor_last=false&location_ids%5B%5D=8&location_ids%5B%5D=51&location_ids%5B%5D=2&location_ids%5B%5D=33&location_ids%5B%5D=54&location_ids%5B%5D=4&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=1&location_ids%5B%5D=259&location_ids%5B%5D=314&location_ids%5B%5D=100&location_ids%5B%5D=99&location_ids%5B%5D=233&location_ids%5B%5D=68&location_ids%5B%5D=74&location_ids%5B%5D=69&location_ids%5B%5D=103&location_ids%5B%5D=246&location_ids%5B%5D=186&location_ids%5B%5D=376&location_ids%5B%5D=25&location_ids%5B%5D=138&location_ids%5B%5D=152&location_ids%5B%5D=26&location_ids%5B%5D=175&location_ids%5B%5D=135&location_ids%5B%5D=136&location_ids%5B%5D=16&location_ids%5B%5D=36"
-))
-YENIEMLAK_SEARCH_URL = os.environ.get("YENIEMLAK_SEARCH_URL", (
-    "https://yeniemlak.az/elan/axtar?elan_nov=1&emlak=1&menzil_nov=&qiymet=&qiymet2=195000&mertebe=2&mertebe2=&otaq=2&otaq2=&sahe_m=50&sahe_m2=&sahe_s=&sahe_s2=&seher%5B%5D=7&rayon%5B%5D=2&rayon%5B%5D=3&rayon%5B%5D=6&rayon%5B%5D=9&menteqe%5B%5D=20&menteqe%5B%5D=23&menteqe%5B%5D=45&menteqe%5B%5D=72&menteqe%5B%5D=73&menteqe%5B%5D=74&metro%5B%5D=1&metro%5B%5D=2&metro%5B%5D=3&metro%5B%5D=4&metro%5B%5D=5&metro%5B%5D=8&metro%5B%5D=9&metro%5B%5D=10&metro%5B%5D=18&metro%5B%5D=19"
-))
-EV10_SEARCH_URL = os.environ.get("EV10_SEARCH_URL", (
-    "https://ev10.az/alqi-satqi/menzil?page_number=1&media_type=image&sort_by=date_desc&max_price=195000&room_counts=3%2C2%2C4&has_license=true&eligible_for_mortgage=true&renovated=true&floor_types=NOT_FIRST_FLOOR%2CNOT_TOP_FLOOR&location_ids=29%2C32%2C41%2C42%2C43%2C78%2C83%2C186%2C187%2C188%2C192%2C193%2C194%2C195%2C196%2C205%2C206"
+    "https://bina.az/baki/alqi-satqi/menziller?has_bill_of_sale=true&has_repair=true&location_ids%5B%5D=51&location_ids%5B%5D=100&location_ids%5B%5D=16&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=99&location_ids%5B%5D=200"
 ))
 
+# This bot tracks bina.az ONLY.
 SOURCES = [
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": ""},
-    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:"},
-    {"name": "ev10.az", "type": "ev10", "url": EV10_SEARCH_URL, "prefix": "ev:"},
 ]
 
 # bina.az config
@@ -715,13 +708,8 @@ def format_change(l, source_name, kind, old_price, new_price, n_changes):
     head = "🔻 <b>PRICE DROP</b>" if kind == "drop" else "🔺 <b>PRICE INCREASE</b>"
     lines = [f"{head} · {html.escape(source_name)}", ""]
     cur = l.get("currency", "AZN")
-    diff = int(new_price) - int(old_price)
-    sign = "−" if diff < 0 else "+"
     old_txt = f"<s>{_spaced(old_price)}</s>" if kind == "drop" else _spaced(old_price)
-    lines.append(f"💰 <b>Price:</b> {old_txt} → <b>{_spaced(new_price)}</b> {cur} "
-                 f"({sign}{_spaced(abs(diff))})")
-    if n_changes:
-        lines.append(f"📊 <i>Change #{n_changes} for this listing</i>")
+    lines.append(f"💰 <b>Price:</b> {old_txt} → <b>{_spaced(new_price)}</b> {cur}")
     if l.get("rooms") is not None:
         lines.append(f"🛏 <b>Rooms:</b> {l['rooms']}")
     if l.get("area") is not None:
