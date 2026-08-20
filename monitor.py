@@ -51,7 +51,17 @@ GRAPHQL_URL = "https://bina.az/graphql"
 OPERATION = "SearchItems"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "6"))
+# Price tracking needs the FULL result set each run (not just the newest listings),
+# so an old listing's price change is still fetched and compared. SCAN_PAGES caps how
+# many pages we page through — a safety valve against hammering bina / getting blocked.
+# 120 pages * 16 = ~1920 listings. If your search has more matches than this, either
+# raise it (block risk) or narrow the search so the whole set fits.
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "120"))
+PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause between pages
+# Reject absurd price jumps (parse glitches), but allow any realistic change.
+PRICE_GLITCH_LOW = float(os.environ.get("PRICE_GLITCH_LOW", "0.2"))    # new < 20% of old
+PRICE_GLITCH_HIGH = float(os.environ.get("PRICE_GLITCH_HIGH", "5.0"))  # new > 5x old
+MAX_PRICE_HISTORY = int(os.environ.get("MAX_PRICE_HISTORY", "0"))      # 0 = keep ALL transitions
 
 # general config
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
@@ -247,7 +257,10 @@ def fetch_bina(url):
     fv = bina_filter_vars(url)
     check = bina_check(url)
     out, cursor = [], None
-    for _ in range(SCAN_PAGES):
+    total_count = None
+    pages = 0
+    hit_cap = False
+    for i in range(SCAN_PAGES):
         r = requests.get(GRAPHQL_URL, params=_bina_params(fv, cursor), headers=API_HEADERS, timeout=30)
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code}")
@@ -263,6 +276,8 @@ def fetch_bina(url):
         conn = (payload.get("data") or {}).get("itemsConnection")
         if not conn:
             raise RuntimeError("no itemsConnection")
+        if total_count is None:
+            total_count = conn.get("totalCount")
         for edge in conn.get("edges", []):
             node = edge.get("node")
             if node and node.get("id") is not None:
@@ -272,11 +287,36 @@ def fetch_bina(url):
                         out.append(l)
                 except Exception as e:
                     log("skip bina node:", e)
+        pages += 1
         info = conn.get("pageInfo") or {}
         if not info.get("hasNextPage") or not info.get("endCursor"):
             break
         cursor = info["endCursor"]
+        if i == SCAN_PAGES - 1:
+            hit_cap = True
+        if PAGE_DELAY:
+            time.sleep(PAGE_DELAY)
+    log(f"bina: scanned {pages} pages, {len(out)} matching listings"
+        + (f" of ~{total_count} total" if total_count is not None else ""))
+    # surface a coverage gap so you know if changes on deep listings are being missed
+    if hit_cap and total_count and total_count > len(out):
+        _coverage_warn(len(out), total_count)
     return out
+
+
+_coverage_warned = {"done": False}
+
+
+def _coverage_warn(scanned, total):
+    if _coverage_warned["done"]:
+        return
+    _coverage_warned["done"] = True
+    if IN_ACTIONS:
+        tg_send_message(
+            f"ℹ️ Price tracker is covering <b>{scanned}</b> of ~<b>{total}</b> matching "
+            f"listings (scan cap reached). Price changes on the deeper ~{total - scanned} "
+            f"are not tracked. To cover everything, narrow the search (add a price cap or "
+            f"rooms) or raise SCAN_PAGES.")
 
 
 # --------------------------------------------------------------------------- #
@@ -525,6 +565,37 @@ def _gh_url():
     return f"https://api.github.com/repos/{GH_REPO}/contents/{STATE_FILE}"
 
 
+def _content_from_contents_json(j):
+    """Return the file text from a Contents-API response, fetching the raw blob
+    when the file is > 1 MB (content field empty)."""
+    cb = j.get("content", "") or ""
+    if cb.strip():
+        return base64.b64decode(cb).decode("utf-8")
+    if (j.get("size") or 0) > 0:
+        rh = dict(_gh_headers())
+        rh["Accept"] = "application/vnd.github.raw"
+        rr = requests.get(_gh_url(), headers=rh, params={"ref": GH_BRANCH}, timeout=60)
+        rr.raise_for_status()
+        return rr.text
+    return ""
+
+
+def _merge_records(a, b):
+    """Merge two versions of the same listing: keep the LONGER price_history so no
+    recorded transition is ever lost; carry the most recent last_seen."""
+    ha = a.get("price_history") if isinstance(a.get("price_history"), list) else []
+    hb = b.get("price_history") if isinstance(b.get("price_history"), list) else []
+    keep = dict(a) if len(ha) >= len(hb) else dict(b)
+    seens = [x for x in (a.get("last_seen"), b.get("last_seen")) if x]
+    if seens:
+        keep["last_seen"] = max(seens)
+    if keep.get("price_history"):
+        lastp = keep["price_history"][-1].get("price")
+        if isinstance(lastp, (int, float)):
+            keep["price"] = int(lastp)
+    return keep
+
+
 def load_state():
     if not USE_API:
         if not os.path.exists(STATE_FILE):
@@ -540,23 +611,10 @@ def load_state():
     j = r.json()
     sha = j["sha"]
     size = j.get("size", 0) or 0
-    content_b64 = j.get("content", "") or ""
-    if content_b64.strip():
-        raw = base64.b64decode(content_b64).decode("utf-8")
-    elif size > 0:
-        # File is > 1 MB: the Contents API does NOT inline it (content == "").
-        # Re-request with the raw media type (supported up to 100 MB). NEVER treat
-        # this as an empty database, or we would overwrite all history.
-        raw_headers = dict(_gh_headers())
-        raw_headers["Accept"] = "application/vnd.github.raw"
-        rr = requests.get(_gh_url(), headers=raw_headers, params={"ref": GH_BRANCH}, timeout=60)
-        rr.raise_for_status()
-        raw = rr.text
-        if not raw.strip():
-            raise RuntimeError(f"seen.json is {size} bytes but its content came back empty; "
-                               "aborting run to protect history.")
-    else:
-        raw = ""                                # size 0 -> truly empty file
+    raw = _content_from_contents_json(j)
+    if not raw.strip() and size > 0:
+        raise RuntimeError(f"seen.json is {size} bytes but its content came back empty; "
+                           "aborting run to protect history.")
     try:
         state = json.loads(raw) if raw.strip() else {"listings": {}}
     except json.JSONDecodeError as e:
@@ -602,18 +660,14 @@ def save_state(state, sha):
             if g.status_code == 200:
                 j = g.json()
                 sha = j["sha"]
-                raw = base64.b64decode(j.get("content", "")).decode("utf-8") if j.get("content") else ""
+                raw = _content_from_contents_json(j)
                 latest = json.loads(raw) if raw.strip() else {"listings": {}}
                 latest.setdefault("listings", {})
                 for k, v in state["listings"].items():
                     if k not in latest["listings"]:
                         latest["listings"][k] = v
-                    else:  # keep a lower price if we detected a drop this run
-                        ours = v.get("price")
-                        theirs = latest["listings"][k].get("price")
-                        if isinstance(ours, (int, float)) and isinstance(theirs, (int, float)) and ours < theirs:
-                            latest["listings"][k]["price"] = ours
-                            latest["listings"][k]["price_dropped_at"] = v.get("price_dropped_at")
+                    else:  # same listing touched by both -> keep the fuller price history
+                        latest["listings"][k] = _merge_records(latest["listings"][k], v)
                 if state.get("source_status"):
                     latest["source_status"] = state["source_status"]
                 state = latest
@@ -653,120 +707,141 @@ def _fmt_pub(v):
         return str(v)
 
 
-def format_message(l, source_name, kind="new", old_price=None):
-    if kind == "drop":
-        lines = [f"🔻 <b>PRICE DROP</b> · {html.escape(source_name)}", ""]
-    else:
-        lines = [f"🏠 <b>NEW APARTMENT FOUND</b> · {html.escape(source_name)}", ""]
+def _spaced(n):
+    return f"{int(n):,}".replace(",", " ")
+
+
+def format_change(l, source_name, kind, old_price, new_price, n_changes):
+    head = "🔻 <b>PRICE DROP</b>" if kind == "drop" else "🔺 <b>PRICE INCREASE</b>"
+    lines = [f"{head} · {html.escape(source_name)}", ""]
     cur = l.get("currency", "AZN")
-    if kind == "drop" and isinstance(old_price, (int, float)) and l.get("price") is not None:
-        diff = int(old_price) - int(l["price"])
-        lines.append(f"💰 <b>Price:</b> <s>{int(old_price):,}</s> → <b>{l['price']:,}</b> {cur} "
-                     f"(−{diff:,})".replace(",", " "))
-    elif l.get("price") is not None:
-        lines.append(f"💰 <b>Price:</b> {l['price']:,} {cur}".replace(",", " "))
-    lines.append(f"🛏 <b>Rooms:</b> {l.get('rooms') if l.get('rooms') is not None else '-'}")
+    diff = int(new_price) - int(old_price)
+    sign = "−" if diff < 0 else "+"
+    old_txt = f"<s>{_spaced(old_price)}</s>" if kind == "drop" else _spaced(old_price)
+    lines.append(f"💰 <b>Price:</b> {old_txt} → <b>{_spaced(new_price)}</b> {cur} "
+                 f"({sign}{_spaced(abs(diff))})")
+    if n_changes:
+        lines.append(f"📊 <i>Change #{n_changes} for this listing</i>")
+    if l.get("rooms") is not None:
+        lines.append(f"🛏 <b>Rooms:</b> {l['rooms']}")
     if l.get("area") is not None:
         area = int(l["area"]) if float(l["area"]).is_integer() else l["area"]
         lines.append(f"📐 <b>Area:</b> {area} {l.get('area_units', 'm²')}")
     if l.get("floor") and l.get("floors"):
         lines.append(f"🏢 <b>Floor:</b> {l['floor']}/{l['floors']}")
-    elif l.get("floor"):
-        lines.append(f"🏢 <b>Floor:</b> {l['floor']}")
     if l.get("location"):
         lines.append(f"📍 <b>Location:</b> {html.escape(str(l['location']))}")
-    pub = _fmt_pub(l.get("updated_at"))
-    if pub:
-        label = "Updated" if kind == "drop" else "Published"
-        lines.append(f"📅 <b>{label}:</b> {html.escape(pub)}")
-    tags = [t for t, on in (("kupçalı", l.get("has_bill_of_sale")),
-                            ("ipoteka", l.get("has_mortgage")),
-                            ("təmirli", l.get("has_repair"))) if on]
-    if tags:
-        lines.append("✅ " + ", ".join(tags))
     lines.append("")
     lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
     return "\n".join(lines)
 
 
-def notify(l, source_name, kind="new", old_price=None):
-    text = format_message(l, source_name, kind=kind, old_price=old_price)
+def notify_change(l, source_name, kind, old_price, new_price, n_changes):
+    text = format_change(l, source_name, kind, old_price, new_price, n_changes)
     if SEND_PHOTOS and l.get("photo"):
         return tg_send_photo(l["photo"], text)
     return tg_send_message(text)
 
 
-def is_real_drop(old_price, new_price):
-    """True only for a genuine downward move (guards against missing/garbled prices)."""
-    if not isinstance(old_price, (int, float)) or not isinstance(new_price, (int, float)):
-        return False
-    if new_price <= 0 or new_price >= old_price:
-        return False
-    if (old_price - new_price) < PRICE_DROP_MIN_ABS:
-        return False
-    if new_price < old_price * DROP_ANOMALY_FLOOR:   # implausibly large "drop" => parse glitch
-        return False
-    return True
+def normalize_price(v):
+    """200000 / '200,000' / '200 000 AZN' -> 200000 (int) ; unparseable -> None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v) if v > 0 else None
+    if isinstance(v, str):
+        d = re.sub(r"[^\d]", "", v)
+        return int(d) if d else None
+    return None
+
+
+def is_price_glitch(old, new):
+    """Reject absurd jumps that are almost certainly parse errors, not real changes."""
+    if new <= 0:
+        return True
+    if new < old * PRICE_GLITCH_LOW or new > old * PRICE_GLITCH_HIGH:
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
-# Per-source processing
+# Per-source processing  —  PRICE-CHANGE TRACKER
+#
+# Model: every listing carries a permanent price_history. On each run we compare
+# the current price to the last recorded price and, on a real change, APPEND a
+# {price, date, change} event (never overwrite/lose past events). New listings are
+# recorded silently (seed initial price); we alert only on price changes, in BOTH
+# directions. Old age is irrelevant — any listing in the fetched set is compared.
 # --------------------------------------------------------------------------- #
-def source_seeded(seen, prefix):
-    """Has this source ever been recorded before?"""
-    if prefix == "":                     # bina.az uses bare numeric keys
-        return any(not k.startswith("ye:") for k in seen)
-    return any(k.startswith(prefix) for k in seen)
+def _last_price(rec):
+    ph = rec.get("price_history")
+    if isinstance(ph, list) and ph:
+        p = ph[-1].get("price")
+        if isinstance(p, (int, float)):
+            return int(p)
+    p = rec.get("price")
+    return int(p) if isinstance(p, (int, float)) else None
+
+
+def _ensure_history(rec, now):
+    """Backward-compat migration: seed price_history from an old flat 'price'."""
+    if not isinstance(rec.get("price_history"), list):
+        rec["price_history"] = []
+    if not rec["price_history"] and isinstance(rec.get("price"), (int, float)):
+        rec["price_history"].append({"price": int(rec["price"]),
+                                     "date": rec.get("first_seen", now)})
 
 
 def process_source(items, source, seen):
     prefix, name = source["prefix"], source["name"]
-    seeded = source_seeded(seen, prefix)
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    fresh, drops = [], []
-    recorded = 0
+    events = []
     for l in items:
         key = prefix + str(l["id"])
-        cur_price = l.get("price")
-        if key in seen:
-            if not seeded:
-                continue
-            old_price = seen[key].get("price")
-            if is_real_drop(old_price, cur_price):
-                drops.append((key, l, old_price))            # alert after the loop
-            elif isinstance(cur_price, (int, float)) and cur_price != old_price:
-                # price went up, or baseline was missing -> track it, no alert
-                if not isinstance(old_price, (int, float)) or cur_price > old_price:
-                    seen[key]["price"] = cur_price
-            continue
-        if seeded:
-            fresh.append((key, l))
-        else:
-            seen[key] = {"url": l["url"], "price": cur_price, "first_seen": now,
-                         "notification_sent": True, "matched": True, "source": name}
-            recorded += 1
+        cur = normalize_price(l.get("price"))
+        rec = seen.get(key)
 
-    if not seeded:
-        tg_send_message(f"✅ Now also monitoring <b>{html.escape(name)}</b> — recorded "
-                        f"{recorded} current listings. You'll get only new ones from here.")
-        return 0
+        if rec is None:
+            # First time we ever see this listing -> record it silently with its
+            # initial price. We do NOT announce new listings (this is a price tracker).
+            seen[key] = {"url": l["url"], "price": cur, "first_seen": now, "last_seen": now,
+                         "source": name,
+                         "price_history": ([{"price": cur, "date": now}] if cur is not None else [])}
+            continue
+
+        _ensure_history(rec, now)
+        rec["last_seen"] = now
+        rec["url"] = l.get("url", rec.get("url"))
+        old = _last_price(rec)
+
+        if cur is None:
+            continue                       # price missing/garbled this run -> ignore, no fake event
+        if old is None:
+            rec["price"] = cur             # establish a baseline for a record that had none
+            if not rec["price_history"]:
+                rec["price_history"].append({"price": cur, "date": now})
+            continue
+        if cur == old:
+            continue                       # unchanged -> no event
+        if is_price_glitch(old, cur):
+            log("ignoring glitchy price:", key, old, "->", cur)
+            continue
+
+        change = cur - old
+        # RECORD the transition permanently FIRST (source of truth), then alert.
+        rec["price_history"].append({"price": cur, "date": now, "change": change})
+        if MAX_PRICE_HISTORY and len(rec["price_history"]) > MAX_PRICE_HISTORY:
+            rec["price_history"] = rec["price_history"][-MAX_PRICE_HISTORY:]
+        rec["price"] = cur                 # latest/current price
+        kind = "increase" if change > 0 else "drop"
+        events.append((l, kind, old, cur, len(rec["price_history"])))
+        log(f"price change {key}: {old} -> {cur} ({'+' if change>0 else ''}{change})")
 
     notified = 0
-    for key, l in fresh:
-        if notify(l, name, kind="new"):
-            seen[key] = {"url": l["url"], "price": l.get("price"), "first_seen": now,
-                         "notification_sent": True, "matched": True, "source": name}
+    for l, kind, old, cur, n in events:
+        if notify_change(l, name, kind, old, cur, n):
             notified += 1
-        else:
-            log("send failed, retry next run:", key)
-    for key, l, old_price in drops:
-        if notify(l, name, kind="drop", old_price=old_price):
-            seen[key]["price"] = l.get("price")        # new baseline only after a successful alert
-            seen[key]["price_dropped_at"] = now
-            notified += 1
-            log("Price drop:", key, old_price, "->", l.get("price"))
-        else:
-            log("drop send failed, retry next run:", key)
+        # note: the transition is already saved in price_history regardless of send
     return notified
 
 
