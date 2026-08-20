@@ -304,12 +304,7 @@ def _coverage_warn(scanned, total):
     if _coverage_warned["done"]:
         return
     _coverage_warned["done"] = True
-    if IN_ACTIONS:
-        tg_send_message(
-            f"ℹ️ Price tracker is covering <b>{scanned}</b> of ~<b>{total}</b> matching "
-            f"listings (scan cap reached). Price changes on the deeper ~{total - scanned} "
-            f"are not tracked. To cover everything, narrow the search (add a price cap or "
-            f"rooms) or raise SCAN_PAGES.")
+    
 
 # --------------------------------------------------------------------------- #
 # State (GitHub Contents API, atomic)
