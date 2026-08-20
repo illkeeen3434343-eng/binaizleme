@@ -49,7 +49,7 @@ PAGE_SIZE = 16
 # many pages we page through — a safety valve against hammering bina / getting blocked.
 # 120 pages * 16 = ~1920 listings. If your search has more matches than this, either
 # raise it (block risk) or narrow the search so the whole set fits.
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "120"))
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "250"))
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause between pages
 # Reject absurd price jumps (parse glitches), but allow any realistic change.
 PRICE_GLITCH_LOW = float(os.environ.get("PRICE_GLITCH_LOW", "0.2"))    # new < 20% of old
