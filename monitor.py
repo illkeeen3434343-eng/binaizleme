@@ -535,13 +535,36 @@ def load_state():
         return data, None
     r = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=30)
     if r.status_code == 404:
-        return {"listings": {}}, None
+        return {"listings": {}}, None          # genuinely no file yet -> first run
     r.raise_for_status()
     j = r.json()
-    raw = base64.b64decode(j.get("content", "")).decode("utf-8") if j.get("content") else ""
-    state = json.loads(raw) if raw.strip() else {"listings": {}}
+    sha = j["sha"]
+    size = j.get("size", 0) or 0
+    content_b64 = j.get("content", "") or ""
+    if content_b64.strip():
+        raw = base64.b64decode(content_b64).decode("utf-8")
+    elif size > 0:
+        # File is > 1 MB: the Contents API does NOT inline it (content == "").
+        # Re-request with the raw media type (supported up to 100 MB). NEVER treat
+        # this as an empty database, or we would overwrite all history.
+        raw_headers = dict(_gh_headers())
+        raw_headers["Accept"] = "application/vnd.github.raw"
+        rr = requests.get(_gh_url(), headers=raw_headers, params={"ref": GH_BRANCH}, timeout=60)
+        rr.raise_for_status()
+        raw = rr.text
+        if not raw.strip():
+            raise RuntimeError(f"seen.json is {size} bytes but its content came back empty; "
+                               "aborting run to protect history.")
+    else:
+        raw = ""                                # size 0 -> truly empty file
+    try:
+        state = json.loads(raw) if raw.strip() else {"listings": {}}
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"seen.json failed to parse ({e}); aborting to protect history.")
+    if not isinstance(state, dict):
+        raise RuntimeError("seen.json is not a JSON object; aborting to protect history.")
     state.setdefault("listings", {})
-    return state, j["sha"]
+    return state, sha
 
 
 def _prune(state):
@@ -763,6 +786,7 @@ def main():
             tg_send_message(f"⚠️ Could not READ memory this run ({html.escape(str(e))}). Skipping.")
         return
     seen = state["listings"]
+    loaded_count = len(seen)          # invariant: we must never save fewer than this
 
     if IN_ACTIONS and not USE_API:
         tg_send_message("⚠️ Memory storage not configured (GH_TOKEN/GH_REPO missing); listings "
@@ -796,11 +820,21 @@ def main():
         status[name] = ""
         total_notified += process_source(items, source, seen)
 
+    # HARD SAFETY INVARIANT: a run must never shrink the historical dataset.
+    # We only ever add to `seen`, so this can only trip on a bug/partial read.
+    if len(seen) < loaded_count:
+        log(f"ABORT SAVE: would shrink history {loaded_count} -> {len(seen)}")
+        if IN_ACTIONS:
+            tg_send_message(f"🛑 Save aborted to protect history: had {loaded_count} records, "
+                            f"about to write {len(seen)}. Nothing was overwritten.")
+        return
+
     ok, reason = save_state(state, sha)
     if not ok:
         tg_send_message("⚠️ Read listings fine, but could NOT save memory — listings will "
                         f"repeat until fixed.\nReason: {html.escape(reason)}")
-    log(f"Done. notified={total_notified} saved={ok}({reason}) seen_total={len(seen)} "
+    log(f"Done. notified={total_notified} saved={ok}({reason}) "
+        f"records_before={loaded_count} records_after={len(seen)} "
         f"status={ {k: (v or 'ok') for k, v in status.items()} }")
 
 
