@@ -55,7 +55,11 @@ SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "6"))
 
 # general config
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
-MAX_SEEN = 8000
+# 0 (default) = UNLIMITED, permanent historical retention. seen.json is a permanent
+# database, not a cache: nothing is ever dropped for being old. A positive value is
+# only a safety valve against GitHub's per-file size limit (~100 MB); leave it 0
+# unless you actually approach that (hundreds of thousands of listings).
+MAX_SEEN = int(os.environ.get("MAX_SEEN", "0"))
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
 # Price-drop alerts: notify when a known listing's price falls.
 PRICE_DROP_MIN_ABS = int(os.environ.get("PRICE_DROP_MIN_ABS", "0"))   # ignore drops smaller than this (AZN)
@@ -541,10 +545,12 @@ def load_state():
 
 
 def _prune(state):
-    L = state["listings"]
-    if len(L) > MAX_SEEN:
-        kept = sorted(L.items(), key=lambda kv: kv[1].get("first_seen", ""), reverse=True)[:MAX_SEEN]
-        state["listings"] = dict(kept)
+    # MAX_SEEN <= 0 means unlimited: keep ALL history, never truncate.
+    if MAX_SEEN and MAX_SEEN > 0:
+        L = state["listings"]
+        if len(L) > MAX_SEEN:
+            kept = sorted(L.items(), key=lambda kv: kv[1].get("first_seen", ""), reverse=True)[:MAX_SEEN]
+            state["listings"] = dict(kept)
 
 
 def save_state(state, sha):
