@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -29,10 +29,14 @@ import requests
 BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
     "https://bina.az/baki/alqi-satqi/menziller?has_bill_of_sale=true&has_repair=true&location_ids%5B%5D=51&location_ids%5B%5D=100&location_ids%5B%5D=16&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=99&location_ids%5B%5D=200"
 ))
+YENIEMLAK_SEARCH_URL = os.environ.get("YENIEMLAK_SEARCH_URL", (
+    "https://yeniemlak.az/elan/axtar?elan_nov=1&emlak=1&menzil_nov=&qiymet=&qiymet2=&mertebe=&mertebe2=&otaq=&otaq2=&sahe_m=&sahe_m2=&sahe_s=&sahe_s2=&seher%5B%5D=7&rayon%5B%5D=2&rayon%5B%5D=9&menteqe%5B%5D=20&menteqe%5B%5D=66&menteqe%5B%5D=72&menteqe%5B%5D=73&metro%5B%5D=1&metro%5B%5D=2&metro%5B%5D=3&metro%5B%5D=4&metro%5B%5D=5"
+))
 
-# This bot tracks bina.az ONLY.
+# Sources this bot tracks. Each listing's price history is tracked independently.
 SOURCES = [
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": ""},
+    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:"},
 ]
 
 # bina.az config
@@ -49,7 +53,7 @@ PAGE_SIZE = 16
 # many pages we page through — a safety valve against hammering bina / getting blocked.
 # 120 pages * 16 = ~1920 listings. If your search has more matches than this, either
 # raise it (block risk) or narrow the search so the whole set fits.
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "1000"))
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "120"))
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause between pages
 # Reject absurd price jumps (parse glitches), but allow any realistic change.
 PRICE_GLITCH_LOW = float(os.environ.get("PRICE_GLITCH_LOW", "0.2"))    # new < 20% of old
@@ -304,7 +308,105 @@ def _coverage_warn(scanned, total):
     if _coverage_warned["done"]:
         return
     _coverage_warned["done"] = True
-    
+    if IN_ACTIONS:
+        tg_send_message(
+            f"ℹ️ Price tracker is covering <b>{scanned}</b> of ~<b>{total}</b> matching "
+            f"listings (scan cap reached). Price changes on the deeper ~{total - scanned} "
+            f"are not tracked. To cover everything, narrow the search (add a price cap or "
+            f"rooms) or raise SCAN_PAGES.")
+
+
+# --------------------------------------------------------------------------- #
+# yeniemlak.az  (server-rendered HTML; paginated via ?page=N)
+# --------------------------------------------------------------------------- #
+YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "60"))   # safety cap on pages to scan
+
+
+def _with_page(url, n):
+    parts = urlparse(url)
+    q = parse_qs(parts.query, keep_blank_values=True)
+    q["page"] = [str(n)]
+    new_q = urlencode(q, doseq=True)
+    return urlunparse(parts._replace(query=new_q))
+
+
+def _parse_yeniemlak_page(raw):
+    id_url = {}
+    for m in re.finditer(r'/elan/([A-Za-z0-9\-]*?-(\d{5,}))', raw):
+        id_url.setdefault(m.group(2), "https://yeniemlak.az/elan/" + m.group(1))
+    text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
+    total_m = re.search(r"Nəticə:\s*(\d+)", text)
+    total = int(total_m.group(1)) if total_m else None
+    heads = [m.start() for m in re.finditer(r"(?:Satılır|Kirayə|Girov)\s*\d[\d ]*?\s*Baxış", text)]
+    heads.append(len(text))
+    out = []
+    for i in range(len(heads) - 1):
+        b = text[heads[i]:heads[i + 1]]
+        m_id = re.search(r"Elan:\s*(\d+)", b)
+        if not m_id:
+            continue
+        iid = m_id.group(1)
+        pm = re.search(r"(?:Satılır|Kirayə|Girov)\s*(\d[\d ]*?)\s*Baxış", b)
+        price = int(pm.group(1).replace(" ", "")) if pm else None
+        fl = re.search(r"(\d+)\s*/\s*(\d+)\s*Mərtəbə", b)
+        rooms = re.search(r"(\d+)\s*otaq", b)
+        area = re.search(r"(\d+)\s*m2", b)
+        date = re.search(r"Tarix:\s*([\d.]+)", b)
+        loc = None
+        lm = re.search(r"Ünvan:\s*(.+)", b)
+        if lm:
+            raw_loc = lm.group(1).strip()
+            mm = re.search(r"(.*?metro\.\s*\S+(?:\s\S+)?)", raw_loc)
+            loc = (mm.group(1) if mm else raw_loc[:70]).strip()
+        out.append({"id": iid, "url": id_url.get(iid, f"https://yeniemlak.az/elan/{iid}"),
+                    "rooms": int(rooms.group(1)) if rooms else None,
+                    "area": int(area.group(1)) if area else None, "area_units": "m²",
+                    "floor": int(fl.group(2)) if fl else None,
+                    "floors": int(fl.group(1)) if fl else None,
+                    "price": price, "currency": "AZN", "location": loc, "location_id": None,
+                    "updated_at": date.group(1) if date else None,
+                    "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
+                    "photo": None})
+    return out, total
+
+
+def fetch_yeniemlak(url):
+    """Page through the whole yeniemlak result set. Stops when a page adds no new
+    listing IDs (also the graceful fallback if ?page is ever ignored)."""
+    all_out, seen_ids = [], set()
+    total = None
+    for page in range(1, YE_MAX_PAGES + 1):
+        purl = _with_page(url, page)
+        r = requests.get(purl, headers=HTML_HEADERS, timeout=30)
+        if r.status_code != 200:
+            if page == 1:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            break
+        listings, tot = _parse_yeniemlak_page(r.text)
+        if tot is not None:
+            total = tot
+        new = [l for l in listings if l["id"] not in seen_ids]
+        if not new:                       # no new IDs -> end of results (or page ignored)
+            break
+        for l in new:
+            seen_ids.add(l["id"])
+            all_out.append(l)
+        if PAGE_DELAY:
+            time.sleep(PAGE_DELAY)
+    log(f"yeniemlak: {len(all_out)} listings"
+        + (f" of ~{total} total" if total is not None else ""))
+    if not all_out and total and total > 0:
+        raise RuntimeError("yeniemlak parsed 0 (structure changed?)")
+    return all_out
+
+
+def fetch_for_source(source):
+    if source["type"] == "bina":
+        return fetch_bina(source["url"])
+    if source["type"] == "yeniemlak":
+        return fetch_yeniemlak(source["url"])
+    raise RuntimeError(f"unknown source type {source['type']}")
+
 
 # --------------------------------------------------------------------------- #
 # State (GitHub Contents API, atomic)
@@ -621,7 +723,7 @@ def main():
     for source in SOURCES:
         name = source["name"]
         try:
-            items = fetch_bina(source["url"])
+            items = fetch_for_source(source)
         except PersistedQueryError:
             err = ("signature expired (persisted query). Re-capture it from the browser "
                    "Network tab and update BINA_PERSISTED_HASH.")
