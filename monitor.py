@@ -38,9 +38,9 @@ TAP_SEARCH_URL = os.environ.get("TAP_SEARCH_URL", (
 
 # Sources this bot tracks. Each listing's price history is tracked independently.
 SOURCES = [
-    {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": ""},
-    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:"},
-    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:"},
+    {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price"},
+    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new"},
+    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "price"},
 ]
 
 # bina.az config
@@ -316,7 +316,8 @@ def _coverage_warn(scanned, total):
 # --------------------------------------------------------------------------- #
 # yeniemlak.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
-YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "60"))   # safety cap on pages to scan
+YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "5"))   # owner-new mode: newest pages only
+MAX_OWNER_CHECKS = int(os.environ.get("MAX_OWNER_CHECKS", "40"))  # detail-page checks per run
 
 
 def _with_page(url, n):
@@ -598,6 +599,8 @@ def save_state(state, sha):
                         latest["listings"][k] = _merge_records(latest["listings"][k], v)
                 if state.get("source_status"):
                     latest["source_status"] = state["source_status"]
+                if state.get("seeded"):
+                    latest["seeded"] = state["seeded"]
                 state = latest
                 _prune(state)
                 continue
@@ -661,6 +664,87 @@ def format_change(l, source_name, kind, old_price, new_price, n_changes):
 
 def notify_change(l, source_name, kind, old_price, new_price, n_changes):
     text = format_change(l, source_name, kind, old_price, new_price, n_changes)
+    if SEND_PHOTOS and l.get("photo"):
+        return tg_send_photo(l["photo"], text)
+    return tg_send_message(text)
+
+
+# --------------------------------------------------------------------------- #
+# yeniemlak "new owner post" mode: announce new listings posted by the property
+# OWNER ("Əmlak sahibi") — not agents/realtors ("Vasitəçi" / "Rieltor"). No price
+# tracking for this source. The owner label lives on the detail page, so we only
+# fetch detail pages for genuinely NEW listings (few per run).
+# --------------------------------------------------------------------------- #
+def check_is_owner(url):
+    """True = owner post, False = agent/realtor, None = couldn't determine (retry)."""
+    try:
+        r = requests.get(url, headers=HTML_HEADERS, timeout=30)
+        if r.status_code != 200:
+            return None
+        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", r.text)))
+    except requests.RequestException:
+        return None
+    if "Əmlak sahibi" in text:
+        return True
+    if "Vasitəçi" in text or "Rieltor" in text:
+        return False
+    return False   # no explicit owner label -> treat as not-owner (conservative)
+
+
+def format_new_owner(l, source_name):
+    lines = [f"🏠 <b>NEW LISTING</b> · {html.escape(source_name)} · <i>Əmlak sahibi</i>", ""]
+    if l.get("price") is not None:
+        lines.append(f"💰 <b>Price:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
+    if l.get("rooms") is not None:
+        lines.append(f"🛏 <b>Rooms:</b> {l['rooms']}")
+    if l.get("area") is not None:
+        area = int(l["area"]) if float(l["area"]).is_integer() else l["area"]
+        lines.append(f"📐 <b>Area:</b> {area} {l.get('area_units', 'm²')}")
+    if l.get("floor") and l.get("floors"):
+        lines.append(f"🏢 <b>Floor:</b> {l['floor']}/{l['floors']}")
+    if l.get("location"):
+        lines.append(f"📍 <b>Location:</b> {html.escape(str(l['location']))}")
+    lines.append("")
+    lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
+    return "\n".join(lines)
+
+
+def process_owner_new(items, source, seen, seeded_flags):
+    prefix, name = source["prefix"], source["name"]
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+    if not seeded_flags.get(name):
+        # First run for this source: seed ALL current listings silently (no detail
+        # fetches, no announcements) so owner-checking only runs on future new posts.
+        for l in items:
+            seen[prefix + str(l["id"])] = {"url": l["url"], "first_seen": now, "source": name}
+        seeded_flags[name] = True
+        log(f"{name}: seeded {len(items)} listings silently (owner-check starts next run)")
+        return 0
+
+    checks = 0
+    notified = 0
+    for l in items:
+        key = prefix + str(l["id"])
+        if key in seen:
+            continue                       # already handled; never re-check or price-track
+        if checks >= MAX_OWNER_CHECKS:
+            break                          # spread detail-page load; rest handled next run
+        owner = check_is_owner(l["url"])
+        checks += 1
+        if PAGE_DELAY:
+            time.sleep(PAGE_DELAY)
+        if owner is None:
+            continue                       # couldn't determine -> leave unrecorded, retry later
+        seen[key] = {"url": l["url"], "first_seen": now, "source": name, "owner": bool(owner)}
+        if owner and notify_new_owner_msg(l, name):
+            notified += 1
+    log(f"{name}: checked {checks} new, announced {notified} owner posts")
+    return notified
+
+
+def notify_new_owner_msg(l, name):
+    text = format_new_owner(l, name)
     if SEND_PHOTOS and l.get("photo"):
         return tg_send_photo(l["photo"], text)
     return tg_send_message(text)
@@ -792,6 +876,7 @@ def main():
 
     total_notified = 0
     status = state.setdefault("source_status", {})   # source name -> last error ("" = healthy)
+    seeded_flags = state.setdefault("seeded", {})     # owner_new sources -> initial seed done
     for source in SOURCES:
         name = source["name"]
         try:
@@ -816,7 +901,10 @@ def main():
         if status.get(name):
             tg_send_message(f"✅ <b>{html.escape(name)}</b> is working again.")
         status[name] = ""
-        total_notified += process_source(items, source, seen)
+        if source.get("mode") == "owner_new":
+            total_notified += process_owner_new(items, source, seen, seeded_flags)
+        else:
+            total_notified += process_source(items, source, seen)
 
     # HARD SAFETY INVARIANT: a run must never shrink the historical dataset.
     # We only ever add to `seen`, so this can only trip on a bug/partial read.
