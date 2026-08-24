@@ -32,11 +32,15 @@ BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
 YENIEMLAK_SEARCH_URL = os.environ.get("YENIEMLAK_SEARCH_URL", (
     "https://yeniemlak.az/elan/axtar?elan_nov=1&emlak=1&menzil_nov=&qiymet=&qiymet2=&mertebe=&mertebe2=&otaq=&otaq2=&sahe_m=&sahe_m2=&sahe_s=&sahe_s2=&seher%5B%5D=7&rayon%5B%5D=2&rayon%5B%5D=9&menteqe%5B%5D=20&menteqe%5B%5D=66&menteqe%5B%5D=72&menteqe%5B%5D=73&metro%5B%5D=1&metro%5B%5D=2&metro%5B%5D=3&metro%5B%5D=4&metro%5B%5D=5"
 ))
+TAP_SEARCH_URL = os.environ.get("TAP_SEARCH_URL", (
+    "https://tap.az/elanlar/dasinmaz-emlak/menziller?keywords_source=typewritten&p%5B740%5D=3722&q%5Bregion_id%5D=420"
+))
 
 # Sources this bot tracks. Each listing's price history is tracked independently.
 SOURCES = [
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": ""},
     {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:"},
+    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:"},
 ]
 
 # bina.az config
@@ -398,7 +402,82 @@ def fetch_for_source(source):
         return fetch_bina(source["url"])
     if source["type"] == "yeniemlak":
         return fetch_yeniemlak(source["url"])
+    if source["type"] == "tap":
+        return fetch_tap(source["url"])
     raise RuntimeError(f"unknown source type {source['type']}")
+
+
+# --------------------------------------------------------------------------- #
+# tap.az  (server-rendered HTML; paginated via ?page=N)
+# --------------------------------------------------------------------------- #
+TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "80"))
+
+
+def _parse_tap_page(raw):
+    total_m = re.search(r"([\d\s]+)\s*elan\b", re.sub(r"<[^>]+>", " ", html.unescape(raw)))
+    total = int(re.sub(r"\D", "", total_m.group(1))) if total_m else None
+    # each listing card is anchored by a /menziller/<id> link; slice card HTML between anchors
+    anchors = [(m.group(1), m.start()) for m in
+               re.finditer(r'/elanlar/dasinmaz-emlak/menziller/(\d+)', raw)]
+    out, seen_ids = [], set()
+    for i, (iid, pos) in enumerate(anchors):
+        if iid in seen_ids:
+            continue
+        seen_ids.add(iid)
+        end = anchors[i + 1][1] if i + 1 < len(anchors) else min(len(raw), pos + 4000)
+        chunk_html = raw[pos:end]
+        photo = None
+        pm_img = re.search(r'src="(https://[^"]*(?:tap\.azstatic|azstatic|cdn)[^"]*\.(?:jpg|jpeg|png|webp)[^"]*)"',
+                           chunk_html)
+        if pm_img:
+            photo = pm_img.group(1)
+        chunk = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", chunk_html)))
+        rooms = re.search(r"(\d+)-otaqlı", chunk)
+        area = re.search(r"([\d.]+)\s*m²", chunk)
+        price = re.search(r"([\d][\d ]*?)\s*₼", chunk)
+        loc = re.search(r"\d+-otaqlı[^,]*,\s*(.+?),\s*[\d.]+\s*m²", chunk)
+        if not (rooms or price):
+            continue                      # nav/other link, not a listing card
+        out.append({"id": iid,
+                    "url": f"https://tap.az/elanlar/dasinmaz-emlak/menziller/{iid}",
+                    "rooms": int(rooms.group(1)) if rooms else None,
+                    "area": float(area.group(1)) if area else None, "area_units": "m²",
+                    "floor": None, "floors": None,
+                    "price": int(re.sub(r"\D", "", price.group(1))) if price else None,
+                    "currency": "AZN",
+                    "location": loc.group(1).strip() if loc else None, "location_id": None,
+                    "updated_at": None,
+                    "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
+                    "photo": photo})
+    return out, total
+
+
+def fetch_tap(url):
+    """Page through the whole tap.az result set. Stops when a page adds no new IDs."""
+    all_out, seen_ids = [], set()
+    total = None
+    for page in range(1, TAP_MAX_PAGES + 1):
+        purl = _with_page(url, page)
+        r = requests.get(purl, headers=HTML_HEADERS, timeout=30)
+        if r.status_code != 200:
+            if page == 1:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            break
+        listings, tot = _parse_tap_page(r.text)
+        if tot is not None:
+            total = tot
+        new = [l for l in listings if l["id"] not in seen_ids]
+        if not new:
+            break
+        for l in new:
+            seen_ids.add(l["id"])
+            all_out.append(l)
+        if PAGE_DELAY:
+            time.sleep(PAGE_DELAY)
+    log(f"tap.az: {len(all_out)} listings" + (f" of ~{total} total" if total is not None else ""))
+    if not all_out and total and total > 0:
+        raise RuntimeError("tap.az parsed 0 (structure changed?)")
+    return all_out
 
 
 # --------------------------------------------------------------------------- #
