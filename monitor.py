@@ -715,7 +715,7 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
 
 
 def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
-    lines = [f"!!! <b>Yeni elan</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
+    lines = [f"‼️ <b>Yeni elan</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
     if l.get("price") is not None:
         lines.append(f"💰 <b>Qiymət:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
     if l.get("rooms") is not None:
