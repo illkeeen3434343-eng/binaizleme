@@ -137,16 +137,55 @@ def tg_send_message(text):
         return False
 
 
+def _download_image(url):
+    """Fetch the image bytes ourselves so we can UPLOAD them to Telegram (far more
+    reliable than asking Telegram to fetch a slow/http/hotlink-protected URL).
+    Tries both http and https, sends a Referer to defeat hotlink protection."""
+    if not url:
+        return None
+    variants = [url]
+    if url.startswith("https://"):
+        variants.append("http://" + url[len("https://"):])
+    elif url.startswith("http://"):
+        variants.append("https://" + url[len("http://"):])
+    hdrs = {"User-Agent": UA, "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            "Referer": "https://yeniemlak.az/"}
+    for u in variants:
+        try:
+            r = http_get(u, headers=hdrs, timeout=30, browser=True)
+            data = getattr(r, "content", None)
+            if getattr(r, "status_code", 0) == 200 and data and len(data) > 1000:
+                return data
+        except Exception as e:
+            log("image download failed:", u, e)
+    return None
+
+
 def tg_send_photo(photo_url, caption):
+    # 1) Preferred: download the image ourselves and UPLOAD the bytes (multipart).
+    img = _download_image(photo_url)
+    if img:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                              data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+                              files={"photo": ("photo.jpg", img, "image/jpeg")}, timeout=60)
+            if r.status_code == 200:
+                return True
+            log("sendPhoto upload failed:", r.status_code, r.text[:200])
+        except requests.RequestException as e:
+            log("sendPhoto upload error:", e)
+    # 2) Fallback: let Telegram fetch the URL (works for fast HTTPS CDNs like bina).
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
                           json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
                                 "parse_mode": "HTML"}, timeout=30)
         if r.status_code == 200:
             return True
-        return tg_send_message(caption)
-    except requests.RequestException:
-        return tg_send_message(caption)
+        log("sendPhoto by-url failed:", r.status_code, r.text[:160])
+    except requests.RequestException as e:
+        log("sendPhoto by-url error:", e)
+    # 3) Last resort: text so the alert still arrives.
+    return tg_send_message(caption)
 
 
 # --------------------------------------------------------------------------- #
@@ -711,7 +750,7 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
     photo = None
     pm = re.search(r'https?://yeniemlak\.az/get-img/[^\s"\'<>]+\.jpg', raw)
     if pm:
-        photo = pm.group(0).replace("http://", "https://")
+        photo = pm.group(0)   # keep original scheme; _download_image tries http+https
     if owner_label in text:
         return True, photo
     if "Vasitəçi" in text or "Rieltor" in text or "Vasitəç:" in text:
