@@ -698,20 +698,25 @@ def notify_change(l, source_name, kind, old_price, new_price, n_changes):
 # fetch detail pages for genuinely NEW listings (few per run).
 # --------------------------------------------------------------------------- #
 def check_is_owner(url, owner_label="Əmlak sahibi"):
-    """True = owner post, False = agent/realtor, None = couldn't determine (retry).
-    owner_label differs per site: 'Əmlak sahibi' (yeniemlak), 'Mülkiyyətçi' (emlak.az)."""
+    """Returns (is_owner, photo_url). is_owner: True=owner, False=agent, None=unknown.
+    Photo is the listing's first image, pulled from the same detail page (no extra request)."""
     try:
         r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
         if r.status_code != 200:
-            return None
-        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", r.text)))
+            return None, None
+        raw = r.text
+        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
     except Exception:
-        return None
+        return None, None
+    photo = None
+    pm = re.search(r'https?://yeniemlak\.az/get-img/[^\s"\'<>]+\.jpg', raw)
+    if pm:
+        photo = pm.group(0).replace("http://", "https://")
     if owner_label in text:
-        return True
+        return True, photo
     if "Vasitəçi" in text or "Rieltor" in text or "Vasitəç:" in text:
-        return False
-    return False   # no explicit owner label -> treat as not-owner (conservative)
+        return False, photo
+    return False, photo   # no explicit owner label -> treat as not-owner (conservative)
 
 
 def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
@@ -754,12 +759,14 @@ def process_owner_new(items, source, seen, seeded_flags):
             continue                       # already handled; never re-check or price-track
         if checks >= MAX_OWNER_CHECKS:
             break                          # spread detail-page load; rest handled next run
-        owner = check_is_owner(l["url"], owner_label)
+        owner, photo = check_is_owner(l["url"], owner_label)
         checks += 1
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
             continue                       # couldn't determine -> leave unrecorded, retry later
+        if photo:
+            l["photo"] = photo
         seen[key] = {"url": l["url"], "first_seen": now, "source": name, "owner": bool(owner)}
         if owner and notify_new_owner_msg(l, name, owner_label):
             notified += 1
