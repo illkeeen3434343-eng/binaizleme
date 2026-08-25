@@ -72,7 +72,7 @@ PAGE_SIZE = 16
 # many pages we page through — a safety valve against hammering bina / getting blocked.
 # 120 pages * 16 = ~1920 listings. If your search has more matches than this, either
 # raise it (block risk) or narrow the search so the whole set fits.
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "120"))
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "1000"))
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause between pages
 # Reject absurd price jumps (parse glitches), but allow any realistic change.
 PRICE_GLITCH_LOW = float(os.environ.get("PRICE_GLITCH_LOW", "0.2"))    # new < 20% of old
@@ -327,19 +327,12 @@ def _coverage_warn(scanned, total):
     if _coverage_warned["done"]:
         return
     _coverage_warned["done"] = True
-    if IN_ACTIONS:
-        tg_send_message(
-            f"ℹ️ Price tracker is covering <b>{scanned}</b> of ~<b>{total}</b> matching "
-            f"listings (scan cap reached). Price changes on the deeper ~{total - scanned} "
-            f"are not tracked. To cover everything, narrow the search (add a price cap or "
-            f"rooms) or raise SCAN_PAGES.")
-
-
+   
 # --------------------------------------------------------------------------- #
 # yeniemlak.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
-YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "5"))   # owner-new mode: newest pages only
-MAX_OWNER_CHECKS = int(os.environ.get("MAX_OWNER_CHECKS", "40"))  # detail-page checks per run
+YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "100"))   # owner-new mode: newest pages only
+MAX_OWNER_CHECKS = int(os.environ.get("MAX_OWNER_CHECKS", "100"))  # detail-page checks per run
 
 
 def _with_page(url, n):
@@ -672,22 +665,22 @@ def _spaced(n):
 
 
 def format_change(l, source_name, kind, old_price, new_price, n_changes):
-    head = "🔻 <b>PRICE DROP</b>" if kind == "drop" else "🔺 <b>PRICE INCREASE</b>"
+    head = "🔻 <b>QİYMƏT DÜŞDÜ</b>" if kind == "drop" else "🔺 <b>QİYMƏT ARTIMI</b>"
     lines = [f"{head} · {html.escape(source_name)}", ""]
     cur = l.get("currency", "AZN")
     old_txt = f"<s>{_spaced(old_price)}</s>" if kind == "drop" else _spaced(old_price)
-    lines.append(f"💰 <b>Price:</b> {old_txt} → <b>{_spaced(new_price)}</b> {cur}")
+    lines.append(f"💰 <b>Qiymət:</b> {old_txt} → <b>{_spaced(new_price)}</b> {cur}")
     if l.get("rooms") is not None:
-        lines.append(f"🛏 <b>Rooms:</b> {l['rooms']}")
+        lines.append(f"🛏 <b>Otaq sayı:</b> {l['rooms']}")
     if l.get("area") is not None:
         area = int(l["area"]) if float(l["area"]).is_integer() else l["area"]
-        lines.append(f"📐 <b>Area:</b> {area} {l.get('area_units', 'm²')}")
+        lines.append(f"📐 <b>Sahə:</b> {area} {l.get('area_units', 'm²')}")
     if l.get("floor") and l.get("floors"):
-        lines.append(f"🏢 <b>Floor:</b> {l['floor']}/{l['floors']}")
+        lines.append(f"🏢 <b>Mərtəbə:</b> {l['floor']}/{l['floors']}")
     if l.get("location"):
-        lines.append(f"📍 <b>Location:</b> {html.escape(str(l['location']))}")
+        lines.append(f"📍 <b>Ünvan:</b> {html.escape(str(l['location']))}")
     lines.append("")
-    lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
+    lines.append(f'🔗 <a href="{html.escape(l["url"])}">Elana bax</a>')
     return "\n".join(lines)
 
 
@@ -722,20 +715,20 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
 
 
 def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
-    lines = [f"🏠 <b>NEW LISTING</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
+    lines = [f"!!! <b>Yeni elan</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
     if l.get("price") is not None:
-        lines.append(f"💰 <b>Price:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
+        lines.append(f"💰 <b>Qiymət:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
     if l.get("rooms") is not None:
-        lines.append(f"🛏 <b>Rooms:</b> {l['rooms']}")
+        lines.append(f"🛏 <b>Otaq sayı:</b> {l['rooms']}")
     if l.get("area") is not None:
         area = int(l["area"]) if float(l["area"]).is_integer() else l["area"]
-        lines.append(f"📐 <b>Area:</b> {area} {l.get('area_units', 'm²')}")
+        lines.append(f"📐 <b>Sahə:</b> {area} {l.get('area_units', 'm²')}")
     if l.get("floor") and l.get("floors"):
-        lines.append(f"🏢 <b>Floor:</b> {l['floor']}/{l['floors']}")
+        lines.append(f"🏢 <b>Mərtəbə:</b> {l['floor']}/{l['floors']}")
     if l.get("location"):
-        lines.append(f"📍 <b>Location:</b> {html.escape(str(l['location']))}")
+        lines.append(f"📍 <b>Ünvan:</b> {html.escape(str(l['location']))}")
     lines.append("")
-    lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
+    lines.append(f'🔗 <a href="{html.escape(l["url"])}">Elana bax</a>')
     return "\n".join(lines)
 
 
