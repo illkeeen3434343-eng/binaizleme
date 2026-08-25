@@ -23,6 +23,21 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 
+try:
+    from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+    HAS_CURL_CFFI = True
+except Exception:
+    HAS_CURL_CFFI = False
+
+
+def http_get(url, headers=None, params=None, timeout=30, browser=False):
+    """GET a URL. For bot-protected HTML sites (browser=True) use curl_cffi with a
+    real Chrome TLS fingerprint; otherwise plain requests."""
+    if browser and HAS_CURL_CFFI:
+        return cf_requests.get(url, headers=headers, params=params, timeout=timeout,
+                               impersonate="chrome")
+    return requests.get(url, headers=headers, params=params, timeout=timeout)
+
 # --------------------------------------------------------------------------- #
 # YOUR SEARCHES  (paste the normal search URL from each site's address bar)
 # --------------------------------------------------------------------------- #
@@ -39,7 +54,7 @@ TAP_SEARCH_URL = os.environ.get("TAP_SEARCH_URL", (
 # Sources this bot tracks. Each listing's price history is tracked independently.
 SOURCES = [
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price"},
-    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new"},
+    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new", "owner_label": "Əmlak sahibi"},
     {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "price"},
 ]
 
@@ -312,7 +327,7 @@ def _coverage_warn(scanned, total):
     if _coverage_warned["done"]:
         return
     _coverage_warned["done"] = True
-    
+   
 # --------------------------------------------------------------------------- #
 # yeniemlak.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
@@ -375,7 +390,7 @@ def fetch_yeniemlak(url):
     total = None
     for page in range(1, YE_MAX_PAGES + 1):
         purl = _with_page(url, page)
-        r = requests.get(purl, headers=HTML_HEADERS, timeout=30)
+        r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
         if r.status_code != 200:
             if page == 1:
                 raise RuntimeError(f"HTTP {r.status_code}")
@@ -412,6 +427,9 @@ def fetch_for_source(source):
 # tap.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
 TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "80"))
+# Only track tap.az posts whose heading contains one of these location keywords.
+TAP_KEYWORDS = ["Q.Qarayev", "Əhmədli", "Xətai r", "Nizami r", "8-ci mkr",
+                "Neftçilər", "Xalqlar", "Həzi", "Köhnə Günəşli"]
 
 
 def _parse_tap_page(raw):
@@ -439,6 +457,10 @@ def _parse_tap_page(raw):
         loc = re.search(r"\d+-otaqlı[^,]*,\s*(.+?),\s*[\d.]+\s*m²", chunk)
         if not (rooms or price):
             continue                      # nav/other link, not a listing card
+        heading_m = re.search(r"(\d+-otaqlı[^₼]*?m²)", chunk)
+        heading = heading_m.group(1) if heading_m else chunk[:120]
+        if TAP_KEYWORDS and not any(kw in heading for kw in TAP_KEYWORDS):
+            continue                      # heading doesn't match a wanted location -> skip
         out.append({"id": iid,
                     "url": f"https://tap.az/elanlar/dasinmaz-emlak/menziller/{iid}",
                     "rooms": int(rooms.group(1)) if rooms else None,
@@ -459,7 +481,7 @@ def fetch_tap(url):
     total = None
     for page in range(1, TAP_MAX_PAGES + 1):
         purl = _with_page(url, page)
-        r = requests.get(purl, headers=HTML_HEADERS, timeout=30)
+        r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
         if r.status_code != 200:
             if page == 1:
                 raise RuntimeError(f"HTTP {r.status_code}")
@@ -675,24 +697,25 @@ def notify_change(l, source_name, kind, old_price, new_price, n_changes):
 # tracking for this source. The owner label lives on the detail page, so we only
 # fetch detail pages for genuinely NEW listings (few per run).
 # --------------------------------------------------------------------------- #
-def check_is_owner(url):
-    """True = owner post, False = agent/realtor, None = couldn't determine (retry)."""
+def check_is_owner(url, owner_label="Əmlak sahibi"):
+    """True = owner post, False = agent/realtor, None = couldn't determine (retry).
+    owner_label differs per site: 'Əmlak sahibi' (yeniemlak), 'Mülkiyyətçi' (emlak.az)."""
     try:
-        r = requests.get(url, headers=HTML_HEADERS, timeout=30)
+        r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
         if r.status_code != 200:
             return None
         text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", r.text)))
-    except requests.RequestException:
+    except Exception:
         return None
-    if "Əmlak sahibi" in text:
+    if owner_label in text:
         return True
-    if "Vasitəçi" in text or "Rieltor" in text:
+    if "Vasitəçi" in text or "Rieltor" in text or "Vasitəç:" in text:
         return False
     return False   # no explicit owner label -> treat as not-owner (conservative)
 
 
-def format_new_owner(l, source_name):
-    lines = [f"🏠 <b>NEW LISTING</b> · {html.escape(source_name)} · <i>Əmlak sahibi</i>", ""]
+def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
+    lines = [f"🏠 <b>NEW LISTING</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
     if l.get("price") is not None:
         lines.append(f"💰 <b>Price:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
     if l.get("rooms") is not None:
@@ -711,6 +734,7 @@ def format_new_owner(l, source_name):
 
 def process_owner_new(items, source, seen, seeded_flags):
     prefix, name = source["prefix"], source["name"]
+    owner_label = source.get("owner_label", "Əmlak sahibi")
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
     if not seeded_flags.get(name):
@@ -730,21 +754,21 @@ def process_owner_new(items, source, seen, seeded_flags):
             continue                       # already handled; never re-check or price-track
         if checks >= MAX_OWNER_CHECKS:
             break                          # spread detail-page load; rest handled next run
-        owner = check_is_owner(l["url"])
+        owner = check_is_owner(l["url"], owner_label)
         checks += 1
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
             continue                       # couldn't determine -> leave unrecorded, retry later
         seen[key] = {"url": l["url"], "first_seen": now, "source": name, "owner": bool(owner)}
-        if owner and notify_new_owner_msg(l, name):
+        if owner and notify_new_owner_msg(l, name, owner_label):
             notified += 1
     log(f"{name}: checked {checks} new, announced {notified} owner posts")
     return notified
 
 
-def notify_new_owner_msg(l, name):
-    text = format_new_owner(l, name)
+def notify_new_owner_msg(l, name, owner_label="Əmlak sahibi"):
+    text = format_new_owner(l, name, owner_label)
     if SEND_PHOTOS and l.get("photo"):
         return tg_send_photo(l["photo"], text)
     return tg_send_message(text)
