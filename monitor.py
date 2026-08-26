@@ -850,9 +850,17 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
     except Exception:
         return None, None
     photo = None
-    pm = re.search(r'https?://yeniemlak\.az/get-img/[^\s"\'<>]+\.jpg', raw)
-    if pm:
-        photo = pm.group(0)   # keep original scheme; _download_image tries http+https
+    # Try several patterns, most specific first, so we catch the main photo even when
+    # the path/extension varies (this fixes the ~2-in-10 "no image" cases).
+    for pat in (r'https?://yeniemlak\.az/get-img/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp)',
+                r'https?://[^\s"\'<>]*yeniemlak\.az/[^\s"\'<>]*(?:img|shekil|photo|foto)[^\s"\'<>]+\.(?:jpg|jpeg|png|webp)',
+                r'https?://[^\s"\'<>]+\.(?:jpg|jpeg)\b'):
+        m = re.search(pat, raw)
+        if m:
+            cand = m.group(0)
+            if "logo" not in cand.lower() and "icon" not in cand.lower():
+                photo = cand
+                break
     if owner_label in text:
         return True, photo
     if "Vasitəçi" in text or "Rieltor" in text or "Vasitəç:" in text:
