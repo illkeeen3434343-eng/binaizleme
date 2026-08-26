@@ -56,7 +56,7 @@ LALAFO_SEARCH_URL = os.environ.get("LALAFO_SEARCH_URL", (
 
 # Sources this bot tracks. Each listing's price history is tracked independently.
 SOURCES = [
-    {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price"},
+    {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price_owner", "owner_label": "Mülkiyyətçi"},
     {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new", "owner_label": "Əmlak sahibi"},
     {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "price"},
     {"name": "lalafo.az", "type": "lalafo", "url": LALAFO_SEARCH_URL, "prefix": "lala:", "mode": "owner_new", "owner_label": "Mülkiyyətçi", "prefiltered_owner": True},
@@ -886,6 +886,38 @@ def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
     return "\n".join(lines)
 
 
+def process_new_owner_checks(items, source, seen, seeded_flags):
+    """For a price-tracked source that should ALSO announce new OWNER posts (bina):
+    owner-check listings not yet in `seen`. MUST run before process_source seeds them.
+    The owner label lives on the detail page; where that page is blocked (e.g. GitHub's
+    datacenter IP) check_is_owner returns None and nothing is announced — no crash."""
+    name = source["name"]
+    owner_label = source.get("owner_label", "Mülkiyyətçi")
+    flag = name + ":owner_seeded"
+    if not seeded_flags.get(flag):
+        seeded_flags[flag] = True
+        return 0                      # first run: don't owner-check the existing backlog
+    checks = notified = 0
+    for l in items:
+        key = source["prefix"] + str(l["id"])
+        if key in seen:
+            continue                  # already known (price-tracked or checked before)
+        if checks >= MAX_OWNER_CHECKS:
+            break
+        owner, photo = check_is_owner(l["url"], owner_label)
+        checks += 1
+        if PAGE_DELAY:
+            time.sleep(PAGE_DELAY)
+        if owner:
+            if photo:
+                l["photo"] = photo    # keep API photo if detail gave none
+            if notify_new_owner_msg(l, name, owner_label):
+                notified += 1
+    if checks:
+        log(f"{name}: owner-checked {checks} new, announced {notified}")
+    return notified
+
+
 def process_owner_new(items, source, seen, seeded_flags):
     prefix, name = source["prefix"], source["name"]
     owner_label = source.get("owner_label", "Əmlak sahibi")
@@ -1090,6 +1122,10 @@ def main():
         status[name] = ""
         if source.get("mode") == "owner_new":
             total_notified += process_owner_new(items, source, seen, seeded_flags)
+        elif source.get("mode") == "price_owner":
+            # owner check must run BEFORE process_source seeds the new listings
+            total_notified += process_new_owner_checks(items, source, seen, seeded_flags)
+            total_notified += process_source(items, source, seen)
         else:
             total_notified += process_source(items, source, seen)
 
