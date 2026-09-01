@@ -482,64 +482,130 @@ def fetch_for_source(source):
 LALAFO_MAX_PAGES = int(os.environ.get("LALAFO_MAX_PAGES", "20"))
 
 
+# lalafo renders listings from JavaScript, so the visible HTML tags are empty.
+# The real data is embedded in the page's __NEXT_DATA__ JSON blob. We parse that.
+LALAFO_MIN_BYTES = int(os.environ.get("LALAFO_MIN_BYTES", "50000"))
+
+
+def _lalafo_next_data(raw):
+    """Return the parsed __NEXT_DATA__ JSON dict, or None if absent/unparseable."""
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
+
+def _is_lalafo_listing(d):
+    """A real ad object: has an integer id, a price, and a /..-id-<n> url."""
+    return (isinstance(d, dict)
+            and isinstance(d.get("id"), int)
+            and "price" in d
+            and isinstance(d.get("url"), str)
+            and "-id-" in d["url"])
+
+
+def _lalafo_feed_items(node):
+    """Walk __NEXT_DATA__ and return the LARGEST array of listing objects — that
+    array is the search feed; smaller ones are 'recommended'/'vip' side blocks."""
+    best = []
+
+    def walk(o):
+        nonlocal best
+        if isinstance(o, list):
+            hits = [x for x in o if _is_lalafo_listing(x)]
+            if len(hits) > len(best):
+                best = hits
+            for x in o:
+                walk(x)
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+
+    walk(node)
+    return best
+
+
+def _lalafo_photo(item):
+    imgs = item.get("images") or []
+    if imgs and isinstance(imgs[0], dict):
+        for k in ("original_url", "url", "thumbnail_url", "webp_url"):
+            u = imgs[0].get(k)
+            if isinstance(u, str) and u.startswith("http"):
+                return u
+    return None
+
+
 def _parse_lalafo_page(raw):
-    total_m = re.search(r"(\d[\d\s]*)\s*elan\b", re.sub(r"<[^>]+>", " ", html.unescape(raw)))
-    total = _digits(total_m.group(1)) if total_m else None
-    anchors = [(m.group(1), m.start()) for m in
-               re.finditer(r'/baku/ads/[^"\'\s]*-id-(\d+)', raw)]
-    out, seen_ids = [], set()
-    for i, (iid, pos) in enumerate(anchors):
-        if iid in seen_ids:
-            continue
-        seen_ids.add(iid)
-        end = anchors[i + 1][1] if i + 1 < len(anchors) else min(len(raw), pos + 6000)
-        chunk_html = raw[pos:end]
-        # image: lalafo wraps CDN urls in /_next/image?url=<encoded img url>
-        photo = None
-        pm_img = re.search(r'_next/image\?url=(https%3A%2F%2Fimg[^&"\']+)', chunk_html)
-        if pm_img:
-            photo = unquote(pm_img.group(1))
-        elif (m2 := re.search(r'(https://img\d*\.lalafo\.com/[^\s"\']+\.(?:jpg|jpeg|png|webp))', chunk_html)):
-            photo = m2.group(1)
-        chunk = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", chunk_html)))
-        rooms = re.search(r"(\d+)\s*otaqlı", chunk)
-        area = re.search(r"(\d+)\s*kv\.?\s*m", chunk)
-        # first "NNN AZN" is the headline price (a struck-out old price may follow)
-        price = re.search(r"([\d][\d ]{2,})\s*AZN", chunk)
-        date = re.search(r"(\d{2}\.\d{2}\.\d{4})", chunk)
-        metro = re.search(r"m\.\s*([^,0-9]+?),\s*\d+\s*kv", chunk)
-        district = re.search(r"Bakı\s*([A-Za-zƏĞİÖÜÇŞəğıöüçş]+\s*r\.)", chunk)
-        title = re.search(r"(\d+\s*otaqlı,[^\[\]]*?kv\.?\s*m)", chunk)
-        if not (rooms or price):
-            continue
-        loc = (metro.group(1).strip() + " m." if metro else None) or (district.group(1) if district else None)
+    nd = _lalafo_next_data(raw)
+    if nd is None:
+        return [], None
+    out = []
+    for it in _lalafo_feed_items(nd):
+        iid = str(it.get("id"))
+        url = it.get("url") or ""
+        if url.startswith("/"):
+            url = "https://lalafo.az" + url
+        elif not url.startswith("http"):
+            url = f"https://lalafo.az/baku/ads/id-{iid}"
+        title = it.get("title") or ""
+        rooms_m = re.search(r"(\d+)\s*otaq", title)
+        area_m = re.search(r"(\d+)\s*(?:kv|m2|m²)", title)
+        stamp = it.get("updated_time") or it.get("created_time")
+        try:
+            upd = dt.datetime.fromtimestamp(int(stamp)).strftime("%d.%m.%Y") if stamp else None
+        except Exception:
+            upd = None
+        price = it.get("price")
+        if not isinstance(price, int):
+            price = _digits(str(price))
         out.append({"id": iid,
-                    "url": f"https://lalafo.az/baku/ads/id-{iid}",
-                    "rooms": _digits(rooms.group(1)) if rooms else None,
-                    "area": _digits(area.group(1)) if area else None, "area_units": "m²",
+                    "url": url,
+                    "rooms": _digits(rooms_m.group(1)) if rooms_m else None,
+                    "area": _digits(area_m.group(1)) if area_m else None, "area_units": "m²",
                     "floor": None, "floors": None,
-                    "price": _digits(price.group(1)) if price else None, "currency": "AZN",
-                    "location": (title.group(1).strip()[:80] if title else loc),
-                    "location_id": None,
-                    "updated_at": date.group(1) if date else None,
+                    "price": price,
+                    "currency": it.get("symbol") or it.get("currency") or "AZN",
+                    "location": (title.strip()[:90] or None),
+                    "location_id": it.get("city_id"),
+                    "updated_at": upd,
                     "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
-                    "photo": photo})
-    return out, total
+                    "photo": _lalafo_photo(it)})
+    return out, None
+
+
+def _fetch_lalafo_html(purl, tries=4):
+    """Fetch one lalafo page, retrying transient Cloudflare block pages — those
+    come back tiny and without __NEXT_DATA__ — with a short back-off."""
+    last = None
+    for attempt in range(tries):
+        r = http_get(purl, headers=HTML_HEADERS, timeout=40, browser=True)
+        last = r
+        body = getattr(r, "text", "") or ""
+        if (getattr(r, "status_code", 0) == 200
+                and len(body) >= LALAFO_MIN_BYTES
+                and "__NEXT_DATA__" in body):
+            return r, body
+        time.sleep(3 * (attempt + 1))       # 3s, 6s, 9s before each retry
+    return last, (getattr(last, "text", "") or "")
 
 
 def fetch_lalafo(url):
     all_out, seen_ids = [], set()
-    total = None
     for page in range(1, LALAFO_MAX_PAGES + 1):
         purl = _with_page(url, page)
-        r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
-        if getattr(r, "status_code", 0) != 200:
+        r, body = _fetch_lalafo_html(purl)
+        if getattr(r, "status_code", 0) != 200 or "__NEXT_DATA__" not in body:
             if page == 1:
-                raise RuntimeError(f"HTTP {getattr(r,'status_code','?')}")
+                raise RuntimeError("lalafo blocked (Cloudflare) after retries")
             break
-        listings, tot = _parse_lalafo_page(r.text)
-        if tot is not None:
-            total = tot
+        listings, _ = _parse_lalafo_page(body)
+        # Only cry "structure changed" when the page clearly HAS listings we failed
+        # to parse; a genuinely empty owner feed (no owner posts) stays silent.
+        if page == 1 and not listings and len(re.findall(r"-id-\d+", body)) > 3:
+            raise RuntimeError("lalafo parsed 0 (structure changed?)")
         new = [l for l in listings if l["id"] not in seen_ids]
         if not new:
             break
@@ -548,9 +614,7 @@ def fetch_lalafo(url):
             all_out.append(l)
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
-    log(f"lalafo.az: {len(all_out)} listings" + (f" of ~{total} total" if total is not None else ""))
-    if not all_out and total and total > 0:
-        raise RuntimeError("lalafo parsed 0 (structure changed?)")
+    log(f"lalafo.az: {len(all_out)} listings")
     return all_out
 
 
@@ -923,8 +987,11 @@ def process_owner_new(items, source, seen, seeded_flags):
     owner_label = source.get("owner_label", "Əmlak sahibi")
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
-    if not seeded_flags.get(name):
-        # First run for this source: seed ALL current listings silently (no detail
+    # Seed silently if this source was never seeded OR has no recorded listings yet
+    # (the second check stops a flood if a prior empty run set the flag with 0 ids).
+    has_recorded = bool(prefix) and any(k.startswith(prefix) for k in seen)
+    if not seeded_flags.get(name) or (bool(prefix) and not has_recorded):
+        # First real run for this source: seed ALL current listings silently (no detail
         # fetches, no announcements) so owner-checking only runs on future new posts.
         for l in items:
             seen[prefix + str(l["id"])] = {"url": l["url"], "first_seen": now, "source": name}
