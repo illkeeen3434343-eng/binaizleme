@@ -58,7 +58,7 @@ LALAFO_SEARCH_URL = os.environ.get("LALAFO_SEARCH_URL", (
 SOURCES = [
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price_owner", "owner_label": "Mülkiyyətçi"},
     {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new", "owner_label": "Əmlak sahibi"},
-    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "price"},
+    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "owner_new", "owner_label": "Sahibindən", "prefiltered_owner": True},
     {"name": "lalafo.az", "type": "lalafo", "url": LALAFO_SEARCH_URL, "prefix": "lala:", "mode": "owner_new", "owner_label": "Mülkiyyətçi", "prefiltered_owner": True},
 ]
 
@@ -625,6 +625,9 @@ TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "80"))
 # Only track tap.az posts whose heading contains one of these location keywords.
 TAP_KEYWORDS = ["Q.Qarayev", "Əhmədli", "Xətai r", "Nizami r", "8-ci mkr",
                 "Neftçilər", "Xalqlar", "Həzi", "Köhnə Günəşli"]
+# Owner-only: skip dealer/store cards (they carry a "Mağaza" badge). Set
+# TAP_OWNER_ONLY=0 to fall back to keeping every card.
+TAP_OWNER_ONLY = os.environ.get("TAP_OWNER_ONLY", "1") not in ("0", "false", "False", "no")
 
 
 def _digits(s):
@@ -640,6 +643,7 @@ def _parse_tap_page(raw):
     anchors = [(m.group(1), m.start()) for m in
                re.finditer(r'/elanlar/dasinmaz-emlak/menziller/(\d+)', raw)]
     out, seen_ids = [], set()
+    dealers = 0
     for i, (iid, pos) in enumerate(anchors):
         if iid in seen_ids:
             continue
@@ -662,6 +666,12 @@ def _parse_tap_page(raw):
         heading = heading_m.group(1) if heading_m else chunk[:120]
         if TAP_KEYWORDS and not any(kw in heading for kw in TAP_KEYWORDS):
             continue                      # heading doesn't match a wanted location -> skip
+        if TAP_OWNER_ONLY:
+            back = anchors[i - 1][1] if i > 0 else max(0, pos - 1500)
+            pre = html.unescape(raw[back:pos])   # the badge sits just BEFORE this card's link
+            if re.search(r"mağaza", pre, re.I):
+                dealers += 1
+                continue                  # store/dealer card -> skip (owner-only)
         try:
             area_val = float(area.group(1)) if area else None
         except ValueError:
@@ -677,6 +687,8 @@ def _parse_tap_page(raw):
                     "updated_at": None,
                     "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
                     "photo": photo})
+    if TAP_OWNER_ONLY and dealers:
+        log(f"tap.az: skipped {dealers} dealer (Mağaza) cards on this page")
     return out, total
 
 
