@@ -381,7 +381,7 @@ def _coverage_warn(scanned, total):
 # --------------------------------------------------------------------------- #
 # yeniemlak.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
-YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "100"))   # owner-new mode: newest pages only
+YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "1000"))   # owner-new mode: newest pages only
 MAX_OWNER_CHECKS = int(os.environ.get("MAX_OWNER_CHECKS", "100"))  # detail-page checks per run
 
 
@@ -479,7 +479,7 @@ def fetch_for_source(source):
 # lalafo.az  (Next.js HTML; the /owner/ URL already returns ONLY owner posts,
 # so every result is a "Mülkiyyətçi" listing — no per-post owner check needed.)
 # --------------------------------------------------------------------------- #
-LALAFO_MAX_PAGES = int(os.environ.get("LALAFO_MAX_PAGES", "2"))
+LALAFO_MAX_PAGES = int(os.environ.get("LALAFO_MAX_PAGES", "1000"))
 
 
 # lalafo renders listings from JavaScript, so the visible HTML tags are empty.
@@ -507,24 +507,45 @@ def _is_lalafo_listing(d):
             and "-id-" in d["url"])
 
 
-def _lalafo_feed_items(node):
-    """Walk __NEXT_DATA__ and return the LARGEST array of listing objects — that
-    array is the search feed; smaller ones are 'recommended'/'vip' side blocks."""
-    best = []
+def _lalafo_feed(node):
+    """Find the paginated SEARCH feed: a dict holding an 'items' list of listing
+    objects together with '_meta'/'_links' pagination. Recommendation/vip blocks
+    lack that pagination, so keying on it avoids the out-of-area filler listings.
+    Returns (items, links, meta)."""
+    best = ([], {}, {})
 
     def walk(o):
         nonlocal best
-        if isinstance(o, list):
-            hits = [x for x in o if _is_lalafo_listing(x)]
-            if len(hits) > len(best):
-                best = hits
-            for x in o:
-                walk(x)
-        elif isinstance(o, dict):
+        if isinstance(o, dict):
+            items = o.get("items")
+            if isinstance(items, list) and ("_meta" in o or "_links" in o):
+                hits = [x for x in items if _is_lalafo_listing(x)]
+                if len(hits) > len(best[0]):
+                    best = (hits, o.get("_links") or {}, o.get("_meta") or {})
             for v in o.values():
                 walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
 
     walk(node)
+    if not best[0]:                       # fallback: largest listing array anywhere
+        flat = []
+
+        def w2(o):
+            nonlocal flat
+            if isinstance(o, list):
+                hits = [x for x in o if _is_lalafo_listing(x)]
+                if len(hits) > len(flat):
+                    flat = hits
+                for x in o:
+                    w2(x)
+            elif isinstance(o, dict):
+                for v in o.values():
+                    w2(v)
+
+        w2(node)
+        best = (flat, {}, {})
     return best
 
 
@@ -541,9 +562,10 @@ def _lalafo_photo(item):
 def _parse_lalafo_page(raw):
     nd = _lalafo_next_data(raw)
     if nd is None:
-        return [], None
+        return [], False
+    items, links, meta = _lalafo_feed(nd)
     out = []
-    for it in _lalafo_feed_items(nd):
+    for it in items:
         iid = str(it.get("id"))
         url = it.get("url") or ""
         if url.startswith("/"):
@@ -573,7 +595,17 @@ def _parse_lalafo_page(raw):
                     "updated_at": upd,
                     "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
                     "photo": _lalafo_photo(it)})
-    return out, None
+    # Does a genuine next page exist? Prefer the server's own "next" link; fall
+    # back to page counters. When false, the next ?page= would be filler content.
+    has_next = bool(links.get("next"))
+    if not has_next and meta:
+        try:
+            cur = int(meta.get("currentPage") or meta.get("current_page") or 1)
+            pc = int(meta.get("pageCount") or meta.get("page_count") or 1)
+            has_next = cur < pc
+        except Exception:
+            has_next = False
+    return out, has_next
 
 
 def _fetch_lalafo_html(purl, tries=4):
@@ -601,17 +633,19 @@ def fetch_lalafo(url):
             if page == 1:
                 raise RuntimeError("lalafo blocked (Cloudflare) after retries")
             break
-        listings, _ = _parse_lalafo_page(body)
+        listings, has_next = _parse_lalafo_page(body)
         # Only cry "structure changed" when the page clearly HAS listings we failed
         # to parse; a genuinely empty owner feed (no owner posts) stays silent.
         if page == 1 and not listings and len(re.findall(r"-id-\d+", body)) > 3:
             raise RuntimeError("lalafo parsed 0 (structure changed?)")
         new = [l for l in listings if l["id"] not in seen_ids]
-        if not new:
-            break
         for l in new:
             seen_ids.add(l["id"])
             all_out.append(l)
+        if not has_next:            # server says this is the last real page -> stop
+            break                   # (prevents drifting into out-of-area filler ads)
+        if not new:                 # safety: nothing new yet still "next" -> stop
+            break
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
     log(f"lalafo.az: {len(all_out)} listings")
@@ -621,7 +655,7 @@ def fetch_lalafo(url):
 # --------------------------------------------------------------------------- #
 # tap.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
-TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "15"))
+TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "1000"))
 # Only track tap.az posts whose heading contains one of these location keywords.
 TAP_KEYWORDS = ["Q.Qarayev", "Əhmədli", "Xətai r", "Nizami r", "8-ci km",
                 "Neftçilər", "Xalqlar", "Həzi", "Köhnə Günəşli"]
@@ -692,20 +726,36 @@ def _parse_tap_page(raw):
     return out, total
 
 
+def _tap_blocked(body):
+    low = (body or "").lower()
+    return any(x in low for x in ("just a moment", "cf-chl", "challenge-platform", "attention required"))
+
+
+def _fetch_tap_html(purl, tries=4):
+    """Fetch one tap.az page, retrying transient Cloudflare block pages."""
+    last = None
+    for attempt in range(tries):
+        r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
+        last = r
+        body = getattr(r, "text", "") or ""
+        if getattr(r, "status_code", 0) == 200 and not _tap_blocked(body):
+            return r, body
+        time.sleep(3 * (attempt + 1))     # 3s, 6s, 9s before each retry
+    return last, (getattr(last, "text", "") or "")
+
+
 def fetch_tap(url):
-    """Page through the whole tap.az result set. Stops when a page adds no new IDs."""
+    """Page through tap.az results. An empty result (no owner posts matching the
+    filter right now) is a normal, quiet state - only a real block raises."""
     all_out, seen_ids = [], set()
-    total = None
     for page in range(1, TAP_MAX_PAGES + 1):
         purl = _with_page(url, page)
-        r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
-        if r.status_code != 200:
+        r, body = _fetch_tap_html(purl)
+        if getattr(r, "status_code", 0) != 200 or _tap_blocked(body):
             if page == 1:
-                raise RuntimeError(f"HTTP {r.status_code}")
+                raise RuntimeError("tap.az blocked (Cloudflare) after retries")
             break
-        listings, tot = _parse_tap_page(r.text)
-        if tot is not None:
-            total = tot
+        listings, _ = _parse_tap_page(body)
         new = [l for l in listings if l["id"] not in seen_ids]
         if not new:
             break
@@ -714,9 +764,7 @@ def fetch_tap(url):
             all_out.append(l)
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
-    log(f"tap.az: {len(all_out)} listings" + (f" of ~{total} total" if total is not None else ""))
-    if not all_out and total and total > 0:
-        raise RuntimeError("tap.az parsed 0 (structure changed?)")
+    log(f"tap.az: {len(all_out)} listings")
     return all_out
 
 
