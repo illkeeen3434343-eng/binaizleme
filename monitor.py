@@ -381,7 +381,7 @@ def _coverage_warn(scanned, total):
 # --------------------------------------------------------------------------- #
 # yeniemlak.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
-YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "100"))   # owner-new mode: newest pages only
+YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "1000"))   # owner-new mode: newest pages only
 MAX_OWNER_CHECKS = int(os.environ.get("MAX_OWNER_CHECKS", "100"))  # detail-page checks per run
 
 
@@ -479,7 +479,7 @@ def fetch_for_source(source):
 # lalafo.az  (Next.js HTML; the /owner/ URL already returns ONLY owner posts,
 # so every result is a "Mülkiyyətçi" listing — no per-post owner check needed.)
 # --------------------------------------------------------------------------- #
-LALAFO_MAX_PAGES = int(os.environ.get("LALAFO_MAX_PAGES", "20"))
+LALAFO_MAX_PAGES = int(os.environ.get("LALAFO_MAX_PAGES", "1000"))
 
 
 # lalafo renders listings from JavaScript, so the visible HTML tags are empty.
@@ -621,9 +621,9 @@ def fetch_lalafo(url):
 # --------------------------------------------------------------------------- #
 # tap.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
-TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "80"))
+TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "1000"))
 # Only track tap.az posts whose heading contains one of these location keywords.
-TAP_KEYWORDS = ["Q.Qarayev", "Əhmədli", "Xətai r", "Nizami r", "8-ci mkr",
+TAP_KEYWORDS = ["Q.Qarayev", "Əhmədli", "Xətai r", "Nizami r", "8-ci km",
                 "Neftçilər", "Xalqlar", "Həzi", "Köhnə Günəşli"]
 # Owner-only: skip dealer/store cards (they carry a "Mağaza" badge). Set
 # TAP_OWNER_ONLY=0 to fall back to keeping every card.
