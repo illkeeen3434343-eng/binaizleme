@@ -23,6 +23,8 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
+VERSION = "2026-09-03-a"   # bump this when you deploy; printed at start of every run
+
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
     HAS_CURL_CFFI = True
@@ -58,7 +60,7 @@ LALAFO_SEARCH_URL = os.environ.get("LALAFO_SEARCH_URL", (
 SOURCES = [
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price_owner", "owner_label": "Mülkiyyətçi"},
     {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new", "owner_label": "Əmlak sahibi"},
-    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "owner_new", "owner_label": "Sahibindən", "prefiltered_owner": True},
+    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "owner_new", "owner_label": "Sahibindən"},
     {"name": "lalafo.az", "type": "lalafo", "url": LALAFO_SEARCH_URL, "prefix": "lala:", "mode": "owner_new", "owner_label": "Mülkiyyətçi", "prefiltered_owner": True},
 ]
 
@@ -384,6 +386,24 @@ def _coverage_warn(scanned, total):
 YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "1000"))   # owner-new mode: newest pages only
 MAX_OWNER_CHECKS = int(os.environ.get("MAX_OWNER_CHECKS", "100"))  # detail-page checks per run
 
+# yeniemlak's metro[] is a SELLER-DECLARED tag with no tie to the district, so the
+# server returns Yasamal / Binəqədi / Sabunçu posts for a Xətai+Nizami search
+# (verified: metro=Neftçilər returns Sabunçu/Bakıxanov ads). Re-check the parsed
+# address here. Set YE_KEYWORDS="" to disable this guard.
+YE_KEYWORDS = [k.strip() for k in os.environ.get(
+    "YE_KEYWORDS",
+    "Xətai rayonu,Nizami rayonu,Əhmədli,Xalqlar,Neftçilər,Qara Qarayev,Q.Qarayev,"
+    "Həzi Aslanov,H.Aslanov,8-ci km,Köhnə Günəşli"
+).split(",") if k.strip()]
+
+
+def ye_passes(l):
+    """True if the parsed address matches one of the wanted areas."""
+    if not YE_KEYWORDS:
+        return True
+    loc = l.get("location") or ""
+    return any(k in loc for k in YE_KEYWORDS)
+
 
 def _with_page(url, n):
     parts = urlparse(url)
@@ -400,7 +420,10 @@ def _parse_yeniemlak_page(raw):
     text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
     total_m = re.search(r"Nəticə:\s*(\d+)", text)
     total = int(total_m.group(1)) if total_m else None
-    heads = [m.start() for m in re.finditer(r"(?:Satılır|Kirayə|Girov)\s*\d[\d ]*?\s*Baxış", text)]
+    # "Kreditlə" sits between the price and "Baxış" on credit-eligible ads; without
+    # the optional group those cards never start a block and are silently dropped.
+    heads = [m.start() for m in re.finditer(
+        r"(?:Satılır|Kirayə|Girov)\s*\d[\d ]*?\s*(?:Kreditlə\s*)?Baxış", text)]
     heads.append(len(text))
     out = []
     for i in range(len(heads) - 1):
@@ -409,7 +432,7 @@ def _parse_yeniemlak_page(raw):
         if not m_id:
             continue
         iid = m_id.group(1)
-        pm = re.search(r"(?:Satılır|Kirayə|Girov)\s*(\d[\d ]*?)\s*Baxış", b)
+        pm = re.search(r"(?:Satılır|Kirayə|Girov)\s*(\d[\d ]*?)\s*(?:Kreditlə\s*)?Baxış", b)
         price = int(pm.group(1).replace(" ", "")) if pm else None
         fl = re.search(r"(\d+)\s*/\s*(\d+)\s*Mərtəbə", b)
         rooms = re.search(r"(\d+)\s*otaq", b)
@@ -435,9 +458,11 @@ def _parse_yeniemlak_page(raw):
 
 def fetch_yeniemlak(url):
     """Page through the whole yeniemlak result set. Stops when a page adds no new
-    listing IDs (also the graceful fallback if ?page is ever ignored)."""
+    listing IDs (also the graceful fallback if ?page is ever ignored). Listings the
+    site leaked outside the wanted districts are dropped by ye_passes()."""
     all_out, seen_ids = [], set()
     total = None
+    parsed = 0
     for page in range(1, YE_MAX_PAGES + 1):
         purl = _with_page(url, page)
         r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
@@ -452,13 +477,16 @@ def fetch_yeniemlak(url):
         if not new:                       # no new IDs -> end of results (or page ignored)
             break
         for l in new:
-            seen_ids.add(l["id"])
-            all_out.append(l)
+            seen_ids.add(l["id"])         # always mark, so pagination still terminates
+            parsed += 1
+            if ye_passes(l):
+                all_out.append(l)
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
-    log(f"yeniemlak: {len(all_out)} listings"
-        + (f" of ~{total} total" if total is not None else ""))
-    if not all_out and total and total > 0:
+    log(f"yeniemlak: kept {len(all_out)} of {parsed} parsed"
+        + (f" (~{total} on site)" if total is not None else ""))
+    # Alarm on a PARSE failure, never on a legitimately empty filtered result.
+    if not parsed and total and total > 0:
         raise RuntimeError("yeniemlak parsed 0 (structure changed?)")
     return all_out
 
@@ -724,6 +752,82 @@ def _parse_tap_page(raw):
     if TAP_OWNER_ONLY and dealers:
         log(f"tap.az: skipped {dealers} dealer (Mağaza) cards on this page")
     return out, total
+
+
+# --------------------------------------------------------------------------- #
+# tap.az: owner vs. realtor
+#
+# tap.az has NO owner/agent field. q[is_shop]=false and the "Mağaza" badge exclude
+# only paid STORE accounts; an individual realtor posts from an ordinary user
+# account and is indistinguishable from an owner on the search card. So the card is
+# no longer trusted — we open the ad and use three signals:
+#   1. a /shops/ link on the page          -> dealer (hard)
+#   2. agency wording in the description   -> realtor ("xidmət haqqı", "komissiya", …)
+#   3. the same user_id posting many ads   -> realtor (counted from our own history)
+# An explicit owner phrase ("vasitəçi narahat etməsin", "sahibindən") beats rule 2,
+# because owners often write "no agents please" and would otherwise be filtered out.
+# --------------------------------------------------------------------------- #
+TAP_MAX_USER_ADS = int(os.environ.get("TAP_MAX_USER_ADS", "3"))
+
+TAP_REALTOR_PHRASES = [p.strip().lower() for p in os.environ.get(
+    "TAP_REALTOR_PHRASES",
+    "xidmət haqqı,xidmet haqqi,komissiya,komisyon,komissyon,rieltor,rialtor,realtor,"
+    "makler,əmlak agentliyi,emlak agentliyi,agentliyi,agentlik,ofis haqqı,ofis haqqi,"
+    "ofis xidmət,ofis xidmet,ekskluziv,eksklüziv,bazamızda,bazamizda,müştərilərimiz,"
+    "musterilerimiz,açarlar bizdə,acarlar bizde,açar bizdə,portfelimiz"
+).split(",") if p.strip()]
+
+TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
+    "TAP_OWNER_PHRASES",
+    "vasitəçi narahat,vasiteci narahat,vasitəçi yoxdur,vasitəçisiz,vasitecisiz,"
+    "vasitəçi olmadan,sahibindən,sahibinden,mülkiyyətçidən,mulkiyyetciden,birbaşa sahibi"
+).split(",") if p.strip()]
+
+
+def tap_check_owner(url, seller_counts=None):
+    """Open one tap.az ad and decide owner vs. realtor.
+    Returns (is_owner, photo, seller_id); is_owner None = undecidable, retry later."""
+    try:
+        r, raw = _fetch_tap_html(url, tries=3)
+    except Exception as e:
+        log("tap detail fetch error:", e)
+        return None, None, None
+    if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw) or len(raw) < 2000:
+        return None, None, None            # blocked/short -> undecidable, do NOT record
+
+    seller = None
+    m = re.search(r"/elanlar\?user_id=(\d+)", raw)
+    if m:
+        seller = m.group(1)
+
+    photo = None
+    pm = re.search(r'(https?://tap\.azstatic\.com/uploads/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp))', raw)
+    if pm:
+        photo = pm.group(1)
+
+    # 1) hard dealer: the ad belongs to a paid store account
+    if re.search(r'href="[^"]*/shops/', raw):
+        return False, photo, seller
+
+    text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw))).lower()
+
+    # 2) an explicit "no agents" / "from the owner" line wins over the wording check
+    if any(p in text for p in TAP_OWNER_PHRASES):
+        return True, photo, seller
+
+    # 3) agency wording anywhere in the ad text
+    hit = next((p for p in TAP_REALTOR_PHRASES if p in text), None)
+    if hit:
+        log(f"tap.az: {url} -> realtor (phrase: {hit})")
+        return False, photo, seller
+
+    # 4) the same account has already posted several ads we recorded
+    if seller and seller_counts and seller_counts.get(seller, 0) >= TAP_MAX_USER_ADS:
+        log(f"tap.az: {url} -> realtor (user {seller} has "
+            f"{seller_counts[seller]} recorded ads)")
+        return False, photo, seller
+
+    return True, photo, seller
 
 
 def _tap_blocked(body):
@@ -1010,36 +1114,55 @@ def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
     return "\n".join(lines)
 
 
+def _seller_counts(seen):
+    """How many ads each seller account already has in our history."""
+    counts = {}
+    for v in seen.values():
+        sid = v.get("seller")
+        if sid:
+            counts[sid] = counts.get(sid, 0) + 1
+    return counts
+
+
 def process_new_owner_checks(items, source, seen, seeded_flags):
     """For a price-tracked source that should ALSO announce new OWNER posts (bina):
     owner-check listings not yet in `seen`. MUST run before process_source seeds them.
-    The owner label lives on the detail page; where that page is blocked (e.g. GitHub's
-    datacenter IP) check_is_owner returns None and nothing is announced — no crash."""
+
+    Returns (notified, deferred_ids). Anything in deferred_ids was NOT decided this
+    run — over the per-run check budget, or the detail page was blocked. The caller
+    MUST keep those out of process_source, otherwise they get seeded as "known" and
+    can never be announced again."""
     name = source["name"]
     owner_label = source.get("owner_label", "Mülkiyyətçi")
     flag = name + ":owner_seeded"
     if not seeded_flags.get(flag):
         seeded_flags[flag] = True
-        return 0                      # first run: don't owner-check the existing backlog
+        return 0, set()               # first run: don't owner-check the existing backlog
     checks = notified = 0
+    deferred = set()
     for l in items:
         key = source["prefix"] + str(l["id"])
         if key in seen:
             continue                  # already known (price-tracked or checked before)
         if checks >= MAX_OWNER_CHECKS:
-            break
+            deferred.add(str(l["id"]))    # over budget -> retry next run
+            continue
         owner, photo = check_is_owner(l["url"], owner_label)
         checks += 1
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
+        if owner is None:
+            deferred.add(str(l["id"]))    # blocked/timeout -> retry next run
+            continue
         if owner:
             if photo:
                 l["photo"] = photo    # keep API photo if detail gave none
             if notify_new_owner_msg(l, name, owner_label):
                 notified += 1
-    if checks:
-        log(f"{name}: owner-checked {checks} new, announced {notified}")
-    return notified
+    if checks or deferred:
+        log(f"{name}: owner-checked {checks} new, announced {notified}, "
+            f"deferred {len(deferred)}")
+    return notified, deferred
 
 
 def process_owner_new(items, source, seen, seeded_flags):
@@ -1060,6 +1183,7 @@ def process_owner_new(items, source, seen, seeded_flags):
         return 0
 
     prefiltered = source.get("prefiltered_owner", False)  # URL already returns only owner posts
+    seller_counts = _seller_counts(seen)
     checks = 0
     notified = 0
     for l in items:
@@ -1074,7 +1198,11 @@ def process_owner_new(items, source, seen, seeded_flags):
             continue
         if checks >= MAX_OWNER_CHECKS:
             break                          # spread detail-page load; rest handled next run
-        owner, photo = check_is_owner(l["url"], owner_label)
+        if source.get("type") == "tap":
+            owner, photo, seller = tap_check_owner(l["url"], seller_counts)
+        else:
+            owner, photo = check_is_owner(l["url"], owner_label)
+            seller = None
         checks += 1
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
@@ -1082,7 +1210,11 @@ def process_owner_new(items, source, seen, seeded_flags):
             continue                       # couldn't determine -> leave unrecorded, retry later
         if photo:
             l["photo"] = photo
-        seen[key] = {"url": l["url"], "first_seen": now, "source": name, "owner": bool(owner)}
+        rec = {"url": l["url"], "first_seen": now, "source": name, "owner": bool(owner)}
+        if seller:
+            rec["seller"] = seller
+            seller_counts[seller] = seller_counts.get(seller, 0) + 1
+        seen[key] = rec
         if owner and notify_new_owner_msg(l, name, owner_label):
             notified += 1
     log(f"{name}: checked {checks} new, announced {notified} owner posts")
@@ -1145,12 +1277,14 @@ def _ensure_history(rec, now):
                                      "date": rec.get("first_seen", now)})
 
 
-def process_source(items, source, seen):
+def process_source(items, source, seen, skip_ids=None):
     prefix, name = source["prefix"], source["name"]
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     events = []
     for l in items:
         key = prefix + str(l["id"])
+        if skip_ids and str(l["id"]) in skip_ids and key not in seen:
+            continue          # not owner-checked yet -> do NOT seed, or it is lost forever
         cur = normalize_price(l.get("price"))
         rec = seen.get(key)
 
@@ -1202,6 +1336,7 @@ def process_source(items, source, seen):
 # Main
 # --------------------------------------------------------------------------- #
 def main():
+    log(f"monitor.py {VERSION} starting")
     if not BOT_TOKEN or not CHAT_ID:
         log("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
         sys.exit(1)
@@ -1251,8 +1386,9 @@ def main():
             total_notified += process_owner_new(items, source, seen, seeded_flags)
         elif source.get("mode") == "price_owner":
             # owner check must run BEFORE process_source seeds the new listings
-            total_notified += process_new_owner_checks(items, source, seen, seeded_flags)
-            total_notified += process_source(items, source, seen)
+            n_new, deferred = process_new_owner_checks(items, source, seen, seeded_flags)
+            total_notified += n_new
+            total_notified += process_source(items, source, seen, skip_ids=deferred)
         else:
             total_notified += process_source(items, source, seen)
 
