@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-04-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-04-b"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -87,6 +87,14 @@ PAGE_SIZE = int(os.environ.get("BINA_PAGE_SIZE", "16"))  # bina GraphQL `first:`
 # raise it (block risk) or narrow the search so the whole set fits.
 SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "1000"))
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause between pages
+
+# bina's server matches locations hierarchically, so selecting a district also returns
+# its sub-areas (metros / settlements). These are sub-areas you do NOT want even though
+# they sit inside a chosen district. Matched against the listing's location name.
+BINA_EXCLUDE_LOCATIONS = [x.strip() for x in os.environ.get(
+    "BINA_EXCLUDE_LOCATIONS",
+    "Koroğlu,Ağ şəhər,Şah İsmayıl Xətai"
+).split(",") if x.strip()]
 # Reject absurd price jumps (parse glitches), but allow any realistic change.
 PRICE_GLITCH_LOW = float(os.environ.get("PRICE_GLITCH_LOW", "0.2"))    # new < 20% of old
 PRICE_GLITCH_HIGH = float(os.environ.get("PRICE_GLITCH_HIGH", "5.0"))  # new > 5x old
@@ -322,6 +330,9 @@ def bina_passes(l, c):
     #
     # The remaining guards only fire on a genuine contradiction (value present AND out of
     # range); a missing value is trusted, never dropped.
+    loc = l.get("location") or ""
+    if BINA_EXCLUDE_LOCATIONS and any(x in loc for x in BINA_EXCLUDE_LOCATIONS):
+        return False
     if c["rooms"] and l.get("rooms") is not None and l.get("rooms") not in c["rooms"]:
         return False
     if c["price_to"] is not None and l.get("price") is not None and l["price"] > c["price_to"]:
@@ -597,12 +608,46 @@ def _lalafo_photo(item):
     return None
 
 
+_LALAFO_DBG = {"done": False}
+
+
+def _lalafo_is_agent(it):
+    """Best-effort agent flag from a lalafo feed item. True only on a clear signal,
+    so a real owner is never dropped by mistake. Reject-on-positive."""
+    try:
+        u = it.get("user") if isinstance(it.get("user"), dict) else {}
+        for k in ("pro", "is_pro", "is_business", "business", "is_shop"):
+            if u.get(k) is True or it.get(k) is True:
+                return True
+        for k in ("user_type", "type", "account_type", "label", "ad_label", "seller_type"):
+            v = u.get(k) or it.get(k)
+            if isinstance(v, str) and any(x in v.lower()
+                                          for x in ("makler", "agent", "agency", "business")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def lalafo_ok(l):
+    """lalafo puts the city in the URL slug (/baku/...). Reject anything not in Baku,
+    e.g. /dzhulfa/ (Culfa, Nakhchivan) that leaks in as fallback/recommended content."""
+    url = (l.get("url") or "").lower()
+    return "/baku/" in url
+
+
 def _parse_lalafo_page(raw):
     nd = _lalafo_next_data(raw)
     if nd is None:
         return [], False
     items, links, meta = _lalafo_feed(nd)
     out = []
+    if items and not _LALAFO_DBG["done"]:
+        _LALAFO_DBG["done"] = True
+        try:
+            log("lalafo item keys sample:", sorted(items[0].keys()))
+        except Exception:
+            pass
     for it in items:
         iid = str(it.get("id"))
         url = it.get("url") or ""
@@ -632,7 +677,8 @@ def _parse_lalafo_page(raw):
                     "location_id": it.get("city_id"),
                     "updated_at": upd,
                     "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
-                    "photo": _lalafo_photo(it)})
+                    "photo": _lalafo_photo(it),
+                    "_agent": _lalafo_is_agent(it)})
     # Does a genuine next page exist? Prefer the server's own "next" link; fall
     # back to page counters. When false, the next ?page= would be filler content.
     has_next = bool(links.get("next"))
@@ -784,7 +830,7 @@ TAP_REALTOR_PHRASES = [p.strip().lower() for p in os.environ.get(
     "xidmət haqqı,xidmet haqqi,komissiya,komisyon,komissyon,rieltor,rialtor,realtor,"
     "makler,əmlak agentliyi,emlak agentliyi,agentliyi,agentlik,ofis haqqı,ofis haqqi,"
     "ofis xidmət,ofis xidmet,ekskluziv,eksklüziv,bazamızda,bazamizda,müştərilərimiz,"
-    "musterilerimiz,açarlar bizdə,acarlar bizde,açar bizdə,portfelimiz,ətraflı məlumat və digər əmlaklar,diger emlaklar"
+    "musterilerimiz,açarlar bizdə,acarlar bizde,açar bizdə,portfelimiz"
 ).split(",") if p.strip()]
 
 TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
@@ -794,7 +840,24 @@ TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
 ).split(",") if p.strip()]
 
 
-def tap_check_owner(url, seller_counts=None):
+def tap_user_ad_count(user_id, cache):
+    """How many ads this tap.az account currently has live. An agency posing as an
+    individual still lists many; a real owner lists one or two. None = couldn't fetch."""
+    if user_id in cache:
+        return cache[user_id]
+    n = None
+    try:
+        r, raw = _fetch_tap_html(f"https://tap.az/elanlar?user_id={user_id}", tries=2)
+        if getattr(r, "status_code", 0) == 200 and not _tap_blocked(raw):
+            ids = set(re.findall(r"/elanlar/[a-z0-9\-/]*?/(\d+)\b", raw))
+            n = len(ids)
+    except Exception as e:
+        log("tap profile fetch error:", e)
+    cache[user_id] = n
+    return n
+
+
+def tap_check_owner(url, seller_counts=None, profile_cache=None):
     """Open one tap.az ad and decide owner vs. realtor.
     Returns (is_owner, photo, seller_id); is_owner None = undecidable, retry later."""
     try:
@@ -830,6 +893,14 @@ def tap_check_owner(url, seller_counts=None):
     if hit:
         log(f"tap.az: {url} -> realtor (phrase: {hit})")
         return False, photo, seller
+
+    # 3.5) how many ads does this account currently have live on tap.az? (strongest
+    #      signal for an agency running from a personal-looking account)
+    if seller:
+        cnt = tap_user_ad_count(seller, profile_cache if profile_cache is not None else {})
+        if cnt is not None and cnt >= TAP_MAX_USER_ADS:
+            log(f"tap.az: {url} -> realtor (profile user {seller} has {cnt}+ live ads)")
+            return False, photo, seller
 
     # 4) the same account has already posted several ads we recorded
     if seller and seller_counts and seller_counts.get(seller, 0) >= TAP_MAX_USER_ADS:
@@ -1076,6 +1147,104 @@ def notify_change(l, source_name, kind, old_price, new_price, n_changes):
 # tracking for this source. The owner label lives on the detail page, so we only
 # fetch detail pages for genuinely NEW listings (few per run).
 # --------------------------------------------------------------------------- #
+def _iter_dicts(obj):
+    """Yield every dict nested anywhere inside a JSON structure."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _iter_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_dicts(v)
+
+
+def _bina_owner_from_ldjson(raw):
+    """schema.org seller/provider @type: Person -> owner, RealEstateAgent/Org -> agent."""
+    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
+                         raw, re.S):
+        try:
+            data = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        for obj in _iter_dicts(data):
+            for key in ("seller", "provider", "offeredBy", "author", "broker"):
+                v = obj.get(key)
+                if isinstance(v, dict):
+                    t = v.get("@type") or v.get("type") or ""
+                    t = " ".join(t) if isinstance(t, list) else str(t)
+                    t = t.lower()
+                    if "person" in t:
+                        return True
+                    if any(x in t for x in ("realestateagent", "organization",
+                                            "localbusiness", "corporation")):
+                        return False
+    return None
+
+
+def _bina_owner_from_nextdata(raw):
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return None
+    for obj in _iter_dicts(data):
+        for key in ("leaser_type", "leaserType", "ownerType", "userType", "seller_type"):
+            v = obj.get(key)
+            if isinstance(v, str) and v.strip():
+                lv = v.lower()
+                if any(x in lv for x in ("owner", "mülk", "mulk", "sahib")):
+                    return True
+                if any(x in lv for x in ("agent", "agency", "makler", "vasit")):
+                    return False
+        for key in ("has_agency", "hasAgency", "is_agency", "isAgency", "is_shop", "isShop"):
+            if obj.get(key) is True:
+                return False
+        for key in ("leaser_name", "leaserName", "contact_name"):
+            v = obj.get(key)
+            if isinstance(v, str) and v.strip():
+                lv = v.lower()
+                if any(x in lv for x in ("vasit", "agent", "makler", "agentlik")):
+                    return False
+                if any(x in lv for x in ("mülk", "mulk", "sahib")):
+                    return True
+    return None
+
+
+_BINA_DBG = {"done": False}
+
+
+def bina_is_owner(url):
+    """bina.az owner vs agent, read from the detail page's structured data.
+    Returns (is_owner, photo). None = undetermined -> caller retries (never buried)."""
+    try:
+        r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
+        if getattr(r, "status_code", 0) != 200:
+            return None, None
+        raw = r.text or ""
+    except Exception:
+        return None, None
+    photo = None
+    mo = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', raw)
+    if mo:
+        photo = mo.group(1)
+    verdict = _bina_owner_from_ldjson(raw)
+    src = "ldjson"
+    if verdict is None:
+        verdict = _bina_owner_from_nextdata(raw); src = "nextdata"
+    if verdict is None:
+        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
+        if "Vasitəçi" in text:
+            verdict, src = False, "text"
+        elif "Mülkiyyətçi" in text:
+            verdict, src = True, "text"
+    if not _BINA_DBG["done"]:
+        _BINA_DBG["done"] = True
+        log(f"bina owner-detect: {url} -> {verdict} (via {src if verdict is not None else 'none'})")
+    return verdict, photo
+
+
 def check_is_owner(url, owner_label="Əmlak sahibi"):
     """Returns (is_owner, photo_url). is_owner: True=owner, False=agent, None=unknown.
     Photo is the listing's first image, pulled from the same detail page (no extra request)."""
@@ -1157,7 +1326,10 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
         if checks >= MAX_OWNER_CHECKS:
             deferred.add(str(l["id"]))    # over budget -> retry next run
             continue
-        owner, photo = check_is_owner(l["url"], owner_label)
+        if source.get("type") == "bina":
+            owner, photo = bina_is_owner(l["url"])
+        else:
+            owner, photo = check_is_owner(l["url"], owner_label)
         checks += 1
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
@@ -1194,6 +1366,7 @@ def process_owner_new(items, source, seen, seeded_flags):
 
     prefiltered = source.get("prefiltered_owner", False)  # URL already returns only owner posts
     seller_counts = _seller_counts(seen)
+    tap_profile_cache = {}
     checks = 0
     notified = 0
     for l in items:
@@ -1201,7 +1374,19 @@ def process_owner_new(items, source, seen, seeded_flags):
         if key in seen:
             continue                       # already handled; never re-check or price-track
         if prefiltered:
-            # every listing is already an owner post (e.g. lalafo /owner/ URL) -> announce, no fetch
+            # "prefiltered" only means the SEARCH URL asked for owner posts. lalafo still
+            # leaks agent ("Makler") posts and out-of-area (non-Baku) fallback content, so
+            # re-check both here before announcing.
+            if source.get("type") == "lalafo":
+                if not lalafo_ok(l):
+                    seen[key] = {"url": l["url"], "first_seen": now,
+                                 "source": name, "owner": False, "skip": "location"}
+                    continue
+                if l.get("_agent"):
+                    log(f"lalafo.az: {l['url']} -> skipped (agent/Makler signal)")
+                    seen[key] = {"url": l["url"], "first_seen": now,
+                                 "source": name, "owner": False, "skip": "agent"}
+                    continue
             seen[key] = {"url": l["url"], "first_seen": now, "source": name, "owner": True}
             if notify_new_owner_msg(l, name, owner_label):
                 notified += 1
@@ -1209,7 +1394,7 @@ def process_owner_new(items, source, seen, seeded_flags):
         if checks >= MAX_OWNER_CHECKS:
             break                          # spread detail-page load; rest handled next run
         if source.get("type") == "tap":
-            owner, photo, seller = tap_check_owner(l["url"], seller_counts)
+            owner, photo, seller = tap_check_owner(l["url"], seller_counts, tap_profile_cache)
         else:
             owner, photo = check_is_owner(l["url"], owner_label)
             seller = None
