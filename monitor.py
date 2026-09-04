@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-03-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-04-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -79,7 +79,7 @@ PERSISTED_HASH = os.environ.get("BINA_PERSISTED_HASH",
 GRAPHQL_URL = "https://bina.az/graphql"
 OPERATION = "SearchItems"
 SORT = "BUMPED_AT_DESC"
-PAGE_SIZE = 16
+PAGE_SIZE = int(os.environ.get("BINA_PAGE_SIZE", "16"))  # bina GraphQL `first:`
 # Price tracking needs the FULL result set each run (not just the newest listings),
 # so an old listing's price change is still fetched and compared. SCAN_PAGES caps how
 # many pages we page through — a safety valve against hammering bina / getting blocked.
@@ -309,15 +309,25 @@ def bina_check(url):
 
 
 def bina_passes(l, c):
-    if c["rooms"] and l.get("rooms") not in c["rooms"]:
+    # bina_filter_vars already sends roomIds / locationIds / price / area / hasBillOfSale
+    # to the GraphQL server, so the server has ALREADY applied every filter. This function
+    # is only a thin safety net against persisted-query drift; it must not re-filter.
+    #
+    # In particular it must NOT re-check location. bina's locations are a TREE: when you
+    # select a district (rayon), the server also returns listings whose leaf location.id is
+    # a settlement / metro / residential-complex INSIDE that district. That leaf id is not
+    # in your district set, so the old `location_id not in c["locs"]` test silently dropped
+    # them - ~18% of results (2053 of 11234), including real owner posts like 6428510.
+    # We now trust the server for location entirely.
+    #
+    # The remaining guards only fire on a genuine contradiction (value present AND out of
+    # range); a missing value is trusted, never dropped.
+    if c["rooms"] and l.get("rooms") is not None and l.get("rooms") not in c["rooms"]:
         return False
-    if c["price_to"] is not None and (l.get("price") is None or l["price"] > c["price_to"]):
+    if c["price_to"] is not None and l.get("price") is not None and l["price"] > c["price_to"]:
         return False
-    if c["area_from"] is not None and (l.get("area") is None or l["area"] < c["area_from"]):
+    if c["area_from"] is not None and l.get("area") is not None and l["area"] < c["area_from"]:
         return False
-    if c["locs"]:
-        if l.get("location_id") is None or l["location_id"] not in c["locs"]:
-            return False
     return True
 
 
@@ -774,7 +784,7 @@ TAP_REALTOR_PHRASES = [p.strip().lower() for p in os.environ.get(
     "xidmət haqqı,xidmet haqqi,komissiya,komisyon,komissyon,rieltor,rialtor,realtor,"
     "makler,əmlak agentliyi,emlak agentliyi,agentliyi,agentlik,ofis haqqı,ofis haqqi,"
     "ofis xidmət,ofis xidmet,ekskluziv,eksklüziv,bazamızda,bazamizda,müştərilərimiz,"
-    "musterilerimiz,açarlar bizdə,acarlar bizde,açar bizdə,portfelimiz"
+    "musterilerimiz,açarlar bizdə,acarlar bizde,açar bizdə,portfelimiz,ətraflı məlumat və digər əmlaklar,diger emlaklar"
 ).split(",") if p.strip()]
 
 TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
