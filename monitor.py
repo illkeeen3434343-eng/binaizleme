@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-04-b"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-05-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -1039,10 +1039,22 @@ def save_state(state, sha):
     _prune(state)
     if not USE_API:
         try:
-            with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            # Atomic write: dump to a temp file, fsync, then os.replace(). A reader
+            # (or the next run) can never see a half-written or empty seen.json even
+            # if the process is killed or the disk fills mid-write.
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(state, fh, ensure_ascii=False, indent=1)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, STATE_FILE)
             return True, "local"
         except Exception as e:
+            try:
+                if os.path.exists(STATE_FILE + ".tmp"):
+                    os.remove(STATE_FILE + ".tmp")
+            except Exception:
+                pass
             return False, f"local write: {e}"
     reason = "unknown"
     for attempt in range(6):
