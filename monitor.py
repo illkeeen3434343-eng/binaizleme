@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-05-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-05-b"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -824,6 +824,11 @@ def _parse_tap_page(raw):
 # because owners often write "no agents please" and would otherwise be filtered out.
 # --------------------------------------------------------------------------- #
 TAP_MAX_USER_ADS = int(os.environ.get("TAP_MAX_USER_ADS", "3"))
+# Count how many APARTMENTS a seller has for sale on their profile; 3+ => agent.
+# This mirrors the manual rule: the ad shows "İstifadəçinin bütün elanları" only for
+# sellers with multiple listings; you then open the profile and count apartments.
+TAP_MAX_APARTMENTS = int(os.environ.get("TAP_MAX_APARTMENTS", "3"))
+TAP_MULTI_MARKER = "bütün elanları"   # appears under the name only for multi-listing sellers
 
 TAP_REALTOR_PHRASES = [p.strip().lower() for p in os.environ.get(
     "TAP_REALTOR_PHRASES",
@@ -840,16 +845,18 @@ TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
 ).split(",") if p.strip()]
 
 
-def tap_user_ad_count(user_id, cache):
-    """How many ads this tap.az account currently has live. An agency posing as an
-    individual still lists many; a real owner lists one or two. None = couldn't fetch."""
+def tap_apartment_count(user_id, cache):
+    """How many APARTMENTS this tap.az account currently has for sale, read from the
+    category-filtered profile page (same page you open by hand). None = couldn't fetch
+    (blocked/error) -> caller decides whether to defer. Cached per run per seller."""
     if user_id in cache:
         return cache[user_id]
     n = None
     try:
-        r, raw = _fetch_tap_html(f"https://tap.az/elanlar?user_id={user_id}", tries=2)
+        url = f"https://tap.az/elanlar/dasinmaz-emlak/menziller?user_id={user_id}"
+        r, raw = _fetch_tap_html(url, tries=2)
         if getattr(r, "status_code", 0) == 200 and not _tap_blocked(raw):
-            ids = set(re.findall(r"/elanlar/[a-z0-9\-/]*?/(\d+)\b", raw))
+            ids = set(re.findall(r"/elanlar/dasinmaz-emlak/menziller/(\d+)", raw))
             n = len(ids)
     except Exception as e:
         log("tap profile fetch error:", e)
@@ -894,13 +901,20 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
         log(f"tap.az: {url} -> realtor (phrase: {hit})")
         return False, photo, seller
 
-    # 3.5) how many ads does this account currently have live on tap.az? (strongest
-    #      signal for an agency running from a personal-looking account)
+    # 3.5) the manual rule: multi-listing sellers show "İstifadəçinin bütün elanları".
+    #      Open their profile, count apartments; 3+ => agent. Only fetch the profile
+    #      when we have a seller id (saves a request for obvious single-listing owners).
+    has_multi = TAP_MULTI_MARKER in raw
     if seller:
-        cnt = tap_user_ad_count(seller, profile_cache if profile_cache is not None else {})
-        if cnt is not None and cnt >= TAP_MAX_USER_ADS:
-            log(f"tap.az: {url} -> realtor (profile user {seller} has {cnt}+ live ads)")
+        cache = profile_cache if profile_cache is not None else {}
+        cnt = tap_apartment_count(seller, cache)
+        if cnt is not None and cnt >= TAP_MAX_APARTMENTS:
+            log(f"tap.az: {url} -> realtor (seller {seller} has {cnt} apartments listed)")
             return False, photo, seller
+        if cnt is None and has_multi:
+            # multi-listing seller we could not verify -> do NOT announce; retry next run
+            log(f"tap.az: {url} -> deferred (multi-listing seller {seller}, profile unread)")
+            return None, photo, seller
 
     # 4) the same account has already posted several ads we recorded
     if seller and seller_counts and seller_counts.get(seller, 0) >= TAP_MAX_USER_ADS:
