@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-05-c"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-05-d"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -94,10 +94,37 @@ PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause be
 # Paid promotion (VIP / Premium / "İrəli çək") re-surfaces OLD ads at the top of a
 # BUMPED_AT_DESC sort, so a promoted ad can look brand new. Skip promoted ads, and/or
 # require the ad to have been updated recently. 0 disables the age rule.
-SKIP_PROMOTED = os.environ.get("SKIP_PROMOTED", "1") == "1"
+# A promoted ad is NOT automatically rejected: it may be a genuinely new post whose
+# owner also paid to promote it. Rule: promoted + demonstrably OLD -> ignore (it is an
+# old ad resurfaced by a paid bump); promoted + new (or age unknown) -> announce.
+PROMOTED_MAX_AGE_DAYS = int(os.environ.get("PROMOTED_MAX_AGE_DAYS", "3"))
 MAX_LISTING_AGE_DAYS = int(os.environ.get("MAX_LISTING_AGE_DAYS", "0"))
 _PROMO_KEY = re.compile(r"vip|premium|featured|promoted|boost|highlight|paid|sticky|urgent", re.I)
 _PROMO_DBG = {"done": False}
+
+
+def _listing_age_days(l):
+    """Age in days from the listing's own creation date. None = unknown (never guess)."""
+    ts = l.get("created_at")
+    if not isinstance(ts, str) or not ts[:4].isdigit():
+        return None
+    try:
+        d = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return (dt.datetime.now(dt.timezone.utc) - d).days
+    except Exception:
+        return None
+
+
+def is_stale_promoted(l):
+    """True only when the ad is promoted AND provably old -> a paid bump of an old ad."""
+    if not l.get("_promoted"):
+        return False
+    age = _listing_age_days(l)
+    if age is None:
+        return False                     # unknown age -> do NOT drop a possibly-new post
+    return age > PROMOTED_MAX_AGE_DAYS
 
 
 def _node_promoted(node):
@@ -270,8 +297,13 @@ def bina_filter_vars(url):
         f["hasBillOfSale"] = b(one("has_bill_of_sale"))
     if b(one("has_mortgage")) is not None:
         f["hasMortgage"] = b(one("has_mortgage"))
-    f["floorFirst"] = b(one("floor_first")) is True
-    f["floorLast"] = b(one("floor_last")) is True
+    # These were previously sent UNCONDITIONALLY as false. bina treats that as a real
+    # constraint, not "unset": measured 11229 listings with them vs 13294 without -- so
+    # 2065 listings (~15%) were hidden on every run. Send them only if the URL sets them.
+    if b(one("floor_first")) is not None:
+        f["floorFirst"] = b(one("floor_first"))
+    if b(one("floor_last")) is not None:
+        f["floorLast"] = b(one("floor_last"))
     return f
 
 
@@ -357,18 +389,9 @@ def bina_passes(l, c):
     loc = l.get("location") or ""
     if BINA_EXCLUDE_LOCATIONS and any(x in loc for x in BINA_EXCLUDE_LOCATIONS):
         return False
-    if SKIP_PROMOTED and l.get("_promoted"):
-        return False                     # paid bump: an old ad masquerading as new
-    if MAX_LISTING_AGE_DAYS > 0:
-        ts = l.get("created_at") or l.get("updated_at")
-        if isinstance(ts, str) and ts[:4].isdigit():
-            try:
-                age = (dt.datetime.now(dt.timezone.utc)
-                       - dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))).days
-                if age > MAX_LISTING_AGE_DAYS:
-                    return False
-            except Exception:
-                pass
+    if MAX_LISTING_AGE_DAYS > 0 and _listing_age_days(l) is not None \
+            and _listing_age_days(l) > MAX_LISTING_AGE_DAYS:
+        return False
     if c["rooms"] and l.get("rooms") is not None and l.get("rooms") not in c["rooms"]:
         return False
     if c["price_to"] is not None and l.get("price") is not None and l["price"] > c["price_to"]:
@@ -1426,6 +1449,10 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
             deferred.add(str(l["id"]))    # blocked/timeout -> retry next run
             continue
         if owner:
+            if is_stale_promoted(l):
+                log(f"{name}: {l['url']} -> promoted bump of a "
+                    f"{_listing_age_days(l)}-day-old ad; recorded, not announced")
+                continue              # seeded by process_source; never announced as new
             if photo:
                 l["photo"] = photo    # keep API photo if detail gave none
             if notify_new_owner_msg(l, name, owner_label):
