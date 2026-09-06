@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-05-d"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-05-e"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -99,22 +99,39 @@ PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause be
 # old ad resurfaced by a paid bump); promoted + new (or age unknown) -> announce.
 PROMOTED_MAX_AGE_DAYS = int(os.environ.get("PROMOTED_MAX_AGE_DAYS", "3"))
 MAX_LISTING_AGE_DAYS = int(os.environ.get("MAX_LISTING_AGE_DAYS", "0"))
+# Confirmed live on bina: isFeatured (Premium/crown) and isVipped (VIP). The regex
+# stays as a fallback so a renamed/added flag is still caught and logged.
+BINA_PROMO_FIELDS = ("isFeatured", "isVipped")
 _PROMO_KEY = re.compile(r"vip|premium|featured|promoted|boost|highlight|paid|sticky|urgent", re.I)
 _PROMO_DBG = {"done": False}
 
 
+# bina item ids increase almost perfectly linearly with time (measured: 6374417 on
+# 13 Aug -> 6409595 on 26 Aug -> ~6438584 on 5 Sep, i.e. ~2700-2900 new ids/day site
+# wide). When the API gives no creation date we estimate age from how far below the
+# newest id a listing sits. Self-calibrating: the newest id in each scan is "now".
+BINA_IDS_PER_DAY = int(os.environ.get("BINA_IDS_PER_DAY", "2800"))
+_BINA_MAX_ID = {"v": 0}
+
+
 def _listing_age_days(l):
-    """Age in days from the listing's own creation date. None = unknown (never guess)."""
+    """Age in days: exact from creation date if present, else estimated from the id.
+    None = genuinely unknown (caller must not treat that as 'old')."""
     ts = l.get("created_at")
-    if not isinstance(ts, str) or not ts[:4].isdigit():
-        return None
-    try:
-        d = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
-        return (dt.datetime.now(dt.timezone.utc) - d).days
-    except Exception:
-        return None
+    if isinstance(ts, str) and ts[:4].isdigit():
+        try:
+            d = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=dt.timezone.utc)
+            return (dt.datetime.now(dt.timezone.utc) - d).days
+        except Exception:
+            pass
+    iid, top = str(l.get("id") or ""), _BINA_MAX_ID["v"]
+    if iid.isdigit() and top and BINA_IDS_PER_DAY > 0:
+        gap = top - int(iid)
+        if gap >= 0:
+            return gap / BINA_IDS_PER_DAY
+    return None
 
 
 def is_stale_promoted(l):
@@ -131,6 +148,9 @@ def _node_promoted(node):
     """True if any promotion-ish boolean on the bina node is set. Field names differ
     across bina releases, so match by key pattern and log what was found once."""
     found = {}
+    for k in BINA_PROMO_FIELDS:
+        if node.get(k) is True:
+            found[k] = True
     for k, v in node.items():
         if v is True and _PROMO_KEY.search(k):
             found[k] = v
@@ -431,6 +451,8 @@ def fetch_bina(url):
             if node and node.get("id") is not None:
                 try:
                     l = _bina_node(node)
+                    if str(l["id"]).isdigit():       # calibrate "now" for age estimates
+                        _BINA_MAX_ID["v"] = max(_BINA_MAX_ID["v"], int(l["id"]))
                     if bina_passes(l, check):
                         out.append(l)
                 except Exception as e:
@@ -1450,8 +1472,9 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
             continue
         if owner:
             if is_stale_promoted(l):
-                log(f"{name}: {l['url']} -> promoted bump of a "
-                    f"{_listing_age_days(l)}-day-old ad; recorded, not announced")
+                age = _listing_age_days(l)
+                log(f"{name}: {l['url']} -> promoted bump of a ~{age:.0f}-day-old ad; "
+                    f"recorded, not announced")
                 continue              # seeded by process_source; never announced as new
             if photo:
                 l["photo"] = photo    # keep API photo if detail gave none
