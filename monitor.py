@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-05-e"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-06-b"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -911,6 +911,17 @@ TAP_MAX_USER_ADS = int(os.environ.get("TAP_MAX_USER_ADS", "3"))
 TAP_MAX_APARTMENTS = int(os.environ.get("TAP_MAX_APARTMENTS", "3"))
 TAP_MULTI_MARKER = "bütün elanları"   # appears under the name only for multi-listing sellers
 
+# A business name on the SELLER ACCOUNT is a structural agent signal - stronger than
+# any description wording, because it is account identity rather than free text
+# ("Invest", "MMC", "Estate"...). Deliberately excludes "emlak"/"əmlak": tap's own
+# breadcrumb says "Daşınmaz əmlak", which would match every single ad.
+TAP_BUSINESS_TOKENS = [t.strip().lower() for t in os.environ.get(
+    "TAP_BUSINESS_TOKENS",
+    "invest,mmc,ltd,llc,group,qrup,estate,realty,realt,property,agency,agentlik,agent,"
+    "consulting,konsalt,holding,development,construction,company,şirkət,sirket,"
+    "broker,partners,capital,rieltor,realtor,makler,elit,vip elanlar"
+).split(",") if t.strip()]
+
 TAP_REALTOR_PHRASES = [p.strip().lower() for p in os.environ.get(
     "TAP_REALTOR_PHRASES",
     "xidmət haqqı,xidmet haqqi,komissiya,komisyon,komissyon,rieltor,rialtor,realtor,"
@@ -934,23 +945,46 @@ TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
 ).split(",") if p.strip()]
 
 
+def _tap_seller_block(raw):
+    """Just the text immediately around the seller link, so business-name tokens are
+    matched against the ACCOUNT NAME rather than the whole page (a wide window would
+    pick up breadcrumbs and neighbouring ads)."""
+    mm = re.search(r"/elanlar\?user_id=\d+", raw)
+    if not mm:
+        return ""
+    a, b = max(0, mm.start() - 400), min(len(raw), mm.end() + 200)
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw[a:b])))
+
+
 def tap_apartment_count(user_id, cache):
-    """How many APARTMENTS this tap.az account currently has for sale, read from the
-    category-filtered profile page (same page you open by hand). None = couldn't fetch
-    (blocked/error) -> caller decides whether to defer. Cached per run per seller."""
+    """How many APARTMENTS this tap.az account currently has for sale.
+
+    Returns an int >= 1, or None when the profile could not be read/parsed.
+    NEVER returns 0: the seller necessarily owns at least the ad we are inspecting,
+    so a zero count means the page did not render its cards (wrong URL form, JS-only
+    listing, layout change). Reporting that as 0 made every agent look like a
+    single-apartment owner -- the bug that let user 6638901 (5 apartments) through.
+    Tries both profile URL forms because tap does not always honour user_id on the
+    category path."""
     if user_id in cache:
         return cache[user_id]
-    n = None
-    try:
-        url = f"https://tap.az/elanlar/dasinmaz-emlak/menziller?user_id={user_id}"
-        r, raw = _fetch_tap_html(url, tries=2)
-        if getattr(r, "status_code", 0) == 200 and not _tap_blocked(raw):
-            ids = set(re.findall(r"/elanlar/dasinmaz-emlak/menziller/(\d+)", raw))
-            n = len(ids)
-    except Exception as e:
-        log("tap profile fetch error:", e)
-    cache[user_id] = n
-    return n
+    best = None
+    for purl in (f"https://tap.az/elanlar?user_id={user_id}",
+                 f"https://tap.az/elanlar/dasinmaz-emlak/menziller?user_id={user_id}"):
+        try:
+            r, raw = _fetch_tap_html(purl, tries=2)
+        except Exception as e:
+            log("tap profile fetch error:", e)
+            continue
+        if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw):
+            continue
+        ids = set(re.findall(r"/elanlar/dasinmaz-emlak/menziller/(\d+)", raw))
+        if ids:
+            best = max(best or 0, len(ids))
+    if best is not None and best < 1:
+        best = None                        # parse failed -> unknown, not "one owner"
+    cache[user_id] = best
+    return best
 
 
 def _tap_description(raw):
@@ -992,6 +1026,14 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
     if re.search(r'href="[^"]*/shops/', raw):
         return False, photo, seller
 
+    # 1.5) business name on the account (e.g. "... Invest", "X MMC", "Y Estate").
+    #      Checked before the description rules: an account name is identity, not text.
+    block = _tap_seller_block(raw).lower()
+    btok = next((t for t in TAP_BUSINESS_TOKENS if t in block), None)
+    if btok:
+        log(f"tap.az: {url} -> realtor (business name token '{btok}' on seller account)")
+        return False, photo, seller
+
     desc = _tap_description(raw)
     if desc is None:
         log(f"tap.az: {url} -> description not found; skipping wording checks")
@@ -1012,13 +1054,16 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
     # 3.5) the manual rule: multi-listing sellers show "İstifadəçinin bütün elanları".
     #      Open their profile, count apartments; 3+ => agent. Only fetch the profile
     #      when we have a seller id (saves a request for obvious single-listing owners).
-    has_multi = TAP_MULTI_MARKER in raw
+    _flat = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
+    has_multi = TAP_MULTI_MARKER in _flat
     if seller:
         cache = profile_cache if profile_cache is not None else {}
         cnt = tap_apartment_count(seller, cache)
         if cnt is not None and cnt >= TAP_MAX_APARTMENTS:
             log(f"tap.az: {url} -> realtor (seller {seller} has {cnt} apartments listed)")
             return False, photo, seller
+        if cnt is not None:
+            log(f"tap.az: seller {seller} has {cnt} apartment(s) listed")
         if cnt is None and has_multi:
             # multi-listing seller we could not verify -> do NOT announce; retry next run
             log(f"tap.az: {url} -> deferred (multi-listing seller {seller}, profile unread)")
