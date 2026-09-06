@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-05-b"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-05-c"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -91,6 +91,28 @@ PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause be
 # bina's server matches locations hierarchically, so selecting a district also returns
 # its sub-areas (metros / settlements). These are sub-areas you do NOT want even though
 # they sit inside a chosen district. Matched against the listing's location name.
+# Paid promotion (VIP / Premium / "İrəli çək") re-surfaces OLD ads at the top of a
+# BUMPED_AT_DESC sort, so a promoted ad can look brand new. Skip promoted ads, and/or
+# require the ad to have been updated recently. 0 disables the age rule.
+SKIP_PROMOTED = os.environ.get("SKIP_PROMOTED", "1") == "1"
+MAX_LISTING_AGE_DAYS = int(os.environ.get("MAX_LISTING_AGE_DAYS", "0"))
+_PROMO_KEY = re.compile(r"vip|premium|featured|promoted|boost|highlight|paid|sticky|urgent", re.I)
+_PROMO_DBG = {"done": False}
+
+
+def _node_promoted(node):
+    """True if any promotion-ish boolean on the bina node is set. Field names differ
+    across bina releases, so match by key pattern and log what was found once."""
+    found = {}
+    for k, v in node.items():
+        if v is True and _PROMO_KEY.search(k):
+            found[k] = v
+    if found and not _PROMO_DBG["done"]:
+        _PROMO_DBG["done"] = True
+        log("bina promoted-flags seen:", sorted(found.keys()))
+    return bool(found)
+
+
 BINA_EXCLUDE_LOCATIONS = [x.strip() for x in os.environ.get(
     "BINA_EXCLUDE_LOCATIONS",
     "Koroğlu,Ağ şəhər,Şah İsmayıl Xətai"
@@ -294,6 +316,8 @@ def _bina_node(node):
             "location": sub("location", "fullName") or sub("location", "name") or sub("city", "name"),
             "has_bill_of_sale": node.get("hasBillOfSale"), "has_mortgage": node.get("hasMortgage"),
             "has_repair": node.get("hasRepair"), "updated_at": node.get("updatedAt"),
+            "created_at": node.get("createdAt") or node.get("publishedAt"),
+            "_promoted": _node_promoted(node),
             "url": f"https://bina.az{path}" if path else f"https://bina.az/items/{node['id']}",
             "photo": photo}
 
@@ -333,6 +357,18 @@ def bina_passes(l, c):
     loc = l.get("location") or ""
     if BINA_EXCLUDE_LOCATIONS and any(x in loc for x in BINA_EXCLUDE_LOCATIONS):
         return False
+    if SKIP_PROMOTED and l.get("_promoted"):
+        return False                     # paid bump: an old ad masquerading as new
+    if MAX_LISTING_AGE_DAYS > 0:
+        ts = l.get("created_at") or l.get("updated_at")
+        if isinstance(ts, str) and ts[:4].isdigit():
+            try:
+                age = (dt.datetime.now(dt.timezone.utc)
+                       - dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))).days
+                if age > MAX_LISTING_AGE_DAYS:
+                    return False
+            except Exception:
+                pass
     if c["rooms"] and l.get("rooms") is not None and l.get("rooms") not in c["rooms"]:
         return False
     if c["price_to"] is not None and l.get("price") is not None and l["price"] > c["price_to"]:
@@ -841,7 +877,15 @@ TAP_REALTOR_PHRASES = [p.strip().lower() for p in os.environ.get(
 TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
     "TAP_OWNER_PHRASES",
     "vasitəçi narahat,vasiteci narahat,vasitəçi yoxdur,vasitəçisiz,vasitecisiz,"
-    "vasitəçi olmadan,sahibindən,sahibinden,mülkiyyətçidən,mulkiyyetciden,birbaşa sahibi"
+    "vasitəçi olmadan,sahibindən,sahibinden,mülkiyyətçidən,mulkiyyetciden,birbaşa sahibi,"
+    # supplied by the user + spelling/diacritic variants
+    "evin sahibiyəm,evin sahibiyem,ev sahibiyəm,ev sahibiyem,öz evimdi,oz evimdi,"
+    "öz evimdir,oz evimdir,özümün evimdi,ozumun evimdi,ev özümündü,ev ozumundu,"
+    # close variants worth covering
+    "mənim evimdir,menim evimdir,mənim mənzilimdir,menim menzilimdir,"
+    "öz mənzilimi,oz menzilimi,öz mənzilimdir,oz menzilimdir,şəxsi mənzilim,sexsi menzilim,"
+    "sahibi mənəm,sahibi menem,özüm satıram,ozum satiram,sahibi satır,sahibi satir,"
+    "mülkiyyətçiyəm,mulkiyyetciyem,birbaşa sahibindən,birbasa sahibinden"
 ).split(",") if p.strip()]
 
 
@@ -862,6 +906,20 @@ def tap_apartment_count(user_id, cache):
         log("tap profile fetch error:", e)
     cache[user_id] = n
     return n
+
+
+def _tap_description(raw):
+    """Just the ad's own description. Matching agency wording against the WHOLE page
+    is wrong: words like "Agentlik"/"komissiya" also appear in nav, footer and in the
+    'similar ads' cards, which silently rejected genuine owner posts."""
+    mo = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', raw)
+    if mo and mo.group(1).strip():
+        return html.unescape(mo.group(1))
+    mo = re.search(r'class="[^"]*(?:lot-text|product-description|lot__description)[^"]*"[^>]*>(.*?)</div>',
+                   raw, re.S)
+    if mo:
+        return html.unescape(re.sub(r"<[^>]+>", " ", mo.group(1)))
+    return None
 
 
 def tap_check_owner(url, seller_counts=None, profile_cache=None):
@@ -889,7 +947,12 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
     if re.search(r'href="[^"]*/shops/', raw):
         return False, photo, seller
 
-    text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw))).lower()
+    desc = _tap_description(raw)
+    if desc is None:
+        log(f"tap.az: {url} -> description not found; skipping wording checks")
+        text = ""                       # never match wording against the whole page
+    else:
+        text = re.sub(r"\s+", " ", desc).lower()
 
     # 2) an explicit "no agents" / "from the owner" line wins over the wording check
     if any(p in text for p in TAP_OWNER_PHRASES):
