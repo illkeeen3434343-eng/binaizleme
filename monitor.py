@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-07-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-07-b"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -1017,6 +1017,9 @@ _BUSINESS_PATTERNS = [
 OWNER_SCORE_STRONG = 4
 SCORE_OWNER_AT = int(os.environ.get("TAP_SCORE_OWNER_AT", "3"))
 SCORE_AGENT_AT = int(os.environ.get("TAP_SCORE_AGENT_AT", "-3"))
+# What to do when the profile cannot be read AND the text gives no signal either way.
+# "owner" = announce (never silently lose a post); "defer" = wait and retry.
+TAP_UNKNOWN_DEFAULT = os.environ.get("TAP_UNKNOWN_DEFAULT", "owner").strip().lower()
 
 
 def owner_signal_score(description, seller_block="", apartment_count=None):
@@ -1095,6 +1098,17 @@ def tap_apartment_count(user_id, cache):
         ids = set(re.findall(r"/elanlar/dasinmaz-emlak/menziller/(\d+)", raw))
         if ids:
             best = max(best or 0, len(ids))
+        # tap renders profile cards with JS, so the links are often absent. The
+        # category-filtered page still prints a total ("N elan") in plain HTML.
+        if "menziller" in purl:
+            tm = re.search(r"(\d[\d\s]*)\s*elan\b", re.sub(r"<[^>]+>", " ", raw))
+            if tm:
+                try:
+                    n = int(re.sub(r"\s+", "", tm.group(1)))
+                    if 0 < n < 10000:
+                        best = max(best or 0, n)
+                except ValueError:
+                    pass
     if best is not None and best < 1:
         best = None                        # parse failed -> unknown, not "one owner"
     cache[user_id] = best
@@ -1162,7 +1176,14 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
         verdict = False
     elif count is not None:
         verdict = count < TAP_MAX_APARTMENTS      # no strong wording: fall back to count
-    # else: profile unreadable AND no wording -> leave undecided, retry next run
+    elif TAP_UNKNOWN_DEFAULT == "owner":
+        # Profile unreadable AND no wording either way. The multi-listing marker alone
+        # is NOT evidence of being a makler, and deferring forever means the post is
+        # never seen at all. Obvious agents are still caught by /shops/, business names
+        # and agency wording above, so default to announcing.
+        verdict = True
+        reasons.append("unknown-profile:defaulted-to-owner")
+    # else: leave undecided, retry next run
 
     log(f"tap.az: {url} score={score} -> "
         f"{ {True: 'OWNER', False: 'AGENT', None: 'DEFER'}[verdict] } {reasons}")
@@ -1515,16 +1536,30 @@ def bina_is_owner(url):
     return verdict, photo
 
 
+OWNER_MAX_TRIES = int(os.environ.get("OWNER_MAX_TRIES", "4"))
+
+
 def check_is_owner(url, owner_label="Əmlak sahibi"):
     """Returns (is_owner, photo_url). is_owner: True=owner, False=agent, None=unknown.
-    Photo is the listing's first image, pulled from the same detail page (no extra request)."""
-    try:
-        r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
-        if r.status_code != 200:
-            return None, None
-        raw = r.text
-        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
-    except Exception:
+    Photo is the listing's first image, pulled from the same detail page (no extra request).
+
+    Detail fetches DO fail intermittently (yeniemlak 168545 returned nothing from the VM
+    while the page plainly contains "Əmlak sahibi"), so: retry, log the reason, and treat
+    an unreadable page as UNKNOWN rather than "agent"."""
+    raw = text = None
+    for attempt in range(3):
+        try:
+            r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
+            if r.status_code == 200 and len(r.text or "") > 1500:
+                raw = r.text
+                text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
+                break
+            log(f"owner-check {url} -> HTTP {r.status_code} "
+                f"len={len(getattr(r, 'text', '') or '')} (attempt {attempt + 1})")
+        except Exception as e:
+            log(f"owner-check {url} -> {e} (attempt {attempt + 1})")
+        time.sleep(1.5 * (attempt + 1))
+    if raw is None:
         return None, None
     photo = None
     # Try several patterns, most specific first, so we catch the main photo even when
@@ -1542,7 +1577,11 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
         return True, photo
     if "Vasitəçi" in text or "Rieltor" in text or "Vasitəç:" in text:
         return False, photo
-    return False, photo   # no explicit owner label -> treat as not-owner (conservative)
+    # Page read fine but carries no seller label -> UNKNOWN, not "agent". Returning
+    # False here is what silently buried owner posts; the caller retries a bounded
+    # number of times (OWNER_MAX_TRIES) and only then settles.
+    log(f"owner-check {url} -> page read but no seller label found")
+    return None, photo
 
 
 def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
@@ -1577,18 +1616,20 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
     """For a price-tracked source that should ALSO announce new OWNER posts (bina):
     owner-check listings not yet in `seen`. MUST run before process_source seeds them.
 
-    Returns (notified, deferred_ids). Anything in deferred_ids was NOT decided this
-    run — over the per-run check budget, or the detail page was blocked. The caller
-    MUST keep those out of process_source, otherwise they get seeded as "known" and
-    can never be announced again."""
+    Returns (notified, deferred_ids, decided). deferred_ids were NOT decided this run
+    (over budget, or the page was unreadable) and MUST be kept out of process_source, or
+    they get seeded as "known" and can never be announced again. `decided` maps id ->
+    bool so process_source can STAMP the verdict on the record it seeds: a seeded record
+    with NO `owner` key is exactly how 6438833 / 6437375 / 6437888 became invisible."""
     name = source["name"]
     owner_label = source.get("owner_label", "Mülkiyyətçi")
     flag = name + ":owner_seeded"
     if not seeded_flags.get(flag):
         seeded_flags[flag] = True
-        return 0, set()               # first run: don't owner-check the existing backlog
+        return 0, set(), {}           # first run: don't owner-check the existing backlog
     checks = notified = 0
     deferred = set()
+    decided = {}
     for l in items:
         key = source["prefix"] + str(l["id"])
         if key in seen:
@@ -1606,6 +1647,7 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
         if owner is None:
             deferred.add(str(l["id"]))    # blocked/timeout -> retry next run
             continue
+        decided[str(l["id"])] = bool(owner)
         if owner:
             if is_stale_promoted(l):
                 age = _listing_age_days(l)
@@ -1619,7 +1661,7 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
     if checks or deferred:
         log(f"{name}: owner-checked {checks} new, announced {notified}, "
             f"deferred {len(deferred)}")
-    return notified, deferred
+    return notified, deferred, decided
 
 
 def process_owner_new(items, source, seen, seeded_flags):
@@ -1646,8 +1688,10 @@ def process_owner_new(items, source, seen, seeded_flags):
     notified = 0
     for l in items:
         key = prefix + str(l["id"])
-        if key in seen:
-            continue                       # already handled; never re-check or price-track
+        rec = seen.get(key)
+        if rec is not None and (rec.get("owner") is not None
+                                or rec.get("tries", 0) >= OWNER_MAX_TRIES):
+            continue                       # already decided, or we gave up after N tries
         if prefiltered:
             # "prefiltered" only means the SEARCH URL asked for owner posts. lalafo still
             # leaks agent ("Makler") posts and out-of-area (non-Baku) fallback content, so
@@ -1677,10 +1721,19 @@ def process_owner_new(items, source, seen, seeded_flags):
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
-            continue                       # couldn't determine -> leave unrecorded, retry later
+            # Record the ATTEMPT so retries are bounded, but leave owner unset so the
+            # listing stays eligible for a real decision on the next run.
+            prev = (seen.get(key) or {})
+            tries = prev.get("tries", 0) + 1
+            seen[key] = {"url": l["url"], "first_seen": prev.get("first_seen", now),
+                         "source": name, "owner": None, "tries": tries}
+            if tries >= OWNER_MAX_TRIES:
+                log(f"{name}: {l['url']} undetermined after {tries} tries; giving up")
+            continue
         if photo:
             l["photo"] = photo
-        rec = {"url": l["url"], "first_seen": now, "source": name, "owner": bool(owner)}
+        rec = {"url": l["url"], "first_seen": (seen.get(key) or {}).get("first_seen", now),
+               "source": name, "owner": bool(owner)}
         if seller:
             rec["seller"] = seller
             seller_counts[seller] = seller_counts.get(seller, 0) + 1
@@ -1747,7 +1800,7 @@ def _ensure_history(rec, now):
                                      "date": rec.get("first_seen", now)})
 
 
-def process_source(items, source, seen, skip_ids=None):
+def process_source(items, source, seen, skip_ids=None, owner_map=None):
     prefix, name = source["prefix"], source["name"]
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     events = []
@@ -1761,9 +1814,13 @@ def process_source(items, source, seen, skip_ids=None):
         if rec is None:
             # First time we ever see this listing -> record it silently with its
             # initial price. We do NOT announce new listings (this is a price tracker).
-            seen[key] = {"url": l["url"], "price": cur, "first_seen": now, "last_seen": now,
-                         "source": name,
-                         "price_history": ([{"price": cur, "date": now}] if cur is not None else [])}
+            _rec = {"url": l["url"], "price": cur, "first_seen": now, "last_seen": now,
+                    "source": name,
+                    "price_history": ([{"price": cur, "date": now}] if cur is not None else [])}
+            _v = (owner_map or {}).get(str(l["id"]))
+            if _v is not None:
+                _rec["owner"] = _v     # stamp the owner verdict so it is never "unknown"
+            seen[key] = _rec
             continue
 
         _ensure_history(rec, now)
@@ -1856,9 +1913,11 @@ def main():
             total_notified += process_owner_new(items, source, seen, seeded_flags)
         elif source.get("mode") == "price_owner":
             # owner check must run BEFORE process_source seeds the new listings
-            n_new, deferred = process_new_owner_checks(items, source, seen, seeded_flags)
+            n_new, deferred, decided = process_new_owner_checks(
+                items, source, seen, seeded_flags)
             total_notified += n_new
-            total_notified += process_source(items, source, seen, skip_ids=deferred)
+            total_notified += process_source(items, source, seen, skip_ids=deferred,
+                                             owner_map=decided)
         else:
             total_notified += process_source(items, source, seen)
 
