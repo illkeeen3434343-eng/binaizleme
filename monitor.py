@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-06-b"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-07-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -945,6 +945,120 @@ TAP_OWNER_PHRASES = [p.strip().lower() for p in os.environ.get(
 ).split(",") if p.strip()]
 
 
+
+# =========================================================================== #
+# Azerbaijani owner-signal detection
+#
+# Normalize -> match intent patterns -> score. Rationale for each piece:
+#  * NORMALIZE: fold Azerbaijani letters to ASCII so "ozume mexsusdur" and
+#    "özümə məxsusdur" are one string. Python's .lower() turns "İ" into i+U+0307,
+#    so letters are mapped BEFORE lowering.
+#  * PATTERNS not literals: suffixes vary (mexsusdu/mexsusdur, evimdi/evimdir,
+#    deyil/deyilem), so patterns end in \w* rather than fixed endings.
+#  * MASKING: owner spans are blanked out before agent patterns run, so
+#    "makler deyilem" cannot also register as a makler signal.
+#  * SCORE not gate: an unreadable profile must not silently bury an owner post.
+# =========================================================================== #
+_AZ_MAP = str.maketrans({
+    "ə": "e", "Ə": "e", "ç": "c", "Ç": "c", "ş": "s", "Ş": "s",
+    "ğ": "g", "Ğ": "g", "ü": "u", "Ü": "u", "ö": "o", "Ö": "o",
+    "ı": "i", "I": "i", "İ": "i", "â": "a", "é": "e",
+})
+
+
+def az_normalize(text):
+    """Fold Azerbaijani text to lowercase ASCII words separated by single spaces."""
+    if not text:
+        return ""
+    t = str(text).translate(_AZ_MAP).lower()
+    t = re.sub(r"[^0-9a-z]+", " ", t)     # punctuation/newlines -> space
+    return " " + re.sub(r"\s+", " ", t).strip() + " "
+
+
+# --- explicit ownership statements ---------------------------------------- #
+_OWNER_PATTERNS = [
+    r"\b(menzil|ev|obyekt)\w*\s+(ozume|ozumun|mene|menim)\s+mexsus\w*",
+    r"\b(ozume|ozumun|mene|menim)\s+mexsus\w*",
+    r"\b(menzil|ev)\w*\s+(ozumdu\w*|ozumundu\w*|menimdi\w*)",
+    r"\bozumun\s+(evi|menzili)\w*",
+    r"\bsexsi\s+(oz\s+)?(ev|menzil)\w*",
+    r"\b(oz|menim\s+oz)\s+(ev|menzil)im\w*",
+    r"\b(ev|menzil)in\s+sahibi\w*",
+    r"\b(ev|menzil)\s*sahibiyem\b",
+    r"\bsahibi\s+ozumem\b",
+    r"\bmulkiyyetci(yem|\s+olaraq)\w*",
+    r"\bbirbasa\s+(ozum|sahib)\w*",
+    r"\bsahibinden\s+(satilir|satiram)\b",
+    r"\bozum\s+(satiram|terefinden\s+satilir)\b",
+    r"\bvasitecisiz\b",
+    r"\bvasiteci\s+yoxdur\b",
+]
+# --- explicit rejection of maklers/agents (equally strong) ---------------- #
+_ANTI_AGENT_PATTERNS = [
+    r"\b(men\s+)?makler\w*\s+deyil\w*",
+    r"\b(makler|vasiteci|agent|rieltor)\w*\s+(yazmasin|narahat\s+etmesin|"
+    r"zeng\s+etmesin|elaqe\s+saxlamasin|qebul\s+etmirem)\b",
+    r"\b(makler|vasiteci|agent|rieltor)\w*\s+islemirem\b",
+    r"\b(makler|vasiteci|agent|rieltor)\w*\s+lazim\s+deyil\b",
+]
+# --- agency wording (checked only AFTER owner spans are masked out) ------- #
+_AGENCY_PATTERNS = [
+    r"\bxidmet\s+haqq\w*", r"\bkomissiya\w*", r"\bkomisyon\w*",
+    r"\bofis\s+xidmet\w*", r"\bagentliy\w*", r"\bekskluziv\w*",
+    r"\bbazamizda\b", r"\bmusterilerimiz\w*", r"\bportfel\w*",
+]
+# --- business name on the ACCOUNT (identity, not free text) --------------- #
+_BUSINESS_PATTERNS = [
+    r"\binvest\w*", r"\bmmc\b", r"\bltd\b", r"\bllc\b", r"\bestate\w*",
+    r"\brealty\w*", r"\bagency\w*", r"\bagentlik\w*", r"\bholding\w*",
+    r"\bconsulting\w*", r"\bdevelopment\w*", r"\bemlak\s+(evi|merkezi|servis)\w*",
+]
+
+OWNER_SCORE_STRONG = 4
+SCORE_OWNER_AT = int(os.environ.get("TAP_SCORE_OWNER_AT", "3"))
+SCORE_AGENT_AT = int(os.environ.get("TAP_SCORE_AGENT_AT", "-3"))
+
+
+def owner_signal_score(description, seller_block="", apartment_count=None):
+    """Score a listing. Returns (score, reasons). Positive = owner, negative = agent."""
+    text = az_normalize(description)
+    reasons, score = [], 0
+
+    masked = text
+    for pat in _OWNER_PATTERNS + _ANTI_AGENT_PATTERNS:
+        for mm in list(re.finditer(pat, masked)):
+            reasons.append("owner:" + mm.group(0).strip())
+            score += OWNER_SCORE_STRONG
+            # blank the span so "makler deyilem" cannot also read as an agent signal
+            masked = masked[:mm.start()] + " " * (mm.end() - mm.start()) + masked[mm.end():]
+    score = min(score, 8)                       # cap: repetition is not more proof
+
+    for pat in _AGENCY_PATTERNS:
+        mm = re.search(pat, masked)
+        if mm:
+            reasons.append("agency:" + mm.group(0).strip())
+            score -= 4
+
+    nb = az_normalize(seller_block)
+    for pat in _BUSINESS_PATTERNS:
+        mm = re.search(pat, nb)
+        if mm:
+            reasons.append("business-name:" + mm.group(0).strip())
+            score -= 5
+            break
+
+    # Listing COUNT is a weak signal, and only APARTMENTS count. Unrelated ads
+    # (phones, books) must never make someone an agent.
+    if apartment_count is not None:
+        if apartment_count >= TAP_MAX_APARTMENTS:
+            reasons.append(f"count:{apartment_count}-apartments")
+            score -= 6
+        else:
+            reasons.append(f"count:{apartment_count}-apartment(s)-ok")
+            score += 1
+    return score, reasons
+
+
 def _tap_seller_block(raw):
     """Just the text immediately around the seller link, so business-name tokens are
     matched against the ACCOUNT NAME rather than the whole page (a wide window would
@@ -1002,80 +1116,57 @@ def _tap_description(raw):
 
 
 def tap_check_owner(url, seller_counts=None, profile_cache=None):
-    """Open one tap.az ad and decide owner vs. realtor.
-    Returns (is_owner, photo, seller_id); is_owner None = undecidable, retry later."""
+    """Owner vs makler for one tap.az ad, by weighted signals.
+    Returns (is_owner, photo, seller_id); None = undecidable, retry next run."""
     try:
         r, raw = _fetch_tap_html(url, tries=3)
     except Exception as e:
         log("tap detail fetch error:", e)
         return None, None, None
     if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw) or len(raw) < 2000:
-        return None, None, None            # blocked/short -> undecidable, do NOT record
+        return None, None, None
 
-    seller = None
-    m = re.search(r"/elanlar\?user_id=(\d+)", raw)
-    if m:
-        seller = m.group(1)
-
+    seller = (re.search(r"/elanlar\?user_id=(\d+)", raw) or [None, None])[1]
     photo = None
     pm = re.search(r'(https?://tap\.azstatic\.com/uploads/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp))', raw)
     if pm:
         photo = pm.group(1)
 
-    # 1) hard dealer: the ad belongs to a paid store account
+    # Hard reject: a paid STORE account is unambiguously a business.
     if re.search(r'href="[^"]*/shops/', raw):
         return False, photo, seller
 
-    # 1.5) business name on the account (e.g. "... Invest", "X MMC", "Y Estate").
-    #      Checked before the description rules: an account name is identity, not text.
-    block = _tap_seller_block(raw).lower()
-    btok = next((t for t in TAP_BUSINESS_TOKENS if t in block), None)
-    if btok:
-        log(f"tap.az: {url} -> realtor (business name token '{btok}' on seller account)")
-        return False, photo, seller
-
     desc = _tap_description(raw)
-    if desc is None:
-        log(f"tap.az: {url} -> description not found; skipping wording checks")
-        text = ""                       # never match wording against the whole page
-    else:
-        text = re.sub(r"\s+", " ", desc).lower()
+    block = _tap_seller_block(raw)
+    flat = az_normalize(re.sub(r"<[^>]+>", " ", raw))
+    has_multi = az_normalize(TAP_MULTI_MARKER).strip() in flat
 
-    # 2) an explicit "no agents" / "from the owner" line wins over the wording check
-    if any(p in text for p in TAP_OWNER_PHRASES):
-        return True, photo, seller
+    # Count APARTMENTS only. Other categories are irrelevant to being a makler.
+    count = None
+    if seller and has_multi:
+        count = tap_apartment_count(seller, profile_cache if profile_cache is not None else {})
+    elif seller:
+        count = 1                      # no multi marker => this is their only ad
 
-    # 3) agency wording anywhere in the ad text
-    hit = next((p for p in TAP_REALTOR_PHRASES if p in text), None)
-    if hit:
-        log(f"tap.az: {url} -> realtor (phrase: {hit})")
-        return False, photo, seller
+    score, reasons = owner_signal_score(desc or "", block, count)
 
-    # 3.5) the manual rule: multi-listing sellers show "İstifadəçinin bütün elanları".
-    #      Open their profile, count apartments; 3+ => agent. Only fetch the profile
-    #      when we have a seller id (saves a request for obvious single-listing owners).
-    _flat = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
-    has_multi = TAP_MULTI_MARKER in _flat
-    if seller:
-        cache = profile_cache if profile_cache is not None else {}
-        cnt = tap_apartment_count(seller, cache)
-        if cnt is not None and cnt >= TAP_MAX_APARTMENTS:
-            log(f"tap.az: {url} -> realtor (seller {seller} has {cnt} apartments listed)")
-            return False, photo, seller
-        if cnt is not None:
-            log(f"tap.az: seller {seller} has {cnt} apartment(s) listed")
-        if cnt is None and has_multi:
-            # multi-listing seller we could not verify -> do NOT announce; retry next run
-            log(f"tap.az: {url} -> deferred (multi-listing seller {seller}, profile unread)")
-            return None, photo, seller
-
-    # 4) the same account has already posted several ads we recorded
+    # Our own history is a weak tie-breaker only.
     if seller and seller_counts and seller_counts.get(seller, 0) >= TAP_MAX_USER_ADS:
-        log(f"tap.az: {url} -> realtor (user {seller} has "
-            f"{seller_counts[seller]} recorded ads)")
-        return False, photo, seller
+        score -= 2
+        reasons.append(f"history:{seller_counts[seller]}-prior-ads")
 
-    return True, photo, seller
+    verdict = None
+    if score >= SCORE_OWNER_AT:
+        verdict = True
+    elif score <= SCORE_AGENT_AT:
+        verdict = False
+    elif count is not None:
+        verdict = count < TAP_MAX_APARTMENTS      # no strong wording: fall back to count
+    # else: profile unreadable AND no wording -> leave undecided, retry next run
+
+    log(f"tap.az: {url} score={score} -> "
+        f"{ {True: 'OWNER', False: 'AGENT', None: 'DEFER'}[verdict] } {reasons}")
+    return verdict, photo, seller
 
 
 def _tap_blocked(body):
