@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-08-b"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-08-c"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -955,7 +955,16 @@ TAP_MAX_USER_ADS = int(os.environ.get("TAP_MAX_USER_ADS", "3"))
 # This mirrors the manual rule: the ad shows "İstifadəçinin bütün elanları" only for
 # sellers with multiple listings; you then open the profile and count apartments.
 TAP_MAX_APARTMENTS = int(os.environ.get("TAP_MAX_APARTMENTS", "3"))
-TAP_MULTI_MARKER = "bütün elanları"   # appears under the name only for multi-listing sellers
+# tap shows one of these under the seller name when the account has more than one ad:
+#   "İstifadəçinin bütün elanları"  /  "İstifadəçinin digər elanları"  (+ Latin variants).
+# Matching just one missed the others, so a multi-listing agent read as single-listing
+# and their profile was never counted. Stored normalized (diacritic-folded, lowercased).
+TAP_MULTI_MARKERS = [m_.strip() for m_ in os.environ.get(
+    "TAP_MULTI_MARKERS",
+    "bütün elanları,digər elanları,butun elanlari,diger elanlari,"
+    "bütün elanlarına bax,digər elanlarına bax,istifadəçinin elanları"
+).split(",") if m_.strip()]
+TAP_MULTI_MARKER = "bütün elanları"   # kept for back-compat
 
 # A business name on the SELLER ACCOUNT is a structural agent signal - stronger than
 # any description wording, because it is account identity rather than free text
@@ -1207,7 +1216,7 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
     desc = _tap_description(raw)
     block = _tap_seller_block(raw)
     flat = az_normalize(re.sub(r"<[^>]+>", " ", raw))
-    has_multi = az_normalize(TAP_MULTI_MARKER).strip() in flat
+    has_multi = any(az_normalize(mk).strip() in flat for mk in TAP_MULTI_MARKERS)
 
     # Count APARTMENTS only. Other categories are irrelevant to being a makler.
     count = None
