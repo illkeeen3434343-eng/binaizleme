@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-07-b"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-09-08-b"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -692,29 +692,75 @@ def _lalafo_photo(item):
 _LALAFO_DBG = {"done": False}
 
 
-def _lalafo_is_agent(it):
-    """Best-effort agent flag from a lalafo feed item. True only on a clear signal,
-    so a real owner is never dropped by mistake. Reject-on-positive."""
+# Free-text fields are EXCLUDED from the scan: an owner writing "vasitəçi narahat
+# etməsin" must never be read as a seller-type of "Vasitəçi".
+_LALAFO_FREETEXT = ("description", "text", "body", "content", "title", "seo",
+                    "meta", "url", "slug", "comment")
+_LALAFO_AGENT_VALUES = {"vasiteci", "makler", "agent", "rieltor", "agentlik",
+                        "vasitecilik", "emlak agentliyi"}
+_LALAFO_OWNER_VALUES = {"sahibi", "mulkiyyetci", "ev sahibi", "emlak sahibi", "sahib"}
+
+
+def _lalafo_values(obj, key=""):
+    """Every string value in the item, skipping free-text fields."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and any(sk in k.lower() for sk in _LALAFO_FREETEXT):
+                continue
+            yield from _lalafo_values(v, k)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _lalafo_values(v, key)
+    elif isinstance(obj, str):
+        yield key, obj
+
+
+def _lalafo_seller_type(it):
+    """'agent' / 'owner' / None, from lalafo's own 'Təklifin növü' style parameters.
+    Schema-independent: matches on VALUES, so renamed keys cannot break it."""
     try:
+        for _k, v in _lalafo_values(it):
+            n = az_normalize(v).strip()
+            if not n or len(n) > 24:
+                continue
+            if n in _LALAFO_AGENT_VALUES:
+                return "agent"
+            if n in _LALAFO_OWNER_VALUES:
+                return "owner"
         u = it.get("user") if isinstance(it.get("user"), dict) else {}
         for k in ("pro", "is_pro", "is_business", "business", "is_shop"):
             if u.get(k) is True or it.get(k) is True:
-                return True
-        for k in ("user_type", "type", "account_type", "label", "ad_label", "seller_type"):
-            v = u.get(k) or it.get(k)
-            if isinstance(v, str) and any(x in v.lower()
-                                          for x in ("makler", "agent", "agency", "business")):
-                return True
+                return "agent"
     except Exception:
         pass
-    return False
+    return None
+
+
+def _lalafo_is_agent(it):
+    return _lalafo_seller_type(it) == "agent"
+
+
+# Wanted areas for lalafo, matched against the ad's location text AND its URL slug
+# (lalafo slugs carry the district: .../baki-hmdli-2-otaqli...). Empty = city check only.
+LALAFO_KEYWORDS = [k.strip() for k in os.environ.get(
+    "LALAFO_KEYWORDS",
+    "ehmedli,ahmadli,hmdli,xalqlar,xalqlar dostlugu,neftciler,qara qarayev,q qarayev,"
+    "hezi aslanov,hzi aslanov,haci aslanov,8 km,8-ci km,kohne gunesli,gunesli,"
+    "xetai,xtai,nizami r,koroglu"
+).split(",") if k.strip()]
 
 
 def lalafo_ok(l):
-    """lalafo puts the city in the URL slug (/baku/...). Reject anything not in Baku,
-    e.g. /dzhulfa/ (Culfa, Nakhchivan) that leaks in as fallback/recommended content."""
+    """Two gates: the city (slug must be /baku/) and the district.
+    Out-of-city fallback content (/dzhulfa/) and out-of-area Baku ads (Bayıl, Yasamal…)
+    both leak into lalafo's owner feed, so the district must be checked too."""
     url = (l.get("url") or "").lower()
-    return "/baku/" in url
+    if "/baku/" not in url:
+        return False
+    if not LALAFO_KEYWORDS:
+        return True
+    hay = az_normalize(url + " " + str(l.get("location") or ""))
+    return any(az_normalize(k).strip() in hay for k in LALAFO_KEYWORDS)
 
 
 def _parse_lalafo_page(raw):
@@ -1003,9 +1049,17 @@ _ANTI_AGENT_PATTERNS = [
 ]
 # --- agency wording (checked only AFTER owner spans are masked out) ------- #
 _AGENCY_PATTERNS = [
-    r"\bxidmet\s+haqq\w*", r"\bkomissiya\w*", r"\bkomisyon\w*",
-    r"\bofis\s+xidmet\w*", r"\bagentliy\w*", r"\bekskluziv\w*",
+    # ANY "... haqqi" fee (ofis haqqi, xidmet haqqi, komissiya haqqi, vasitecilik
+    # haqqi). "ofis haqqi 1%" is a paid-service fee only an agent charges; the old
+    # list only had "xidmet haqqi" and "ofis xidmet", so "ofis haqqi" slipped through.
+    r"\b(ofis|xidmet|komissiya|komisyon|vasitecilik|agentlik|reyestr)\s*haqq\w*",
+    r"\bofis\s+xidmet\w*",
+    r"\bhaqq\w*\s+\d+\s*(faiz|%)",          # "haqqi 1 faiz" / "haqqi 1 %"
+    r"\b\d+\s*(faiz|%)\s*(ofis|xidmet|komissiya)\w*",
+    r"\bkomissiya\w*", r"\bkomisyon\w*",
+    r"\bagentliy\w*", r"\bagentlik\w*", r"\bekskluziv\w*",
     r"\bbazamizda\b", r"\bmusterilerimiz\w*", r"\bportfel\w*",
+    r"\brieltor\w*", r"\bmakler\s+(xidmet|haqq)\w*",
 ]
 # --- business name on the ACCOUNT (identity, not free text) --------------- #
 _BUSINESS_PATTERNS = [
