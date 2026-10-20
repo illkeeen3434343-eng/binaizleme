@@ -12,7 +12,9 @@ Each source is seeded silently the first time it appears, so adding a new portal
 never floods you with its existing listings.
 """
 import base64
+import bisect
 import datetime as dt
+import hashlib
 import html
 import json
 import os
@@ -23,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-09-08-c"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-10-18-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -56,12 +58,15 @@ LALAFO_SEARCH_URL = os.environ.get("LALAFO_SEARCH_URL", (
     "https://lalafo.az/baku/kvartiry/prodazha-kvartir/owner/nizaminskij/hatainskij/gara-garaev/neftchiler/halglar-dostlugu/ahmedly/azi-aslanov/fresh-renovation/kupchaya/8-oy-kilometr/ahmedlyi/staryiy-gyunyashli/pos-azi-aslanov"
 ))
 
-# Sources this bot tracks. Each listing's price history is tracked independently.
+# Sources this bot tracks. ORDER MATTERS: tap.az only ever serves its first results
+# page (it ignores ?page=N), so it must be read as soon as a run starts. bina's full
+# scan takes ~10 minutes and goes last; if a slow run makes cron skip a tick, the
+# page-1 sources are not the ones that lose coverage.
 SOURCES = [
-    {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price_owner", "owner_label": "Mülkiyyətçi"},
-    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new", "owner_label": "Əmlak sahibi"},
     {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "owner_new", "owner_label": "Sahibindən"},
     {"name": "lalafo.az", "type": "lalafo", "url": LALAFO_SEARCH_URL, "prefix": "lala:", "mode": "owner_new", "owner_label": "Mülkiyyətçi", "prefiltered_owner": True},
+    {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new", "owner_label": "Əmlak sahibi"},
+    {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price_owner", "owner_label": "Mülkiyyətçi"},
 ]
 
 # Run only a subset of sources on a given host (e.g. GitHub vs your VM).
@@ -692,6 +697,24 @@ def _lalafo_photo(item):
 _LALAFO_DBG = {"done": False}
 
 
+def _to_epoch(v):
+    """unix seconds / milliseconds / ISO string -> epoch seconds; None if unusable."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().isdigit()):
+            x = float(v)
+            if x > 1e12:            # milliseconds
+                x /= 1000.0
+            return x if x > 1e9 else None
+        d = dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.timestamp()
+    except Exception:
+        return None
+
+
 # Free-text fields are EXCLUDED from the scan: an owner writing "vasitəçi narahat
 # etməsin" must never be read as a seller-type of "Vasitəçi".
 _LALAFO_FREETEXT = ("description", "text", "body", "content", "title", "seo",
@@ -745,8 +768,10 @@ def _lalafo_is_agent(it):
 LALAFO_KEYWORDS = [k.strip() for k in os.environ.get(
     "LALAFO_KEYWORDS",
     "ehmedli,ahmadli,hmdli,xalqlar,xalqlar dostlugu,neftciler,qara qarayev,q qarayev,"
-    "hezi aslanov,hzi aslanov,haci aslanov,8 km,8-ci km,kohne gunesli,gunesli,"
-    "xetai,xtai,nizami r,koroglu"
+    "hezi aslanov,hzi aslanov,haci aslanov,8 km,8-ci km,8-ci kilometr,kohne gunesli,"
+    "gunesli,xetai,xtai,nizami r"
+    # NOT plain "nizami": lalafo writes "m. Nizami" for the Nizami METRO, which is in
+    # Yasamal (verified on ad 42756259). "koroglu" removed: bina excludes Koroğlu.
 ).split(",") if k.strip()]
 
 
@@ -793,6 +818,7 @@ def _parse_lalafo_page(raw):
         price = it.get("price")
         if not isinstance(price, int):
             price = _digits(str(price))
+        desc = it.get("description") if isinstance(it.get("description"), str) else ""
         out.append({"id": iid,
                     "url": url,
                     "rooms": _digits(rooms_m.group(1)) if rooms_m else None,
@@ -805,7 +831,13 @@ def _parse_lalafo_page(raw):
                     "updated_at": upd,
                     "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
                     "photo": _lalafo_photo(it),
-                    "_agent": _lalafo_is_agent(it)})
+                    "_agent": _lalafo_is_agent(it),
+                    # title + description: checked for agency wording ("EKSKLUZIV",
+                    # "ofis haqqı") in case the feed item lacks "Təklifin növü"
+                    "_text": f"{title} {desc}",
+                    # lalafo keeps the ORIGINAL creation date when an ad is edited
+                    # (ad 42756259: created 22.12.2025, updated 15.10.2026)
+                    "created_ts": _to_epoch(it.get("created_time"))})
     # Does a genuine next page exist? Prefer the server's own "next" link; fall
     # back to page counters. When false, the next ?page= would be filler content.
     has_next = bool(links.get("next"))
@@ -867,9 +899,23 @@ def fetch_lalafo(url):
 # tap.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
 TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "1000"))
-# Only track tap.az posts whose heading contains one of these location keywords.
-TAP_KEYWORDS = ["Q.Qarayev", "Əhmədli", "Xətai r", "Nizami r", "8-ci km",
-                "Neftçilər", "Xalqlar", "Həzi", "Köhnə Günəşli"]
+# Only track tap.az posts whose heading names one of these places. tap headings use
+# FULL names ("Qara Qarayev m.", "8-ci kilometr qəs.") - the old list had only
+# "Q.Qarayev" and "8-ci km", so those two areas were silently dropped. Matched after
+# az_normalize, so diacritics/case/punctuation do not matter. Comma-separated env.
+TAP_KEYWORDS = [k.strip() for k in os.environ.get(
+    "TAP_KEYWORDS",
+    "Əhmədli,Xətai r,Nizami r,Qara Qarayev,Q.Qarayev,Neftçilər,Xalqlar,Həzi,"
+    "8-ci km,8-ci kilometr,8 km,Köhnə Günəşli"
+).split(",") if k.strip()]
+
+
+def _tap_location_ok(heading):
+    """True if the card heading names a wanted place (word-start match, normalized)."""
+    if not TAP_KEYWORDS:
+        return True
+    hay = az_normalize(heading)
+    return any(" " + az_normalize(k).strip() in hay for k in TAP_KEYWORDS)
 # Owner-only: skip dealer/store cards (they carry a "Mağaza" badge). Set
 # TAP_OWNER_ONLY=0 to fall back to keeping every card.
 TAP_OWNER_ONLY = os.environ.get("TAP_OWNER_ONLY", "1") not in ("0", "false", "False", "no")
@@ -909,7 +955,7 @@ def _parse_tap_page(raw):
             continue                      # nav/other link, not a listing card
         heading_m = re.search(r"(\d+-otaqlı[^₼]*?m²)", chunk)
         heading = heading_m.group(1) if heading_m else chunk[:120]
-        if TAP_KEYWORDS and not any(kw in heading for kw in TAP_KEYWORDS):
+        if not _tap_location_ok(heading):
             continue                      # heading doesn't match a wanted location -> skip
         if TAP_OWNER_ONLY:
             back = anchors[i - 1][1] if i > 0 else max(0, pos - 1500)
@@ -1025,7 +1071,9 @@ def az_normalize(text):
     """Fold Azerbaijani text to lowercase ASCII words separated by single spaces."""
     if not text:
         return ""
-    t = str(text).translate(_AZ_MAP).lower()
+    # "%" would be stripped as punctuation below; keep it as a word so fee patterns
+    # like "haqqı 1%" still match.
+    t = str(text).replace("%", " faiz ").translate(_AZ_MAP).lower()
     t = re.sub(r"[^0-9a-z]+", " ", t)     # punctuation/newlines -> space
     return " " + re.sub(r"\s+", " ", t).strip() + " "
 
@@ -1038,15 +1086,17 @@ _OWNER_PATTERNS = [
     r"\bozumun\s+(evi|menzili)\w*",
     r"\bsexsi\s+(oz\s+)?(ev|menzil)\w*",
     r"\b(oz|menim\s+oz)\s+(ev|menzil)im\w*",
+    r"\bmenim\s+(ev|menzil)im\w*",                  # "mənim evimdir / mənzilimdir"
     r"\b(ev|menzil)in\s+sahibi\w*",
     r"\b(ev|menzil)\s*sahibiyem\b",
-    r"\bsahibi\s+ozumem\b",
+    r"\bsahibi\s+(ozumem|menem|ozum)\b",            # "sahibi özüməm / mənəm"
     r"\bmulkiyyetci(yem|\s+olaraq)\w*",
-    r"\bbirbasa\s+(ozum|sahib)\w*",
+    r"\bbirbasa\s+(ozum|sahib|mulkiyyet)\w*",
     r"\bsahibinden\s+(satilir|satiram)\b",
     r"\bozum\s+(satiram|terefinden\s+satilir)\b",
     r"\bvasitecisiz\b",
     r"\bvasiteci\s+yoxdur\b",
+    r"\bvasiteci\w*\s+olmadan\b",                   # "vasitəçi olmadan"
 ]
 # --- explicit rejection of maklers/agents (equally strong) ---------------- #
 _ANTI_AGENT_PATTERNS = [
@@ -1075,6 +1125,7 @@ _BUSINESS_PATTERNS = [
     r"\binvest\w*", r"\bmmc\b", r"\bltd\b", r"\bllc\b", r"\bestate\w*",
     r"\brealty\w*", r"\bagency\w*", r"\bagentlik\w*", r"\bholding\w*",
     r"\bconsulting\w*", r"\bdevelopment\w*", r"\bemlak\s+(evi|merkezi|servis)\w*",
+    r"\bmakler\w*", r"\brieltor\w*", r"\brealtor\w*", r"\bbroker\w*",
 ]
 
 OWNER_SCORE_STRONG = 4
@@ -1136,46 +1187,82 @@ def _tap_seller_block(raw):
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw[a:b])))
 
 
-def tap_apartment_count(user_id, cache):
-    """How many APARTMENTS this tap.az account currently has for sale.
+TAP_PROFILE_BROWSER = os.environ.get("TAP_PROFILE_BROWSER", "0").strip() == "1"
+TAP_PROFILE_MAX_PER_RUN = int(os.environ.get("TAP_PROFILE_MAX_PER_RUN", "5"))
+TAP_PROFILE_TTL_DAYS = float(os.environ.get("TAP_PROFILE_TTL_DAYS", "3"))
+_PROFILE_RUN = {"used": 0, "warned": False}
+_RUNTIME = {"state": None}          # set by main(): lets helpers keep small caches in state
 
-    Returns an int >= 1, or None when the profile could not be read/parsed.
-    NEVER returns 0: the seller necessarily owns at least the ad we are inspecting,
-    so a zero count means the page did not render its cards (wrong URL form, JS-only
-    listing, layout change). Reporting that as 0 made every agent look like a
-    single-apartment owner -- the bug that let user 6638901 (5 apartments) through.
-    Tries both profile URL forms because tap does not always honour user_id on the
-    category path."""
+
+def tap_profile_count_browser(user_id):
+    """Open the seller's profile in headless Chromium (the page builds its list with
+    JavaScript) and count APARTMENT links. None if playwright is missing or the page
+    cannot be rendered. Only used when TAP_PROFILE_BROWSER=1."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        if not _PROFILE_RUN["warned"]:
+            _PROFILE_RUN["warned"] = True
+            log("tap profile browser unavailable (pip install playwright && "
+                "playwright install chromium):", e)
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(user_agent=UA, locale="az-AZ")
+                page.goto(f"https://tap.az/elanlar?user_id={user_id}",
+                          wait_until="domcontentloaded", timeout=45000)
+                try:
+                    page.wait_for_selector('a[href*="/elanlar/"]', timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2500)
+                rendered = page.content()
+            finally:
+                browser.close()
+    except Exception as e:
+        log(f"tap profile browser error for user {user_id}:", e)
+        return None
+    if _tap_blocked(rendered):
+        return None
+    ids = set(re.findall(r"/elanlar/dasinmaz-emlak/menziller/(\d+)", rendered))
+    tap_profile_count_browser.last_ids = sorted(ids)      # for verify_tap_profile.py
+    return len(ids) if ids else None    # >= 1 always (their own ad) or unreadable
+
+
+tap_profile_count_browser.last_ids = []
+
+
+def tap_apartment_count(user_id, cache):
+    """How many APARTMENTS this tap.az seller has for sale, from their profile.
+
+    Returns an int >= 1, or None when unknown. Plain HTTP can NOT read this: the
+    category URL ignores user_id (it returns the general Baku feed - counting that
+    made every seller look like a 28-apartment agent), and the real profile page is
+    rendered by JavaScript. So: per-run cache -> saved cache (TTL) -> headless
+    browser if TAP_PROFILE_BROWSER=1 -> otherwise None (unknown)."""
     if user_id in cache:
         return cache[user_id]
-    best = None
-    for purl in (f"https://tap.az/elanlar?user_id={user_id}",
-                 f"https://tap.az/elanlar/dasinmaz-emlak/menziller?user_id={user_id}"):
-        try:
-            r, raw = _fetch_tap_html(purl, tries=2)
-        except Exception as e:
-            log("tap profile fetch error:", e)
-            continue
-        if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw):
-            continue
-        ids = set(re.findall(r"/elanlar/dasinmaz-emlak/menziller/(\d+)", raw))
-        if ids:
-            best = max(best or 0, len(ids))
-        # tap renders profile cards with JS, so the links are often absent. The
-        # category-filtered page still prints a total ("N elan") in plain HTML.
-        if "menziller" in purl:
-            tm = re.search(r"(\d[\d\s]*)\s*elan\b", re.sub(r"<[^>]+>", " ", raw))
-            if tm:
-                try:
-                    n = int(re.sub(r"\s+", "", tm.group(1)))
-                    if 0 < n < 10000:
-                        best = max(best or 0, n)
-                except ValueError:
-                    pass
-    if best is not None and best < 1:
-        best = None                        # parse failed -> unknown, not "one owner"
-    cache[user_id] = best
-    return best
+    n = None
+    st = _RUNTIME.get("state")
+    saved = st.setdefault("tap_profiles", {}) if isinstance(st, dict) else {}
+    ent = saved.get(str(user_id))
+    fresh = False
+    if isinstance(ent, dict):
+        t = _to_epoch(ent.get("t"))
+        fresh = t is not None and (time.time() - t) <= TAP_PROFILE_TTL_DAYS * 86400
+    if fresh:
+        n = ent.get("n")
+    elif TAP_PROFILE_BROWSER and _PROFILE_RUN["used"] < TAP_PROFILE_MAX_PER_RUN:
+        _PROFILE_RUN["used"] += 1
+        n = tap_profile_count_browser(user_id)
+        if n is not None:
+            saved[str(user_id)] = {"n": n, "t": dt.datetime.now(dt.timezone.utc)
+                                   .isoformat(timespec="seconds")}
+            log(f"tap.az: seller {user_id} profile shows {n} apartment(s)")
+    cache[user_id] = n
+    return n
 
 
 def _tap_description(raw):
@@ -1192,16 +1279,53 @@ def _tap_description(raw):
     return None
 
 
-def tap_check_owner(url, seller_counts=None, profile_cache=None):
+def _apt_key(l):
+    """Identity of a FLAT for counting: rooms+area, so re-posts of the same flat
+    count once. Falls back to the listing id when rooms/area are unknown."""
+    r, a = l.get("rooms"), l.get("area")
+    if r is not None and a is not None:
+        try:
+            return f"{int(r)}r-{int(round(float(a)))}m"
+        except (TypeError, ValueError):
+            pass
+    return "id-" + str(l.get("id"))
+
+
+TAP_HISTORY_DAYS = float(os.environ.get("TAP_HISTORY_DAYS", "60"))
+
+
+def _seller_apartments(seen):
+    """seller id -> set of DISTINCT flats we recorded for that seller (tap) in the last
+    TAP_HISTORY_DAYS. The rule is "3+ apartments ON SALE", so flats seen long ago
+    (probably sold) do not count."""
+    out = {}
+    cutoff = time.time() - TAP_HISTORY_DAYS * 86400
+    for k, v in seen.items():
+        sid = v.get("seller")
+        if not sid:
+            continue
+        t = _to_epoch(v.get("first_seen"))
+        if t is not None and t < cutoff:
+            continue
+        out.setdefault(sid, set()).add(
+            _apt_key({"rooms": v.get("rooms"), "area": v.get("area"), "id": k}))
+    return out
+
+
+def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
     """Owner vs makler for one tap.az ad, by weighted signals.
-    Returns (is_owner, photo, seller_id); None = undecidable, retry next run."""
+    Returns (is_owner, photo, seller_id); None = undecided.
+    tap_check_owner.last_reason: "fetch" (page unreadable -> retry, no try used) or
+    "undecided" (read fine, signals inconclusive)."""
+    tap_check_owner.last_reason = "fetch"
     try:
-        r, raw = _fetch_tap_html(url, tries=3)
+        r, raw = _fetch_tap_html(url, tries=2)
     except Exception as e:
         log("tap detail fetch error:", e)
         return None, None, None
     if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw) or len(raw) < 2000:
         return None, None, None
+    tap_check_owner.last_reason = "undecided"
 
     seller = (re.search(r"/elanlar\?user_id=(\d+)", raw) or [None, None])[1]
     photo = None
@@ -1211,6 +1335,7 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
 
     # Hard reject: a paid STORE account is unambiguously a business.
     if re.search(r'href="[^"]*/shops/', raw):
+        tap_check_owner.last_reason = "ok"
         return False, photo, seller
 
     desc = _tap_description(raw)
@@ -1218,19 +1343,29 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
     flat = az_normalize(re.sub(r"<[^>]+>", " ", raw))
     has_multi = any(az_normalize(mk).strip() in flat for mk in TAP_MULTI_MARKERS)
 
-    # Count APARTMENTS only. Other categories are irrelevant to being a makler.
+    # How many APARTMENTS does this seller have? Unrelated ads (phones, books) never
+    # count. Source 1: flats WE have recorded from this seller (re-posts of the same
+    # flat count once). Source 2: their profile, only via a real browser (optional).
+    this_key = _apt_key(listing or {"id": url.rstrip("/").rsplit("/", 1)[-1]})
+    prior = (seller_counts or {}).get(seller) if seller else None
+    if isinstance(prior, (set, frozenset, list, tuple)):
+        hist = len(set(prior) | {this_key})
+    elif isinstance(prior, int):
+        hist = prior + 1
+    else:
+        hist = 1
     count = None
-    if seller and has_multi:
-        count = tap_apartment_count(seller, profile_cache if profile_cache is not None else {})
+    if seller and hist >= TAP_MAX_APARTMENTS:
+        count = hist                   # we have SEEN them sell 3+ different flats
+    elif seller and has_multi:
+        prof = tap_apartment_count(seller, profile_cache if profile_cache is not None else {})
+        count = max(prof, hist) if prof is not None else None    # None = unknown
     elif seller:
-        count = 1                      # no multi marker => this is their only ad
+        count = 1                      # no multi-listing marker => this is their only ad
 
     score, reasons = owner_signal_score(desc or "", block, count)
-
-    # Our own history is a weak tie-breaker only.
-    if seller and seller_counts and seller_counts.get(seller, 0) >= TAP_MAX_USER_ADS:
-        score -= 2
-        reasons.append(f"history:{seller_counts[seller]}-prior-ads")
+    if seller and hist >= TAP_MAX_APARTMENTS:
+        reasons.append(f"history:{hist}-flats-seen")
 
     verdict = None
     if score >= SCORE_OWNER_AT:
@@ -1240,17 +1375,20 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None):
     elif count is not None:
         verdict = count < TAP_MAX_APARTMENTS      # no strong wording: fall back to count
     elif TAP_UNKNOWN_DEFAULT == "owner":
-        # Profile unreadable AND no wording either way. The multi-listing marker alone
-        # is NOT evidence of being a makler, and deferring forever means the post is
-        # never seen at all. Obvious agents are still caught by /shops/, business names
-        # and agency wording above, so default to announcing.
+        # Apartment count unknown AND no wording either way. The multi-listing marker
+        # alone is NOT evidence of being a makler (owners sell phones too).
         verdict = True
-        reasons.append("unknown-profile:defaulted-to-owner")
-    # else: leave undecided, retry next run
+        reasons.append("count-unknown:defaulted-to-owner")
+    # else: leave undecided (TAP_UNKNOWN_DEFAULT=defer)
+    if verdict is not None:
+        tap_check_owner.last_reason = "ok"
 
     log(f"tap.az: {url} score={score} -> "
         f"{ {True: 'OWNER', False: 'AGENT', None: 'DEFER'}[verdict] } {reasons}")
     return verdict, photo, seller
+
+
+tap_check_owner.last_reason = ""
 
 
 def _tap_blocked(body):
@@ -1513,7 +1651,9 @@ def _iter_dicts(obj):
 
 
 def _bina_owner_from_ldjson(raw):
-    """schema.org seller/provider @type: Person -> owner, RealEstateAgent/Org -> agent."""
+    """schema.org seller @type RealEstateAgent/Organization -> agent. A "Person" is
+    NOT evidence of an owner (an individual realtor is a Person too), and site-level
+    keys like author/provider describe the website, not the seller."""
     for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
                          raw, re.S):
         try:
@@ -1521,14 +1661,12 @@ def _bina_owner_from_ldjson(raw):
         except Exception:
             continue
         for obj in _iter_dicts(data):
-            for key in ("seller", "provider", "offeredBy", "author", "broker"):
+            for key in ("seller", "offeredBy", "broker"):
                 v = obj.get(key)
                 if isinstance(v, dict):
                     t = v.get("@type") or v.get("type") or ""
                     t = " ".join(t) if isinstance(t, list) else str(t)
                     t = t.lower()
-                    if "person" in t:
-                        return True
                     if any(x in t for x in ("realestateagent", "organization",
                                             "localbusiness", "corporation")):
                         return False
@@ -1567,11 +1705,38 @@ def _bina_owner_from_nextdata(raw):
 
 
 _BINA_DBG = {"done": False}
+_BINA_OWNER_LABELS = {"mulkiyyetci"}
+_BINA_AGENT_LABELS = {"vasiteci", "vasiteci agent"}
+_LABELISH = re.compile(r"k[iıİI]yy|vas[iıİI]t", re.I)
+
+
+def _bina_label_verdict(raw):
+    """Seller type from a STANDALONE label element, e.g. <div>mülkiyyətçi</div> or
+    <span>vasitəçi (agent)</span>. Words inside the description are never labels:
+    the old substring test turned an owner who wrote "Vasitəçilər narahat etməsin"
+    into an agent, because "Vasitəçi" was checked first and anywhere on the page."""
+    found_owner = found_agent = False
+    for m in re.finditer(r">\s*([^<>]{2,40}?)\s*<", raw):
+        txt = m.group(1)
+        if not _LABELISH.search(txt):
+            continue
+        n = az_normalize(html.unescape(txt)).strip()
+        if n in _BINA_OWNER_LABELS:
+            found_owner = True
+        elif n in _BINA_AGENT_LABELS:
+            found_agent = True
+    if found_owner and not found_agent:
+        return True
+    if found_agent and not found_owner:
+        return False
+    return None
 
 
 def bina_is_owner(url):
-    """bina.az owner vs agent, read from the detail page's structured data.
-    Returns (is_owner, photo). None = undetermined -> caller retries (never buried)."""
+    """bina.az owner vs agent from the detail page. Returns (is_owner, photo).
+    None = undetermined. bina_is_owner.last_reason: "fetch" (page not read) or
+    "nolabel" (read, but no seller label found)."""
+    bina_is_owner.last_reason = "fetch"
     try:
         r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
         if getattr(r, "status_code", 0) != 200:
@@ -1579,27 +1744,45 @@ def bina_is_owner(url):
         raw = r.text or ""
     except Exception:
         return None, None
+    if len(raw) < 1500:
+        return None, None
     photo = None
     mo = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', raw)
     if mo:
         photo = mo.group(1)
-    verdict = _bina_owner_from_ldjson(raw)
-    src = "ldjson"
+    verdict, src = _bina_owner_from_ldjson(raw), "ldjson"
     if verdict is None:
-        verdict = _bina_owner_from_nextdata(raw); src = "nextdata"
+        verdict, src = _bina_owner_from_nextdata(raw), "nextdata"
     if verdict is None:
+        verdict, src = _bina_label_verdict(raw), "label"
+    if verdict is None:
+        # Last resort, description-safe: the owner label word, or the agent label in
+        # its exact "vasitəçi (agent)" form. A bare "Vasitəçi" in free text decides
+        # nothing (owners write "vasitəçilər narahat etməsin").
         text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
-        if "Vasitəçi" in text:
-            verdict, src = False, "text"
-        elif "Mülkiyyətçi" in text:
+        owner_sub = "Mülkiyyətçi" in text
+        agent_sub = re.search(r"vasitəçi\s*\(\s*agent\s*\)", text, re.I) is not None
+        if owner_sub and not agent_sub:
             verdict, src = True, "text"
+        elif agent_sub and not owner_sub:
+            verdict, src = False, "text"
+    bina_is_owner.last_reason = "ok" if verdict is not None else "nolabel"
     if not _BINA_DBG["done"]:
         _BINA_DBG["done"] = True
         log(f"bina owner-detect: {url} -> {verdict} (via {src if verdict is not None else 'none'})")
     return verdict, photo
 
 
+bina_is_owner.last_reason = ""
+
+
 OWNER_MAX_TRIES = int(os.environ.get("OWNER_MAX_TRIES", "4"))
+# Each failing detail page used to cost 3 attempts + ~9 s of sleep; at 100 checks a run
+# that was ~15 minutes of yeniemlak alone, so cron skipped ticks and tap (page 1 only)
+# was read half as often. Now: 2 attempts, and a run stops checking a source after this
+# many unreadable pages in a row (they are retried next run, not given up).
+OWNER_FETCH_TRIES = int(os.environ.get("OWNER_FETCH_TRIES", "2"))
+OWNER_FETCH_FAIL_STREAK = int(os.environ.get("OWNER_FETCH_FAIL_STREAK", "5"))
 
 
 def check_is_owner(url, owner_label="Əmlak sahibi"):
@@ -1609,8 +1792,9 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
     Detail fetches DO fail intermittently (yeniemlak 168545 returned nothing from the VM
     while the page plainly contains "Əmlak sahibi"), so: retry, log the reason, and treat
     an unreadable page as UNKNOWN rather than "agent"."""
+    check_is_owner.last_reason = "fetch"
     raw = text = None
-    for attempt in range(3):
+    for attempt in range(max(1, OWNER_FETCH_TRIES)):
         try:
             r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
             if r.status_code == 200 and len(r.text or "") > 1500:
@@ -1621,7 +1805,8 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
                 f"len={len(getattr(r, 'text', '') or '')} (attempt {attempt + 1})")
         except Exception as e:
             log(f"owner-check {url} -> {e} (attempt {attempt + 1})")
-        time.sleep(1.5 * (attempt + 1))
+        if attempt + 1 < OWNER_FETCH_TRIES:
+            time.sleep(2.0)
     if raw is None:
         return None, None
     photo = None
@@ -1636,15 +1821,20 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
             if "logo" not in cand.lower() and "icon" not in cand.lower():
                 photo = cand
                 break
+    check_is_owner.last_reason = "ok"
     if owner_label in text:
         return True, photo
     if "Vasitəçi" in text or "Rieltor" in text or "Vasitəç:" in text:
         return False, photo
+    check_is_owner.last_reason = "nolabel"
     # Page read fine but carries no seller label -> UNKNOWN, not "agent". Returning
     # False here is what silently buried owner posts; the caller retries a bounded
     # number of times (OWNER_MAX_TRIES) and only then settles.
     log(f"owner-check {url} -> page read but no seller label found")
     return None, photo
+
+
+check_is_owner.last_reason = ""
 
 
 def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
@@ -1675,7 +1865,92 @@ def _seller_counts(seen):
     return counts
 
 
-def process_new_owner_checks(items, source, seen, seeded_flags):
+# --------------------------------------------------------------------------- #
+# "Is this listing really NEW?"  (tap / lalafo / yeniemlak)
+#
+# A listing the bot has never recorded is not necessarily new: "İrəli çək", VIP,
+# Premium or a simple edit lifts an OLD ad to the top of the feed. Listing ids only
+# ever grow, so our own history (each record's first_seen + id) tells us when ids of
+# a given size first existed. For an unseen id we look up the earliest moment we saw
+# an id at least that large: the ad existed by then, so (now - that moment) is a
+# LOWER BOUND on its age. Lower bound => we can only under-estimate age, so a genuinely
+# new ad is never suppressed. lalafo also gives the real creation time; that wins.
+# --------------------------------------------------------------------------- #
+NEW_MAX_AGE_DAYS = float(os.environ.get("NEW_MAX_AGE_DAYS", "3"))
+
+
+class IdClock:
+    def __init__(self):
+        self.ts, self.ids = [], []         # parallel lists; ids strictly increasing
+
+    @classmethod
+    def from_seen(cls, seen, source_name, prefix):
+        pts = []
+        for k, v in seen.items():
+            if not isinstance(v, dict) or v.get("source") != source_name:
+                continue
+            if not k.startswith(prefix):
+                continue
+            num = k[len(prefix):]
+            if not num.isdigit():
+                continue
+            t = _to_epoch(v.get("first_seen"))
+            if t is not None:
+                pts.append((t, int(num)))
+        pts.sort()
+        c = cls()
+        for t, i in pts:
+            if not c.ids or i > c.ids[-1]:
+                c.ts.append(t)
+                c.ids.append(i)
+        return c
+
+    def age_days(self, iid, now_ts):
+        """Lower bound on the age of listing `iid` in days; None if no history."""
+        try:
+            iid = int(iid)
+        except (TypeError, ValueError):
+            return None
+        if not self.ids:
+            return None
+        idx = bisect.bisect_left(self.ids, iid)
+        if idx >= len(self.ids):
+            return 0.0                     # newer than anything we have ever seen
+        return max(0.0, (now_ts - self.ts[idx]) / 86400.0)
+
+
+def listing_age_days(l, clock, now_ts):
+    created = l.get("created_ts")
+    if isinstance(created, (int, float)) and created > 0:
+        return max(0.0, (now_ts - created) / 86400.0)
+    return clock.age_days(l.get("id"), now_ts) if clock is not None else None
+
+
+def _url_fingerprint(url):
+    return hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _url_changed(seeded_flags, name, url):
+    """True once, when a source's search URL differs from the one last run. The very
+    first time (no fingerprint stored yet) it just records the fingerprint."""
+    key = name + ":url"
+    fp = _url_fingerprint(url)
+    old = seeded_flags.get(key)
+    seeded_flags[key] = fp
+    return bool(old) and old != fp
+
+
+def _is_retryable(rec):
+    """Re-examine a recorded listing ONLY if an earlier check explicitly left it
+    undecided (owner=None) and it still has tries left. A record WITHOUT an "owner"
+    key comes from silent seeding or the price tracker: it is KNOWN and stays quiet.
+    (2026-09-07-b treated such records as undecided, so old seeded listings were
+    re-checked and announced as new - e.g. the old lalafo ads re-sent on 8 Sep.)"""
+    return ("owner" in rec and rec.get("owner") is None
+            and rec.get("tries", 0) < OWNER_MAX_TRIES)
+
+
+def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
     """For a price-tracked source that should ALSO announce new OWNER posts (bina):
     owner-check listings not yet in `seen`. MUST run before process_source seeds them.
 
@@ -1687,30 +1962,66 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
     name = source["name"]
     owner_label = source.get("owner_label", "Mülkiyyətçi")
     flag = name + ":owner_seeded"
-    if not seeded_flags.get(flag):
+    changed = _url_changed(seeded_flags, name, source.get("url"))
+    if not seeded_flags.get(flag) or changed:
         seeded_flags[flag] = True
-        return 0, set(), {}           # first run: don't owner-check the existing backlog
+        if changed:
+            log(f"{name}: search URL changed - newly matching listings are recorded "
+                "silently this run (no announcements)")
+        return 0, set(), {}           # don't owner-check (and announce) a whole backlog
+    # Retry counter for pages that were READ but showed no seller label. Without a
+    # cap these were re-fetched every run forever ("deferred 371"), burning the
+    # 100-check budget on the same pages and inviting rate limits.
+    tries_map = tries_map if tries_map is not None else {}
+    prefix = source["prefix"]
+    now_ids = {str(l["id"]) for l in items}
+    for k in list(tries_map):
+        if k not in now_ids or (prefix + k) in seen:
+            tries_map.pop(k, None)
     checks = notified = 0
+    fail_streak = 0
     deferred = set()
     decided = {}
     for l in items:
-        key = source["prefix"] + str(l["id"])
+        iid = str(l["id"])
+        key = prefix + iid
         if key in seen:
             continue                  # already known (price-tracked or checked before)
-        if checks >= MAX_OWNER_CHECKS:
-            deferred.add(str(l["id"]))    # over budget -> retry next run
+        if checks >= MAX_OWNER_CHECKS or fail_streak >= OWNER_FETCH_FAIL_STREAK:
+            deferred.add(iid)         # over budget / site refusing -> retry next run
             continue
         if source.get("type") == "bina":
             owner, photo = bina_is_owner(l["url"])
+            reason = getattr(bina_is_owner, "last_reason", "")
         else:
             owner, photo = check_is_owner(l["url"], owner_label)
+            reason = getattr(check_is_owner, "last_reason", "")
         checks += 1
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
-            deferred.add(str(l["id"]))    # blocked/timeout -> retry next run
+            if reason == "fetch":
+                fail_streak += 1
+                deferred.add(iid)     # page not read: retry next run, no try used
+                if fail_streak == OWNER_FETCH_FAIL_STREAK:
+                    log(f"{name}: {fail_streak} detail pages in a row unreadable; "
+                        "pausing owner checks until next run")
+                continue
+            fail_streak = 0
+            n = tries_map.get(iid, 0) + 1
+            if n >= OWNER_MAX_TRIES:
+                tries_map.pop(iid, None)
+                log(f"{name}: {l['url']} -> no seller label after {n} reads; "
+                    "recorded without announcing")
+                continue              # NOT deferred: process_source records it once
+            tries_map[iid] = n
+            deferred.add(iid)
             continue
-        decided[str(l["id"])] = bool(owner)
+        fail_streak = 0
+        tries_map.pop(iid, None)
+        decided[iid] = bool(owner)
+        if not owner:
+            log(f"{name}: {l['url']} -> AGENT (not announced)")
         if owner:
             if is_stale_promoted(l):
                 age = _listing_age_days(l)
@@ -1730,77 +2041,113 @@ def process_new_owner_checks(items, source, seen, seeded_flags):
 def process_owner_new(items, source, seen, seeded_flags):
     prefix, name = source["prefix"], source["name"]
     owner_label = source.get("owner_label", "Əmlak sahibi")
+    stype = source.get("type")
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    now_ts = time.time()
 
-    # Seed silently if this source was never seeded OR has no recorded listings yet
-    # (the second check stops a flood if a prior empty run set the flag with 0 ids).
+    # Seed silently on the first real run, or when the search URL was changed (a new
+    # URL matches many listings the bot never saw - most of them old). Existing
+    # records are never overwritten.
     has_recorded = bool(prefix) and any(k.startswith(prefix) for k in seen)
-    if not seeded_flags.get(name) or (bool(prefix) and not has_recorded):
-        # First real run for this source: seed ALL current listings silently (no detail
-        # fetches, no announcements) so owner-checking only runs on future new posts.
+    first_run = not seeded_flags.get(name) or (bool(prefix) and not has_recorded)
+    changed = _url_changed(seeded_flags, name, source.get("url"))
+    if first_run or changed:
+        n = 0
         for l in items:
-            seen[prefix + str(l["id"])] = {"url": l["url"], "first_seen": now, "source": name}
+            k = prefix + str(l["id"])
+            if k not in seen:
+                seen[k] = {"url": l["url"], "first_seen": now, "source": name}
+                n += 1
         seeded_flags[name] = True
-        log(f"{name}: seeded {len(items)} listings silently (owner-check starts next run)")
+        why = "first run" if first_run else "search URL changed"
+        log(f"{name}: {why} - recorded {n} current listings silently (no announcements)")
         return 0
 
-    prefiltered = source.get("prefiltered_owner", False)  # URL already returns only owner posts
-    seller_counts = _seller_counts(seen)
+    prefiltered = source.get("prefiltered_owner", False)  # URL already asks for owner posts
+    seller_apts = _seller_apartments(seen) if stype == "tap" else {}
     tap_profile_cache = {}
-    checks = 0
-    notified = 0
+    clock = IdClock.from_seen(seen, name, prefix)
+    checks = notified = fail_streak = 0
     for l in items:
         key = prefix + str(l["id"])
         rec = seen.get(key)
-        if rec is not None and (rec.get("owner") is not None
-                                or rec.get("tries", 0) >= OWNER_MAX_TRIES):
-            continue                       # already decided, or we gave up after N tries
+        if rec is not None and not _is_retryable(rec):
+            continue                       # known: announced, rejected, seeded or given up
+        first_seen = (rec or {}).get("first_seen", now)
+
+        # Really new? An old ad lifted by İrəli çək / VIP / Premium / an edit is
+        # recorded quietly and never announced as "Yeni elan".
+        age = listing_age_days(l, clock, now_ts)
+        if age is not None and age > NEW_MAX_AGE_DAYS:
+            seen[key] = {"url": l["url"], "first_seen": first_seen, "source": name,
+                         "skip": f"old ~{age:.0f}d"}
+            log(f"{name}: {l['url']} -> not new (~{age:.0f} days old); recorded, not announced")
+            continue
+
         if prefiltered:
             # "prefiltered" only means the SEARCH URL asked for owner posts. lalafo still
-            # leaks agent ("Makler") posts and out-of-area (non-Baku) fallback content, so
-            # re-check both here before announcing.
-            if source.get("type") == "lalafo":
+            # leaks agent posts and out-of-area content, so check before announcing.
+            if stype == "lalafo":
+                why = None
                 if not lalafo_ok(l):
-                    seen[key] = {"url": l["url"], "first_seen": now,
-                                 "source": name, "owner": False, "skip": "location"}
+                    why = "location"
+                elif l.get("_agent"):
+                    why = "agent"
+                else:
+                    sc, rs = owner_signal_score(l.get("_text") or "", "", None)
+                    if sc <= SCORE_AGENT_AT:
+                        why = "agent-text " + ",".join(rs)
+                if why:
+                    log(f"lalafo.az: {l['url']} -> skipped ({why})")
+                    seen[key] = {"url": l["url"], "first_seen": first_seen,
+                                 "source": name, "owner": False, "skip": why}
                     continue
-                if l.get("_agent"):
-                    log(f"lalafo.az: {l['url']} -> skipped (agent/Makler signal)")
-                    seen[key] = {"url": l["url"], "first_seen": now,
-                                 "source": name, "owner": False, "skip": "agent"}
-                    continue
-            seen[key] = {"url": l["url"], "first_seen": now, "source": name, "owner": True}
+            seen[key] = {"url": l["url"], "first_seen": first_seen, "source": name,
+                         "owner": True}
             if notify_new_owner_msg(l, name, owner_label):
                 notified += 1
             continue
+
         if checks >= MAX_OWNER_CHECKS:
             break                          # spread detail-page load; rest handled next run
-        if source.get("type") == "tap":
-            owner, photo, seller = tap_check_owner(l["url"], seller_counts, tap_profile_cache)
+        if fail_streak >= OWNER_FETCH_FAIL_STREAK:
+            log(f"{name}: {fail_streak} detail pages in a row unreadable; "
+                "pausing owner checks until next run")
+            break
+        if stype == "tap":
+            owner, photo, seller = tap_check_owner(l["url"], seller_apts,
+                                                   tap_profile_cache, listing=l)
+            reason = getattr(tap_check_owner, "last_reason", "")
         else:
             owner, photo = check_is_owner(l["url"], owner_label)
             seller = None
+            reason = getattr(check_is_owner, "last_reason", "")
         checks += 1
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
-            # Record the ATTEMPT so retries are bounded, but leave owner unset so the
-            # listing stays eligible for a real decision on the next run.
-            prev = (seen.get(key) or {})
-            tries = prev.get("tries", 0) + 1
-            seen[key] = {"url": l["url"], "first_seen": prev.get("first_seen", now),
-                         "source": name, "owner": None, "tries": tries}
+            if reason == "fetch":
+                fail_streak += 1           # page not read: retry next run, no try used
+                continue
+            fail_streak = 0
+            tries = (rec or {}).get("tries", 0) + 1
+            seen[key] = {"url": l["url"], "first_seen": first_seen, "source": name,
+                         "owner": None, "tries": tries}
             if tries >= OWNER_MAX_TRIES:
-                log(f"{name}: {l['url']} undetermined after {tries} tries; giving up")
+                log(f"{name}: {l['url']} undetermined after {tries} reads; giving up")
             continue
+        fail_streak = 0
         if photo:
             l["photo"] = photo
-        rec = {"url": l["url"], "first_seen": (seen.get(key) or {}).get("first_seen", now),
-               "source": name, "owner": bool(owner)}
+        new_rec = {"url": l["url"], "first_seen": first_seen, "source": name,
+                   "owner": bool(owner)}
         if seller:
-            rec["seller"] = seller
-            seller_counts[seller] = seller_counts.get(seller, 0) + 1
-        seen[key] = rec
+            new_rec["seller"] = seller
+            if stype == "tap":
+                new_rec["rooms"] = l.get("rooms")
+                new_rec["area"] = l.get("area")
+                seller_apts.setdefault(seller, set()).add(_apt_key(l))
+        seen[key] = new_rec
         if owner and notify_new_owner_msg(l, name, owner_label):
             notified += 1
     log(f"{name}: checked {checks} new, announced {notified} owner posts")
@@ -1926,7 +2273,9 @@ def process_source(items, source, seen, skip_ids=None, owner_map=None):
 # Main
 # --------------------------------------------------------------------------- #
 def main():
-    log(f"monitor.py {VERSION} starting")
+    t0 = time.time()
+    log(f"monitor.py {VERSION} starting "
+        f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}")
     if not BOT_TOKEN or not CHAT_ID:
         log("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
         sys.exit(1)
@@ -1940,6 +2289,7 @@ def main():
         return
     seen = state["listings"]
     loaded_count = len(seen)          # invariant: we must never save fewer than this
+    _RUNTIME["state"] = state         # small caches (tap profile counts) live in state
 
     if IN_ACTIONS and not USE_API:
         tg_send_message("⚠️ Memory storage not configured (GH_TOKEN/GH_REPO missing); listings "
@@ -1977,7 +2327,8 @@ def main():
         elif source.get("mode") == "price_owner":
             # owner check must run BEFORE process_source seeds the new listings
             n_new, deferred, decided = process_new_owner_checks(
-                items, source, seen, seeded_flags)
+                items, source, seen, seeded_flags,
+                tries_map=state.setdefault("owner_tries", {}))
             total_notified += n_new
             total_notified += process_source(items, source, seen, skip_ids=deferred,
                                              owner_map=decided)
@@ -1999,6 +2350,7 @@ def main():
                         f"repeat until fixed.\nReason: {html.escape(reason)}")
     log(f"Done. notified={total_notified} saved={ok}({reason}) "
         f"records_before={loaded_count} records_after={len(seen)} "
+        f"elapsed={int(time.time() - t0)}s "
         f"status={ {k: (v or 'ok') for k, v in status.items()} }")
 
 
