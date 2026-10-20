@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
 Apartment monitor -> Telegram. Watches multiple portals and messages you once
-per brand-new matching listing.
+per brand-new matching listing (plus bina.az price changes).
 
 Sources:
-  * bina.az     — current GraphQL API (server-side filters, rich data + photo)
+  * tap.az       — server-rendered HTML, first results page only
+  * lalafo.az    — Next.js page, data read from __NEXT_DATA__
   * yeniemlak.az — server-rendered HTML (parsed directly; no signature needed)
+  * bina.az      — GraphQL API (server-side filters, rich data + photo)
 
-Memory lives in seen.json via the GitHub Contents API (atomic, no git races).
+Runs on the VM from cron (under flock). Memory is the local seen.json (atomic
+write); the GitHub Contents API is used only when GH_TOKEN + GH_REPO are set.
 Each source is seeded silently the first time it appears, so adding a new portal
 never floods you with its existing listings.
 """
@@ -25,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-10-18-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-10-20-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -85,17 +88,14 @@ GRAPHQL_URL = "https://bina.az/graphql"
 OPERATION = "SearchItems"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = int(os.environ.get("BINA_PAGE_SIZE", "16"))  # bina GraphQL `first:`
-# Price tracking needs the FULL result set each run (not just the newest listings),
-# so an old listing's price change is still fetched and compared. SCAN_PAGES caps how
-# many pages we page through — a safety valve against hammering bina / getting blocked.
-# 120 pages * 16 = ~1920 listings. If your search has more matches than this, either
-# raise it (block risk) or narrow the search so the whole set fits.
+# Price tracking needs the FULL result set now and then (a full pass every
+# FULL_SCAN_EVERY_MIN, quick top-pages scans in between), so an old listing's price
+# change is still fetched and compared. SCAN_PAGES caps how many pages one pass reads
+# - a safety valve against hammering bina. 1000 pages * 16 = 16000 listings; if the
+# search grows past that you get one Telegram warning.
 SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "1000"))
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "0.25"))   # politeness pause between pages
 
-# bina's server matches locations hierarchically, so selecting a district also returns
-# its sub-areas (metros / settlements). These are sub-areas you do NOT want even though
-# they sit inside a chosen district. Matched against the listing's location name.
 # Paid promotion (VIP / Premium / "İrəli çək") re-surfaces OLD ads at the top of a
 # BUMPED_AT_DESC sort, so a promoted ad can look brand new. Skip promoted ads, and/or
 # require the ad to have been updated recently. 0 disables the age rule.
@@ -165,6 +165,9 @@ def _node_promoted(node):
     return bool(found)
 
 
+# bina's server matches locations hierarchically, so selecting a district also returns
+# its sub-areas (metros / settlements). These are sub-areas you do NOT want even though
+# they sit inside a chosen district. Matched against the listing's location name.
 BINA_EXCLUDE_LOCATIONS = [x.strip() for x in os.environ.get(
     "BINA_EXCLUDE_LOCATIONS",
     "Koroğlu,Ağ şəhər,Şah İsmayıl Xətai"
@@ -182,9 +185,6 @@ STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 # unless you actually approach that (hundreds of thousands of listings).
 MAX_SEEN = int(os.environ.get("MAX_SEEN", "0"))
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
-# Price-drop alerts: notify when a known listing's price falls.
-PRICE_DROP_MIN_ABS = int(os.environ.get("PRICE_DROP_MIN_ABS", "0"))   # ignore drops smaller than this (AZN)
-DROP_ANOMALY_FLOOR = float(os.environ.get("DROP_ANOMALY_FLOOR", "0.4"))  # ignore >60% "drops" as parse errors
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -218,18 +218,107 @@ class PersistedQueryError(Exception):
 # --------------------------------------------------------------------------- #
 # Telegram
 # --------------------------------------------------------------------------- #
+TG_TRIES = int(os.environ.get("TG_TRIES", "3"))
+# Alerts that could not be delivered are queued in seen.json ("outbox") and re-sent
+# at the start of the next run. The listing itself is already recorded as handled,
+# so without the queue a Telegram outage / 429 lost that alert for good.
+OUTBOX_MAX_AGE_H = float(os.environ.get("OUTBOX_MAX_AGE_H", "48"))
+OUTBOX_MAX = int(os.environ.get("OUTBOX_MAX", "200"))
+
+
+_TG = {"transient": False}   # was the last failure worth retrying later?
+
+
+def _tg_post(method, timeout=30, **kw):
+    """POST to the Bot API. Waits out 429 (retry_after) and retries 5xx / network
+    errors; returns the final response, or None if nothing got through."""
+    r = _tg_post_once(method, timeout, **kw)
+    _TG["transient"] = r is None or r.status_code == 429 or r.status_code >= 500
+    return r
+
+
+def _tg_post_once(method, timeout, **kw):
+    r = None
+    for attempt in range(max(1, TG_TRIES)):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                              timeout=timeout, **kw)
+        except requests.RequestException as e:
+            log(f"Telegram {method} error:", e)
+            r = None
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 429:
+            try:
+                wait = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                wait = 5
+            log(f"Telegram {method} rate-limited; waiting {wait}s")
+            time.sleep(min(max(wait, 1), 60))
+            continue
+        if r.status_code >= 500:
+            time.sleep(2 * (attempt + 1))
+            continue
+        return r
+    return r
+
+
 def tg_send_message(text):
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                                "disable_web_page_preview": False}, timeout=30)
-        if r.status_code == 200:
-            return True
+    r = _tg_post("sendMessage", json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                                      "disable_web_page_preview": False})
+    if r is not None and r.status_code == 200:
+        return True
+    if r is not None:
         log("Telegram sendMessage failed:", r.status_code, r.text[:200])
-        return False
-    except requests.RequestException as e:
-        log("Telegram error:", e)
-        return False
+    return False
+
+
+def _queue_alert(text, photo=None):
+    """Keep an undelivered listing alert for the next run (see OUTBOX_MAX_AGE_H)."""
+    st = _RUNTIME.get("state")
+    if not isinstance(st, dict):
+        return
+    box = st.setdefault("outbox", [])
+    box.append({"text": text, "photo": photo,
+                "t": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
+    del box[:-OUTBOX_MAX]
+    log(f"Telegram alert queued for retry next run ({len(box)} waiting)")
+
+
+def send_alert(text, photo=None):
+    """Deliver one listing alert; queue it if Telegram was unreachable / overloaded.
+    A permanent rejection (4xx, e.g. bad HTML) is not queued: it would never pass."""
+    ok = tg_send_photo(photo, text) if (SEND_PHOTOS and photo) else tg_send_message(text)
+    if not ok and _TG["transient"]:
+        _queue_alert(text, photo)
+    return ok
+
+
+def flush_outbox(state):
+    """Re-send alerts queued by earlier runs, oldest first. Stops at the first
+    transient failure (Telegram still down) so a dead API does not stall the run."""
+    box = state.get("outbox") or []
+    if not box:
+        return 0
+    cutoff = time.time() - OUTBOX_MAX_AGE_H * 3600
+    keep, sent, dropped = [], 0, 0
+    for i, a in enumerate(box):
+        t = _to_epoch(a.get("t"))
+        if t is not None and t < cutoff:
+            dropped += 1
+            continue
+        ok = (tg_send_photo(a["photo"], a["text"]) if (SEND_PHOTOS and a.get("photo"))
+              else tg_send_message(a.get("text", "")))
+        if not ok and _TG["transient"]:
+            keep.extend(x for x in box[i:] if (_to_epoch(x.get("t")) or cutoff) >= cutoff)
+            break
+        if not ok:
+            dropped += 1                 # rejected for good: do not block the queue
+            continue
+        sent += 1
+    state["outbox"] = keep
+    log(f"outbox: re-sent {sent}, still waiting {len(keep)}, dropped {dropped}")
+    return sent
 
 
 def _download_image(url):
@@ -260,25 +349,22 @@ def tg_send_photo(photo_url, caption):
     # 1) Preferred: download the image ourselves and UPLOAD the bytes (multipart).
     img = _download_image(photo_url)
     if img:
-        try:
-            r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                              data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
-                              files={"photo": ("photo.jpg", img, "image/jpeg")}, timeout=60)
-            if r.status_code == 200:
-                return True
-            log("sendPhoto upload failed:", r.status_code, r.text[:200])
-        except requests.RequestException as e:
-            log("sendPhoto upload error:", e)
-    # 2) Fallback: let Telegram fetch the URL (works for fast HTTPS CDNs like bina).
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                          json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
-                                "parse_mode": "HTML"}, timeout=30)
+        r = _tg_post("sendPhoto", timeout=60,
+                     data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+                     files={"photo": ("photo.jpg", img, "image/jpeg")})
+        if r is None:
+            return False                   # Telegram unreachable: the caller queues it
         if r.status_code == 200:
             return True
-        log("sendPhoto by-url failed:", r.status_code, r.text[:160])
-    except requests.RequestException as e:
-        log("sendPhoto by-url error:", e)
+        log("sendPhoto upload failed:", r.status_code, r.text[:200])
+    # 2) Fallback: let Telegram fetch the URL (works for fast HTTPS CDNs like bina).
+    r = _tg_post("sendPhoto", json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
+                                    "parse_mode": "HTML"})
+    if r is None:
+        return False
+    if r.status_code == 200:
+        return True
+    log("sendPhoto by-url failed:", r.status_code, r.text[:160])
     # 3) Last resort: text so the alert still arrives.
     return tg_send_message(caption)
 
@@ -426,31 +512,57 @@ def bina_passes(l, c):
     return True
 
 
-def fetch_bina(url):
+BINA_PAGE_TRIES = int(os.environ.get("BINA_PAGE_TRIES", "3"))
+
+
+def _bina_page(fv, cursor):
+    """One GraphQL page -> itemsConnection. A failing page is retried before giving
+    up: one bad response on page 500 used to throw away the whole ~10-minute scan.
+    An expired persisted query is not transient and is raised at once."""
+    err = None
+    for attempt in range(max(1, BINA_PAGE_TRIES)):
+        if attempt:
+            time.sleep(3 * attempt)          # 3s, 6s
+        try:
+            r = requests.get(GRAPHQL_URL, params=_bina_params(fv, cursor),
+                             headers=API_HEADERS, timeout=30)
+        except requests.RequestException as e:
+            err = RuntimeError(f"network error: {e}")
+            continue
+        if r.status_code != 200:
+            err = RuntimeError(f"HTTP {r.status_code}")
+            continue
+        try:
+            payload = r.json()
+        except ValueError:
+            err = RuntimeError("response was not JSON")
+            continue
+        if payload.get("errors"):
+            msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
+            if "PersistedQueryNotFound" in msg or "PERSISTED_QUERY_NOT_FOUND" in msg:
+                raise PersistedQueryError(msg)
+            err = RuntimeError(f"GraphQL error: {msg}")
+            continue
+        conn = (payload.get("data") or {}).get("itemsConnection")
+        if not conn:
+            err = RuntimeError("no itemsConnection")
+            continue
+        return conn
+    raise err
+
+
+def fetch_bina(url, plan=None):
     fv = bina_filter_vars(url)
     check = bina_check(url)
     out, cursor = [], None
     total_count = None
     pages = 0
-    hit_cap = False
+    hit_cap = early = False
     for i in range(SCAN_PAGES):
-        r = requests.get(GRAPHQL_URL, params=_bina_params(fv, cursor), headers=API_HEADERS, timeout=30)
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}")
-        try:
-            payload = r.json()
-        except ValueError:
-            raise RuntimeError("response was not JSON")
-        if payload.get("errors"):
-            msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
-            if "PersistedQueryNotFound" in msg or "PERSISTED_QUERY_NOT_FOUND" in msg:
-                raise PersistedQueryError(msg)
-            raise RuntimeError(f"GraphQL error: {msg}")
-        conn = (payload.get("data") or {}).get("itemsConnection")
-        if not conn:
-            raise RuntimeError("no itemsConnection")
+        conn = _bina_page(fv, cursor)
         if total_count is None:
             total_count = conn.get("totalCount")
+        page_items = []
         for edge in conn.get("edges", []):
             node = edge.get("node")
             if node and node.get("id") is not None:
@@ -459,38 +571,54 @@ def fetch_bina(url):
                     if str(l["id"]).isdigit():       # calibrate "now" for age estimates
                         _BINA_MAX_ID["v"] = max(_BINA_MAX_ID["v"], int(l["id"]))
                     if bina_passes(l, check):
-                        out.append(l)
+                        page_items.append(l)
                 except Exception as e:
                     log("skip bina node:", e)
+        out.extend(page_items)
         pages += 1
         info = conn.get("pageInfo") or {}
         if not info.get("hasNextPage") or not info.get("endCursor"):
+            break
+        if plan is not None and plan.stop_after(pages, page_items):
+            early = True
             break
         cursor = info["endCursor"]
         if i == SCAN_PAGES - 1:
             hit_cap = True
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
-    log(f"bina: scanned {pages} pages, {len(out)} matching listings"
+    log(f"bina: {'quick' if early else 'full'} scan, {pages} pages, {len(out)} matching listings"
         + (f" of ~{total_count} total" if total_count is not None else ""))
     # surface a coverage gap so you know if changes on deep listings are being missed
-    if hit_cap and total_count and total_count > len(out):
-        _coverage_warn(len(out), total_count)
+    if not early:
+        _coverage_warn(len(out), total_count, hit_cap)
     return out
 
 
-_coverage_warned = {"done": False}
-
-
-def _coverage_warn(scanned, total):
-    if _coverage_warned["done"]:
+def _coverage_warn(scanned, total, hit_cap):
+    """Tell Telegram ONCE when a full scan stops at SCAN_PAGES with pages left
+    (listings below that point get no price tracking); clear it when it fits again."""
+    st = _RUNTIME.get("state")
+    flags = st.setdefault("seeded", {}) if isinstance(st, dict) else None
+    key = "bina.az:coverage_warned"
+    if not hit_cap:
+        if flags is not None:
+            flags.pop(key, None)
         return
-    _coverage_warned["done"] = True
-   
+    log(f"bina: SCAN_PAGES={SCAN_PAGES} reached with more pages left "
+        f"({scanned} kept of ~{total})")
+    if flags is None or flags.get(key):
+        return                       # diagnostics scripts (no state) only log
+    flags[key] = True
+    tg_send_message(f"⚠️ <b>bina.az</b>: scan stopped at SCAN_PAGES={SCAN_PAGES} pages "
+                    f"({scanned} listings kept of ~{total}). Listings beyond that are not "
+                    "price-tracked. Raise SCAN_PAGES or narrow the search URL.")
+
+
 # --------------------------------------------------------------------------- #
 # yeniemlak.az  (server-rendered HTML; paginated via ?page=N)
 # --------------------------------------------------------------------------- #
-YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "1000"))   # owner-new mode: newest pages only
+YE_MAX_PAGES = int(os.environ.get("YE_MAX_PAGES", "1000"))   # safety cap on pages per run
 MAX_OWNER_CHECKS = int(os.environ.get("MAX_OWNER_CHECKS", "100"))  # detail-page checks per run
 
 # yeniemlak's metro[] is a SELLER-DECLARED tag with no tie to the district, so the
@@ -563,10 +691,11 @@ def _parse_yeniemlak_page(raw):
     return out, total
 
 
-def fetch_yeniemlak(url):
-    """Page through the whole yeniemlak result set. Stops when a page adds no new
-    listing IDs (also the graceful fallback if ?page is ever ignored). Listings the
-    site leaked outside the wanted districts are dropped by ye_passes()."""
+def fetch_yeniemlak(url, plan=None):
+    """Page through the yeniemlak result set. Stops when a page adds no new
+    listing IDs (also the graceful fallback if ?page is ever ignored), or - in a
+    quick scan - when a page holds nothing unknown. Listings the site leaked
+    outside the wanted districts are dropped by ye_passes()."""
     all_out, seen_ids = [], set()
     total = None
     parsed = 0
@@ -583,14 +712,18 @@ def fetch_yeniemlak(url):
         new = [l for l in listings if l["id"] not in seen_ids]
         if not new:                       # no new IDs -> end of results (or page ignored)
             break
+        kept = []
         for l in new:
             seen_ids.add(l["id"])         # always mark, so pagination still terminates
             parsed += 1
             if ye_passes(l):
-                all_out.append(l)
+                kept.append(l)
+        all_out.extend(kept)
+        if plan is not None and plan.stop_after(page, kept):
+            break
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
-    log(f"yeniemlak: kept {len(all_out)} of {parsed} parsed"
+    log(f"yeniemlak: kept {len(all_out)} of {parsed} parsed, {page} page(s)"
         + (f" (~{total} on site)" if total is not None else ""))
     # Alarm on a PARSE failure, never on a legitimately empty filtered result.
     if not parsed and total and total > 0:
@@ -598,15 +731,76 @@ def fetch_yeniemlak(url):
     return all_out
 
 
-def fetch_for_source(source):
+# --------------------------------------------------------------------------- #
+# Quick vs full scans
+#
+# Reading EVERY results page is only needed now and then. bina sorts by
+# BUMPED_AT_DESC, so new posts and bumped/edited ads (incl. most price changes)
+# surface on the first pages. A quick scan stops at the first page (after
+# QUICK_MIN_PAGES) that holds nothing unknown; a full pass every
+# FULL_SCAN_EVERY_MIN still catches deep price changes and anything buried under a
+# burst of bumps. bina's full pass takes ~10 min, so quick runs mean tap.az (page 1
+# only) is read several times more often.
+# Only sources in QUICK_SCAN_SOURCES use it. Add "yeniemlak.az" / "lalafo.az" only
+# after confirming their feeds are sorted newest-first.
+# --------------------------------------------------------------------------- #
+FULL_SCAN_EVERY_MIN = float(os.environ.get("FULL_SCAN_EVERY_MIN", "60"))   # 0 = always full
+QUICK_MIN_PAGES = int(os.environ.get("QUICK_MIN_PAGES", "3"))
+QUICK_SCAN_SOURCES = {s.strip() for s in os.environ.get(
+    "QUICK_SCAN_SOURCES", "bina.az").split(",") if s.strip()}
+
+
+class ScanPlan:
+    """How deep to read one source this run. full=True reads every page."""
+
+    def __init__(self, full, seen=None, prefix="", owner_new=False):
+        self.full, self.seen, self.prefix, self.owner_new = full, seen or {}, prefix, owner_new
+
+    def known(self, l):
+        rec = self.seen.get(self.prefix + str(l["id"]))
+        if rec is None:
+            return False
+        return not (self.owner_new and _is_retryable(rec))
+
+    def stop_after(self, page_no, listings):
+        """True when a quick scan may stop here: past the minimum page count and
+        nothing on this page is new or still waiting for an owner decision."""
+        return (not self.full and page_no >= QUICK_MIN_PAGES
+                and all(self.known(l) for l in listings))
+
+
+def plan_scan(source, state):
+    """Full scan unless the source opted in to quick scans AND it is already seeded,
+    its search URL is unchanged and the last full pass is recent."""
+    name, prefix = source["name"], source.get("prefix", "")
+    seen = state.get("listings", {})
+    owner_new = source.get("mode") == "owner_new"
+    plan = ScanPlan(True, seen, prefix, owner_new)
+    if FULL_SCAN_EVERY_MIN <= 0 or name not in QUICK_SCAN_SOURCES:
+        return plan
+    flags = state.get("seeded", {})
+    seeded = flags.get(name if owner_new else name + ":owner_seeded")
+    if (owner_new and prefix and not flags.get(name + ":seeded_empty")
+            and not any(k.startswith(prefix) for k in seen)):
+        seeded = False
+    if not seeded or flags.get(name + ":url") != _url_fingerprint(source.get("url")):
+        return plan                     # first run / new URL: the seed needs every page
+    last = _to_epoch((state.get("last_full_scan") or {}).get(name))
+    if last is None or time.time() - last >= FULL_SCAN_EVERY_MIN * 60:
+        return plan
+    plan.full = False
+    return plan
+
+
+def fetch_for_source(source, plan=None):
     if source["type"] == "bina":
-        return fetch_bina(source["url"])
+        return fetch_bina(source["url"], plan)
     if source["type"] == "yeniemlak":
-        return fetch_yeniemlak(source["url"])
+        return fetch_yeniemlak(source["url"], plan)
     if source["type"] == "tap":
         return fetch_tap(source["url"])
     if source["type"] == "lalafo":
-        return fetch_lalafo(source["url"])
+        return fetch_lalafo(source["url"], plan)
     raise RuntimeError(f"unknown source type {source['type']}")
 
 
@@ -867,7 +1061,7 @@ def _fetch_lalafo_html(purl, tries=4):
     return last, (getattr(last, "text", "") or "")
 
 
-def fetch_lalafo(url):
+def fetch_lalafo(url, plan=None):
     all_out, seen_ids = [], set()
     for page in range(1, LALAFO_MAX_PAGES + 1):
         purl = _with_page(url, page)
@@ -889,9 +1083,11 @@ def fetch_lalafo(url):
             break                   # (prevents drifting into out-of-area filler ads)
         if not new:                 # safety: nothing new yet still "next" -> stop
             break
+        if plan is not None and plan.stop_after(page, new):
+            break
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
-    log(f"lalafo.az: {len(all_out)} listings")
+    log(f"lalafo.az: {len(all_out)} listings, {page} page(s)")
     return all_out
 
 
@@ -996,7 +1192,6 @@ def _parse_tap_page(raw):
 # An explicit owner phrase ("vasitəçi narahat etməsin", "sahibindən") beats rule 2,
 # because owners often write "no agents please" and would otherwise be filtered out.
 # --------------------------------------------------------------------------- #
-TAP_MAX_USER_ADS = int(os.environ.get("TAP_MAX_USER_ADS", "3"))
 # Count how many APARTMENTS a seller has for sale on their profile; 3+ => agent.
 # This mirrors the manual rule: the ad shows "İstifadəçinin bütün elanları" only for
 # sellers with multiple listings; you then open the profile and count apartments.
@@ -1012,6 +1207,9 @@ TAP_MULTI_MARKERS = [m_.strip() for m_ in os.environ.get(
 ).split(",") if m_.strip()]
 TAP_MULTI_MARKER = "bütün elanları"   # kept for back-compat
 
+# NOTE: the three word lists below (TAP_BUSINESS_TOKENS / TAP_REALTOR_PHRASES /
+# TAP_OWNER_PHRASES) are only read by the trace.py diagnostic. The live verdict comes
+# from the regex patterns in owner_signal_score(), so edit those to change behaviour.
 # A business name on the SELLER ACCOUNT is a structural agent signal - stronger than
 # any description wording, because it is account identity rather than free text
 # ("Invest", "MMC", "Estate"...). Deliberately excludes "emlak"/"əmlak": tap's own
@@ -1561,10 +1759,11 @@ def save_state(state, sha):
                         latest["listings"][k] = v
                     else:  # same listing touched by both -> keep the fuller price history
                         latest["listings"][k] = _merge_records(latest["listings"][k], v)
-                if state.get("source_status"):
-                    latest["source_status"] = state["source_status"]
-                if state.get("seeded"):
-                    latest["seeded"] = state["seeded"]
+                # every other top-level key (source_status, seeded, owner_tries,
+                # tap_profiles, outbox, last_full_scan) is this run's newer copy
+                for k, v in state.items():
+                    if k != "listings":
+                        latest[k] = v
                 state = latest
                 _prune(state)
                 continue
@@ -1606,12 +1805,8 @@ def _spaced(n):
     return f"{int(n):,}".replace(",", " ")
 
 
-def format_change(l, source_name, kind, old_price, new_price, n_changes):
-    head = "🔻 <b>QİYMƏT DÜŞDÜ</b>" if kind == "drop" else "🔺 <b>QİYMƏT ARTIMI</b>"
-    lines = [f"{head} · {html.escape(source_name)}", ""]
-    cur = l.get("currency", "AZN")
-    old_txt = f"<s>{_spaced(old_price)}</s>" if kind == "drop" else _spaced(old_price)
-    lines.append(f"💰 <b>Qiymət:</b> {old_txt} → <b>{_spaced(new_price)}</b> {cur}")
+def _details(l, lines):
+    """Append the rooms / area / floor / address / link lines shared by every alert."""
     if l.get("rooms") is not None:
         lines.append(f"🛏 <b>Otaq sayı:</b> {l['rooms']}")
     if l.get("area") is not None:
@@ -1626,11 +1821,17 @@ def format_change(l, source_name, kind, old_price, new_price, n_changes):
     return "\n".join(lines)
 
 
-def notify_change(l, source_name, kind, old_price, new_price, n_changes):
-    text = format_change(l, source_name, kind, old_price, new_price, n_changes)
-    if SEND_PHOTOS and l.get("photo"):
-        return tg_send_photo(l["photo"], text)
-    return tg_send_message(text)
+def format_change(l, source_name, kind, old_price, new_price, n_changes=None):
+    head = "🔻 <b>QİYMƏT DÜŞDÜ</b>" if kind == "drop" else "🔺 <b>QİYMƏT ARTIMI</b>"
+    lines = [f"{head} · {html.escape(source_name)}", ""]
+    cur = l.get("currency", "AZN")
+    old_txt = f"<s>{_spaced(old_price)}</s>" if kind == "drop" else _spaced(old_price)
+    lines.append(f"💰 <b>Qiymət:</b> {old_txt} → <b>{_spaced(new_price)}</b> {cur}")
+    return _details(l, lines)
+
+
+def notify_change(l, source_name, kind, old_price, new_price, n_changes=None):
+    return send_alert(format_change(l, source_name, kind, old_price, new_price), l.get("photo"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1841,28 +2042,7 @@ def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
     lines = [f"‼️ <b>Yeni elan</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
     if l.get("price") is not None:
         lines.append(f"💰 <b>Qiymət:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
-    if l.get("rooms") is not None:
-        lines.append(f"🛏 <b>Otaq sayı:</b> {l['rooms']}")
-    if l.get("area") is not None:
-        area = int(l["area"]) if float(l["area"]).is_integer() else l["area"]
-        lines.append(f"📐 <b>Sahə:</b> {area} {l.get('area_units', 'm²')}")
-    if l.get("floor") and l.get("floors"):
-        lines.append(f"🏢 <b>Mərtəbə:</b> {l['floor']}/{l['floors']}")
-    if l.get("location"):
-        lines.append(f"📍 <b>Ünvan:</b> {html.escape(str(l['location']))}")
-    lines.append("")
-    lines.append(f'🔗 <a href="{html.escape(l["url"])}">Elana bax</a>')
-    return "\n".join(lines)
-
-
-def _seller_counts(seen):
-    """How many ads each seller account already has in our history."""
-    counts = {}
-    for v in seen.values():
-        sid = v.get("seller")
-        if sid:
-            counts[sid] = counts.get(sid, 0) + 1
-    return counts
+    return _details(l, lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -1950,7 +2130,7 @@ def _is_retryable(rec):
             and rec.get("tries", 0) < OWNER_MAX_TRIES)
 
 
-def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
+def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None, full_scan=True):
     """For a price-tracked source that should ALSO announce new OWNER posts (bina):
     owner-check listings not yet in `seen`. MUST run before process_source seeds them.
 
@@ -1976,7 +2156,8 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
     prefix = source["prefix"]
     now_ids = {str(l["id"]) for l in items}
     for k in list(tries_map):
-        if k not in now_ids or (prefix + k) in seen:
+        # a quick scan sees only the top pages: absence from it says nothing
+        if (full_scan and k not in now_ids) or (prefix + k) in seen:
             tries_map.pop(k, None)
     checks = notified = 0
     fail_streak = 0
@@ -2048,8 +2229,12 @@ def process_owner_new(items, source, seen, seeded_flags):
     # Seed silently on the first real run, or when the search URL was changed (a new
     # URL matches many listings the bot never saw - most of them old). Existing
     # records are never overwritten.
+    # A seed that found nothing to record is still a seed (":seeded_empty"); without
+    # that marker every later run counted as "first run" and silently swallowed the
+    # first real listings instead of announcing them.
     has_recorded = bool(prefix) and any(k.startswith(prefix) for k in seen)
-    first_run = not seeded_flags.get(name) or (bool(prefix) and not has_recorded)
+    first_run = not seeded_flags.get(name) or (
+        bool(prefix) and not has_recorded and not seeded_flags.get(name + ":seeded_empty"))
     changed = _url_changed(seeded_flags, name, source.get("url"))
     if first_run or changed:
         n = 0
@@ -2059,6 +2244,10 @@ def process_owner_new(items, source, seen, seeded_flags):
                 seen[k] = {"url": l["url"], "first_seen": now, "source": name}
                 n += 1
         seeded_flags[name] = True
+        if n:
+            seeded_flags.pop(name + ":seeded_empty", None)
+        elif not has_recorded:
+            seeded_flags[name + ":seeded_empty"] = True
         why = "first run" if first_run else "search URL changed"
         log(f"{name}: {why} - recorded {n} current listings silently (no announcements)")
         return 0
@@ -2155,10 +2344,7 @@ def process_owner_new(items, source, seen, seeded_flags):
 
 
 def notify_new_owner_msg(l, name, owner_label="Əmlak sahibi"):
-    text = format_new_owner(l, name, owner_label)
-    if SEND_PHOTOS and l.get("photo"):
-        return tg_send_photo(l["photo"], text)
-    return tg_send_message(text)
+    return send_alert(format_new_owner(l, name, owner_label), l.get("photo"))
 
 
 def normalize_price(v):
@@ -2295,13 +2481,15 @@ def main():
         tg_send_message("⚠️ Memory storage not configured (GH_TOKEN/GH_REPO missing); listings "
                         "will repeat. Check the workflow env block.")
 
-    total_notified = 0
+    total_notified = flush_outbox(state)              # alerts Telegram refused last run
     status = state.setdefault("source_status", {})   # source name -> last error ("" = healthy)
     seeded_flags = state.setdefault("seeded", {})     # owner_new sources -> initial seed done
+    full_scans = state.setdefault("last_full_scan", {})
     for source in SOURCES:
         name = source["name"]
+        plan = plan_scan(source, state)
         try:
-            items = fetch_for_source(source)
+            items = fetch_for_source(source, plan)
         except PersistedQueryError:
             err = ("signature expired (persisted query). Re-capture it from the browser "
                    "Network tab and update BINA_PERSISTED_HASH.")
@@ -2322,13 +2510,15 @@ def main():
         if status.get(name):
             tg_send_message(f"✅ <b>{html.escape(name)}</b> is working again.")
         status[name] = ""
+        if plan.full:
+            full_scans[name] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         if source.get("mode") == "owner_new":
             total_notified += process_owner_new(items, source, seen, seeded_flags)
         elif source.get("mode") == "price_owner":
             # owner check must run BEFORE process_source seeds the new listings
             n_new, deferred, decided = process_new_owner_checks(
                 items, source, seen, seeded_flags,
-                tries_map=state.setdefault("owner_tries", {}))
+                tries_map=state.setdefault("owner_tries", {}), full_scan=plan.full)
             total_notified += n_new
             total_notified += process_source(items, source, seen, skip_ids=deferred,
                                              owner_map=decided)

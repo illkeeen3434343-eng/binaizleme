@@ -338,7 +338,7 @@ outbox = []
 mm.tg_send_message = lambda text: outbox.append(text) or True
 mm.tg_send_photo = lambda photo, cap: outbox.append(cap) or True
 feeds = {"tap.az": [], "lalafo.az": [], "yeniemlak.az": [], "bina.az": []}
-mm.fetch_for_source = lambda src: [dict(x) for x in feeds[src["name"]]]
+mm.fetch_for_source = lambda src, plan=None: [dict(x) for x in feeds[src["name"]]]
 install_tap(mm, tap_ad("Öz evimdi", multi=False))
 mm.check_is_owner = lambda url, label="": (setattr(mm.check_is_owner, "last_reason", "ok") or True, None)
 mm.bina_is_owner = lambda url: (setattr(mm.bina_is_owner, "last_reason", "ok") or True, None)
@@ -362,6 +362,167 @@ check(len(outbox) == run1 + 2, "run 3 sends nothing (no duplicates)", f"total={l
 st = json.load(open(mm.STATE_FILE, encoding="utf-8"))
 check(st["seeded"].get("tap.az:url") and st["seeded"].get("bina.az:url"),
       "URL fingerprints saved in state")
+
+# --------------------------------------------------------------------------- #
+print("\n[2026-10-20] Telegram retry + outbox")
+mq = load(os.path.join(HERE, "monitor.py"), "monitor_q")
+mq.time.sleep = lambda s: None                     # no real waiting in tests
+mq.PAGE_DELAY = 0
+
+
+class TR:
+    def __init__(self, code, body=None):
+        self.status_code, self._b, self.text = code, body or {}, json.dumps(body or {})
+
+    def json(self):
+        return self._b
+
+
+posts = []
+
+
+def tg_flaky(url, timeout=30, **kw):
+    posts.append(url)
+    return TR(429, {"parameters": {"retry_after": 3}}) if len(posts) == 1 else TR(200)
+
+
+mq.requests.post = tg_flaky
+check(mq.tg_send_message("x") and len(posts) == 2, "429 -> waits retry_after, then delivered",
+      f"posts={len(posts)}")
+mq._RUNTIME["state"] = st_q = {"listings": {}}
+mq.SEND_PHOTOS = False
+mq.requests.post = lambda url, timeout=30, **kw: TR(400, {"description": "can't parse entities"})
+check(mq.notify_new_owner_msg({"id": "0", "url": "https://tap.az/0", "price": 5}, "tap.az") is False
+      and not st_q.get("outbox"), "permanent rejection (400) is NOT queued (would never pass)")
+mq.requests.post = lambda url, timeout=30, **kw: TR(502)
+check(mq.notify_new_owner_msg({"id": "1", "url": "https://tap.az/1", "price": 5}, "tap.az") is False
+      and len(st_q.get("outbox", [])) == 1, "Telegram down (502) -> alert queued in state['outbox']")
+st_q["outbox"].append({"text": "ancient", "photo": None, "t": "2020-01-01T00:00:00+00:00"})
+delivered = []
+mq.requests.post = lambda url, timeout=30, **kw: delivered.append(kw["json"]["text"]) or TR(200)
+n_sent = mq.flush_outbox(st_q)
+check(n_sent == 1 and st_q["outbox"] == [] and "ancient" not in delivered,
+      "next run re-sends the queued alert, drops ones older than OUTBOX_MAX_AGE_H",
+      f"sent={n_sent} left={st_q['outbox']}")
+st_q["outbox"] = [{"text": "a", "t": iso(t_now)}, {"text": "b", "t": iso(t_now)}]
+mq.requests.post = lambda url, timeout=30, **kw: TR(502)
+mq.flush_outbox(st_q)
+check(len(st_q["outbox"]) == 2, "Telegram still down -> whole queue kept for later")
+st_q["outbox"] = [{"text": "poison", "t": iso(t_now)}, {"text": "good", "t": iso(t_now)}]
+delivered.clear()
+mq.requests.post = lambda url, timeout=30, **kw: (
+    TR(400) if kw["json"]["text"] == "poison" else delivered.append("good") or TR(200))
+mq.flush_outbox(st_q)
+check(delivered == ["good"] and st_q["outbox"] == [],
+      "a message Telegram rejects for good does not block the rest of the queue")
+
+print("\n[2026-10-20] bina page retry")
+calls_b = []
+
+
+def bina_get(url, params=None, headers=None, timeout=30):
+    calls_b.append(1)
+    if len(calls_b) < 3:
+        return TR(502)
+    return TR(200, {"data": {"itemsConnection": {"edges": [], "pageInfo": {}}}})
+
+
+mq.requests.get = bina_get
+check(mq._bina_page({}, None) is not None and len(calls_b) == 3,
+      "two failed responses then success -> page returned, scan continues")
+mq.requests.get = lambda url, params=None, headers=None, timeout=30: TR(
+    200, {"errors": [{"message": "PersistedQueryNotFound"}]})
+try:
+    mq._bina_page({}, None)
+    check(False, "expired persisted query raises PersistedQueryError")
+except mq.PersistedQueryError:
+    check(True, "expired persisted query raises PersistedQueryError (not retried)")
+
+print("\n[2026-10-20] quick vs full bina scans")
+
+
+def bina_pages(n_pages, per=16, start=6500000):
+    pages = []
+    for p in range(n_pages):
+        edges = [{"node": {"id": start - p * per - j, "path": f"/items/{start - p * per - j}",
+                           "price": {"total": 100000}, "rooms": 2}} for j in range(per)]
+        pages.append({"totalCount": n_pages * per, "edges": edges,
+                      "pageInfo": {"hasNextPage": p + 1 < n_pages, "endCursor": f"c{p + 1}"}})
+    return pages
+
+
+PAGES_B = bina_pages(10)
+read = []
+
+
+def fake_page(fv, cursor):
+    i = int(cursor[1:]) if cursor else 0
+    read.append(i)
+    return PAGES_B[i]
+
+
+mq._bina_page = fake_page
+known = {str(e["node"]["id"]): {"price": 100000} for pg in PAGES_B for e in pg["edges"]}
+new_id = str(PAGES_B[0]["edges"][0]["node"]["id"])
+known.pop(new_id)
+quick = mq.ScanPlan(False, known, "", owner_new=False)
+got = mq.fetch_bina("https://bina.az/x", quick)
+check(read == [0, 1, 2] and any(l["id"] == new_id for l in got),
+      "quick scan stops after the first all-known page (min 3 pages), new listing kept",
+      f"pages read={read}")
+read.clear()
+got = mq.fetch_bina("https://bina.az/x", mq.ScanPlan(True, known))
+check(len(read) == 10 and len(got) == 160, "full scan reads every page", f"pages read={len(read)}")
+read.clear()
+known.pop(str(PAGES_B[2]["edges"][5]["node"]["id"]))
+known.pop(str(PAGES_B[3]["edges"][5]["node"]["id"]))
+mq.fetch_bina("https://bina.az/x", mq.ScanPlan(False, known))
+check(read == [0, 1, 2, 3, 4], "quick scan keeps going while pages hold unknown listings",
+      f"pages read={read}")
+
+bsrc_q = {"name": "bina.az", "type": "bina", "prefix": "", "mode": "price_owner",
+          "url": "https://bina.az/x"}
+fp_b = mq._url_fingerprint(bsrc_q["url"])
+base = {"listings": {"1": {}}, "seeded": {"bina.az:owner_seeded": True, "bina.az:url": fp_b}}
+check(mq.plan_scan(bsrc_q, dict(base)).full, "no full pass recorded yet -> full")
+check(not mq.plan_scan(bsrc_q, dict(base, last_full_scan={"bina.az": iso(t_now - 600)})).full,
+      "full pass 10 min ago -> quick")
+check(mq.plan_scan(bsrc_q, dict(base, last_full_scan={"bina.az": iso(t_now - 7200)})).full,
+      "full pass 2 h ago -> full")
+check(mq.plan_scan(bsrc_q, dict(base, last_full_scan={"bina.az": iso(t_now - 600)},
+                                seeded={"bina.az:owner_seeded": True, "bina.az:url": "old"})).full,
+      "search URL changed -> full (the silent seed needs every page)")
+check(mq.plan_scan(dict(bsrc_q, name="yeniemlak.az", mode="owner_new", prefix="ye:"),
+                   dict(base, last_full_scan={"yeniemlak.az": iso(t_now - 600)})).full,
+      "sources not in QUICK_SCAN_SOURCES always scan fully")
+
+tries_q = {"6400001": 2}
+mq.bina_is_owner = lambda url: (setattr(mq.bina_is_owner, "last_reason", "ok") or True, None)
+mq.process_new_owner_checks([], bsrc_q, {}, {"bina.az:owner_seeded": True, "bina.az:url": fp_b},
+                            tries_map=tries_q, full_scan=False)
+check(tries_q == {"6400001": 2}, "quick scan does not reset retry counters of deeper listings")
+
+print("\n[2026-10-20] coverage warning sent once")
+warned = []
+mq.tg_send_message = lambda text: warned.append(text) or True
+mq._RUNTIME["state"] = st_c = {"listings": {}}
+mq._coverage_warn(100, 20000, True)
+mq._coverage_warn(100, 20000, True)
+check(len(warned) == 1, "SCAN_PAGES hit -> one Telegram warning, not one per run", str(len(warned)))
+mq._coverage_warn(100, 100, False)
+check("bina.az:coverage_warned" not in st_c["seeded"], "flag cleared once the scan fits again")
+
+print("\n[2026-10-20] empty first seed no longer swallows the first real posts")
+sent_q = []
+mq.notify_new_owner_msg = lambda l, n, ol="": sent_q.append(l["id"]) or True
+mq.tap_check_owner = lambda url, *a, **k: (True, None, None)
+tsrc_q = {"name": "tap.az", "type": "tap", "prefix": "tap:", "mode": "owner_new",
+          "owner_label": "Sahibindən", "url": "https://tap.az/x"}
+seen_q, flags_q = {}, {}
+mq.process_owner_new([], tsrc_q, seen_q, flags_q)            # first run: nothing matched
+mq.process_owner_new([{"id": "48900009", "url": "https://tap.az/9"}], tsrc_q, seen_q, flags_q)
+check(sent_q == ["48900009"], "first listing after an empty seed is announced", str(sent_q))
+mq._RUNTIME["state"] = None
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 sys.exit(1 if FAILS else 0)

@@ -88,6 +88,6 @@ grep -c '^Done\.' run.log 2>/dev/null | sed 's/^/  completed runs in log: /'
 echo "  last 10 run start times:"
 grep -n 'starting' run.log 2>/dev/null | tail -10 | sed 's/^/     /'
 echo
-echo "  NOTE: also check GitHub -> Actions tab. .github/workflows/monitor.yml still"
-echo "  exists with a cron schedule; if it is enabled it is a SECOND bot on a"
-echo "  datacenter IP writing to the repo seen.json."
+echo "  NOTE: the GitHub monitor workflow was removed (2026-10-20); GitHub only runs"
+echo "  the offline tests now. If the Actions tab still lists 'Bina.az Price Tracker'"
+echo "  runs, your copy is out of date - git pull."

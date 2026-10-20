@@ -88,7 +88,7 @@ print(report)
 
 if os.environ.get("TG") == "1":
     try:
-        m.tg_send(report)
+        m.tg_send_message(report)
         print("\n(sent to Telegram)")
     except Exception as e:
         print("telegram send failed:", e)

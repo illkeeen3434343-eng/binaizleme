@@ -1,0 +1,31 @@
+name: Tests
+
+# Offline regression tests: no network, no secrets, nothing is sent to Telegram.
+# The bot itself runs on the VM from cron, not on GitHub.
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Pipeline tests
+        run: python test_pipeline.py
+      - name: Owner-detection tests
+        run: python test_owner_detect.py

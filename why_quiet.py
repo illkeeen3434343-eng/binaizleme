@@ -29,7 +29,7 @@ tok, chat = (m.BOT_TOKEN or ""), (m.CHAT_ID or "")
 print("  token set:", bool(tok), "| chat set:", bool(chat))
 if "\r" in tok or "\r" in chat or tok != tok.strip() or chat != chat.strip():
     print("  !! token/chat contains stray whitespace or \\r  -> run: sed -i 's/\\r$//' .env")
-ok = m.tg_send(f"health probe {dt.datetime.now().strftime('%H:%M')} - if you see this, delivery works")
+ok = m.tg_send_message(f"health probe {dt.datetime.now().strftime('%H:%M')} - if you see this, delivery works")
 print("  test message sent:", ok)
 
 # --- 3. what is the pipeline doing with the newest listings? ---

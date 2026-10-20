@@ -1,0 +1,13 @@
+# secrets and local environment (VM)
+.env
+.venv/
+__pycache__/
+
+# runtime files written by the bot on the VM
+run.log
+*.log
+seen.json.tmp
+seen.json.bak-*
+seen.json.CORRUPT-*
+backups/
+monitor.before.py
