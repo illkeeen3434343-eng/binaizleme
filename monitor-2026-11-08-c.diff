@@ -1,0 +1,173 @@
+--- /mnt/user-data/outputs/2026-11-08-b/monitor.py	2026-11-07 21:32:15.920907000 +0000
++++ monitor.py	2026-11-07 22:10:21.147678439 +0000
+@@ -25,7 +25,7 @@
+ 
+ import requests
+ 
+-VERSION = "2026-11-08-b"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-08-c"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -1408,16 +1408,64 @@
+ 
+ 
+ TAP_PROFILE_BROWSER = os.environ.get("TAP_PROFILE_BROWSER", "0").strip() == "1"
+-TAP_PROFILE_MAX_PER_RUN = int(os.environ.get("TAP_PROFILE_MAX_PER_RUN", "5"))
++TAP_PROFILE_MAX_PER_RUN = int(os.environ.get("TAP_PROFILE_MAX_PER_RUN", "8"))
+ TAP_PROFILE_TTL_DAYS = float(os.environ.get("TAP_PROFILE_TTL_DAYS", "3"))
++# What counts toward the "3 or more = agent" rule when the profile is read:
++#   apartments  only flats (Mənzillər)                                  [default]
++#   property    every real-estate ad (flats, houses, offices, land, ...)
++# Ads outside real estate (phones, cars, furniture) never count.
++TAP_COUNT_SCOPE = os.environ.get("TAP_COUNT_SCOPE", "apartments").strip().lower()
++TAP_PROFILE_URL = os.environ.get("TAP_PROFILE_URL", "https://tap.az/elanlar?user_id={uid}")
+ _PROFILE_RUN = {"used": 0, "warned": False}
+ _RUNTIME = {"state": None}          # set by main(): lets helpers keep small caches in state
++_TAP_AD_LINK = re.compile(
++    r'href="(?:https?://(?:www\.)?tap\.az)?/elanlar/([a-z0-9-]+)/([a-z0-9-]+)/(\d+)[^"]*"')
++
++
++def _tap_profile_count_from_html(rendered, scope=None):
++    """Count a seller's ads on their rendered profile page. Returns (count, detail);
++    count None = cannot be trusted.
++
++    Verified 8 Nov 2026 (diag_tap_profile.py): the profile says "6 elan" and lists
++    exactly those 6 ads (seller 6638901: 1 flat, 2 houses, 2 offices, 1 land plot);
++    an empty profile says "0 elan" and lists nothing (22702915). Rules:
++      * more ad links than the profile's own total -> someone else's ads on the page
++        (e.g. a VIP block) -> not trusted
++      * count already >= the limit -> enough to decide, even if the list is partial
++      * whole list visible (links == total) -> exact, may be 0
++      * otherwise (list only partly loaded, count below the limit) -> not trusted"""
++    scope = (scope or TAP_COUNT_SCOPE)
++    if _tap_blocked(rendered):
++        return None, {"why": "blocked"}
++    ads = {}
++    for cat, sub, iid in _TAP_AD_LINK.findall(rendered or ""):
++        ads[iid] = (cat, sub)
++    flats = {i for i, (c, s_) in ads.items() if c == "dasinmaz-emlak" and s_ == "menziller"}
++    prop = {i for i, (c, s_) in ads.items() if c == "dasinmaz-emlak"}
++    text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", rendered or "")))
++    totals = {int(x) for x in re.findall(r"\b(\d+)\s+elan\b", text)}
++    total = totals.pop() if len(totals) == 1 else None
++    n = len(prop) if scope == "property" else len(flats)
++    detail = {"total": total, "links": len(ads), "flats": len(flats), "property": len(prop),
++              "scope": scope}
++    if total is not None and len(ads) > total:
++        detail["why"] = "foreign ads on the page"
++        return None, detail
++    if n >= TAP_MAX_APARTMENTS:
++        return n, detail
++    if total is not None and len(ads) == total:
++        return n, detail
++    detail["why"] = "list not fully loaded"
++    return None, detail
+ 
+ 
+ def tap_profile_count_browser(user_id):
+     """Open the seller's profile in headless Chromium (the page builds its list with
+-    JavaScript) and count APARTMENT links. None if playwright is missing or the page
+-    cannot be rendered. Only used when TAP_PROFILE_BROWSER=1."""
++    JavaScript), wait until it has finished loading, scroll until the whole list is
++    there, then count (see _tap_profile_count_from_html). None if playwright is
++    missing or the result cannot be trusted. Only used when TAP_PROFILE_BROWSER=1.
++    (2026-11-08-c: the old version waited for the first "/elanlar/" link - the site
++    menu has one - so it could count before the seller's ads had loaded.)"""
+     try:
+         from playwright.sync_api import sync_playwright
+     except Exception as e:
+@@ -1426,38 +1474,59 @@
+             log("tap profile browser unavailable (pip install playwright && "
+                 "playwright install chromium):", e)
+         return None
++    rendered = ""
+     try:
+         with sync_playwright() as p:
+             browser = p.chromium.launch(headless=True)
+             try:
+-                page = browser.new_page(user_agent=UA, locale="az-AZ")
+-                page.goto(f"https://tap.az/elanlar?user_id={user_id}",
++                page = browser.new_page(user_agent=UA, locale="az-AZ",
++                                        viewport={"width": 1280, "height": 2200})
++                page.goto(TAP_PROFILE_URL.format(uid=user_id),
+                           wait_until="domcontentloaded", timeout=45000)
+                 try:
+-                    page.wait_for_selector('a[href*="/elanlar/"]', timeout=15000)
++                    page.wait_for_load_state("networkidle", timeout=20000)
+                 except Exception:
+                     pass
+-                page.wait_for_timeout(2500)
++                for _ in range(8):              # scroll only while ads are still missing
++                    rendered = page.content()
++                    n, d = _tap_profile_count_from_html(rendered)
++                    if n is not None or d.get("why") in ("blocked", "foreign ads on the page"):
++                        break
++                    page.mouse.wheel(0, 4000)
++                    page.wait_for_timeout(1200)
++                    try:
++                        page.wait_for_load_state("networkidle", timeout=5000)
++                    except Exception:
++                        pass
+                 rendered = page.content()
+             finally:
+                 browser.close()
+     except Exception as e:
+         log(f"tap profile browser error for user {user_id}:", e)
+         return None
+-    if _tap_blocked(rendered):
+-        return None
+-    ids = set(re.findall(r"/elanlar/dasinmaz-emlak/menziller/(\d+)", rendered))
+-    tap_profile_count_browser.last_ids = sorted(ids)      # for verify_tap_profile.py
+-    return len(ids) if ids else None    # >= 1 always (their own ad) or unreadable
++    n, detail = _tap_profile_count_from_html(rendered)
++    tap_profile_count_browser.last_detail = detail
++    counted = sorted({(i, f"https://tap.az/elanlar/{c}/{s_}/{i}")
++                      for c, s_, i in _TAP_AD_LINK.findall(rendered)
++                      if c == "dasinmaz-emlak"
++                      and (TAP_COUNT_SCOPE == "property" or s_ == "menziller")})
++    tap_profile_count_browser.last_ids = [i for i, _u in counted]
++    tap_profile_count_browser.last_links = [u for _i, u in counted]
++    if n is None:
++        log(f"tap.az: seller {user_id} profile not trusted ({detail.get('why')}; {detail})")
++    return n
+ 
+ 
+ tap_profile_count_browser.last_ids = []
++tap_profile_count_browser.last_links = []
++tap_profile_count_browser.last_detail = {}
+ 
+ 
+ def tap_apartment_count(user_id, cache):
+-    """How many APARTMENTS this tap.az seller has for sale, from their profile.
++    """How many APARTMENTS (or, with TAP_COUNT_SCOPE=property, real-estate ads) this
++    tap.az seller has, from their profile.
+ 
+-    Returns an int >= 1, or None when unknown. Plain HTTP can NOT read this: the
++    Returns an int >= 0, or None when unknown. Plain HTTP can NOT read this: the
+     category URL ignores user_id (it returns the general Baku feed - counting that
+     made every seller look like a 28-apartment agent), and the real profile page is
+     rendered by JavaScript. So: per-run cache -> saved cache (TTL) -> headless
+@@ -1469,7 +1538,7 @@
+     saved = st.setdefault("tap_profiles", {}) if isinstance(st, dict) else {}
+     ent = saved.get(str(user_id))
+     fresh = False
+-    if isinstance(ent, dict):
++    if isinstance(ent, dict) and ent.get("scope", "apartments") == TAP_COUNT_SCOPE:
+         t = _to_epoch(ent.get("t"))
+         fresh = t is not None and (time.time() - t) <= TAP_PROFILE_TTL_DAYS * 86400
+     if fresh:
+@@ -1478,9 +1547,11 @@
+         _PROFILE_RUN["used"] += 1
+         n = tap_profile_count_browser(user_id)
+         if n is not None:
+-            saved[str(user_id)] = {"n": n, "t": dt.datetime.now(dt.timezone.utc)
++            saved[str(user_id)] = {"n": n, "scope": TAP_COUNT_SCOPE,
++                                   "t": dt.datetime.now(dt.timezone.utc)
+                                    .isoformat(timespec="seconds")}
+-            log(f"tap.az: seller {user_id} profile shows {n} apartment(s)")
++            what = "real-estate ad(s)" if TAP_COUNT_SCOPE == "property" else "apartment(s)"
++            log(f"tap.az: seller {user_id} profile shows {n} {what}")
+     cache[user_id] = n
+     return n
+ 

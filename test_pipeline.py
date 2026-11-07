@@ -912,6 +912,70 @@ with contextlib.redirect_stdout(io.StringIO()):
 check(msgs16 and "99 000 AZN" in msgs16[0] and "Əhmədli m." in msgs16[0],
       "values the card already had are kept (page only fills gaps)")
 
+print("\n[NOV-17] tap seller profile count (browser page) - what is trusted")
+
+
+def tap_profile(total, links, extra=""):
+    nav = '<nav><a href="/elanlar">Elanlar</a><a href="/elanlar/dasinmaz-emlak">Daşınmaz</a></nav>'
+    cards = "".join(f'<a href="/elanlar/{c}/{s_}/{i}"><img></a><a href="/elanlar/{c}/{s_}/{i}">ad</a>'
+                    for c, s_, i in links)
+    return f"<html>{nav}<h1>İstifadəçinin elanları</h1><div>{total} elan</div>{cards}{extra}</html>"
+
+
+D_ = "dasinmaz-emlak"
+deniz = tap_profile(6, [(D_, "obyektler-ve-ofisler", 1), (D_, "obyektler-ve-ofisler", 2),
+                        (D_, "heyet-evleri", 3), (D_, "heyet-evleri", 4), (D_, "torpaq-sahesi", 5),
+                        (D_, "menziller", 48826143)])
+mp = load(os.path.join(HERE, "monitor.py"), "monitor_profile")
+n_, d_ = mp._tap_profile_count_from_html(deniz, "apartments")
+check(n_ == 1 and d_["total"] == 6 and d_["links"] == 6, "6638901 today: 6 ads, 1 flat -> 1 (flats only)",
+      str(d_))
+check(mp._tap_profile_count_from_html(deniz, "property")[0] == 6,
+      "same seller with TAP_COUNT_SCOPE=property -> 6 -> agent")
+check(mp._tap_profile_count_from_html(tap_profile(0, []), "apartments")[0] == 0,
+      "22702915 today: '0 elan', nothing listed -> 0 (exact)")
+part = tap_profile(40, [(D_, "menziller", 10 + i) for i in range(2)]
+                   + [("elektronika", "telefonlar", 50 + i) for i in range(22)])
+check(mp._tap_profile_count_from_html(part, "apartments")[0] is None,
+      "list only partly loaded and below the limit -> not trusted")
+big = tap_profile(40, [(D_, "menziller", 100 + i) for i in range(10)])
+check(mp._tap_profile_count_from_html(big, "apartments")[0] == 10,
+      "partly loaded but already 10 flats -> enough to call it an agent")
+vip = tap_profile(2, [(D_, "menziller", 700 + i) for i in range(5)])
+check(mp._tap_profile_count_from_html(vip, "apartments")[0] is None,
+      "more ads on the page than the seller has (someone else's block) -> not trusted")
+check(mp._tap_profile_count_from_html("<html>Just a moment... cf-chl</html>", "apartments")[0] is None,
+      "blocked page -> not trusted")
+phones = tap_profile(3, [(D_, "menziller", 900), ("elektronika", "telefonlar", 901),
+                         ("neqliyyat", "avtomobiller", 902)])
+check(mp._tap_profile_count_from_html(phones, "property")[0] == 1,
+      "phones and cars never count, even with TAP_COUNT_SCOPE=property")
+mp._RUNTIME["state"] = {"tap_profiles": {"555": {"n": 1, "t": iso(time.time())},
+                                         "556": {"n": 6, "scope": "property", "t": iso(time.time())}}}
+mp.TAP_PROFILE_BROWSER = False
+check(mp.tap_apartment_count("555", {}) == 1 and mp.tap_apartment_count("556", {}) is None,
+      "saved counts are only reused for the same rule (flats vs all property)")
+mp.TAP_PROFILE_BROWSER = True
+mp._RUNTIME["state"] = {"tap_profiles": {}}
+browser_n = {"v": 6}
+mp.tap_profile_count_browser = lambda uid: browser_n["v"]
+install_tap(mp, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Dəniz Xanim", uid="6638901"))
+v17, _p, _s = mp.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menziller/48826143", {}, {},
+                                 listing={"id": "48826143"})
+check(v17 is False, "browser on: profile shows 6 -> AGENT (was 'unknown -> owner')", V[v17])
+mp._RUNTIME["state"] = {"tap_profiles": {}}
+browser_n["v"] = 1
+v17b, _p, _s = mp.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menziller/48826144", {}, {},
+                                  listing={"id": "48826144"})
+check(v17b is True and "count:1-apartment(s)-ok" in mp.tap_check_owner.last_reasons,
+      "browser on: profile shows 1 -> owner (now verified)", str(mp.tap_check_owner.last_reasons))
+mp._RUNTIME["state"] = {"tap_profiles": {}}
+browser_n["v"] = None
+v17c, _p, _s = mp.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menziller/48826145", {}, {},
+                                  listing={"id": "48826145"})
+check(v17c is True and "count-unknown:defaulted-to-owner" in mp.tap_check_owner.last_reasons,
+      "browser could not tell -> same as today (owner by default)")
+
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
 install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))
