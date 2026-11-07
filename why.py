@@ -31,21 +31,28 @@ def keys_for(arg):
 
 
 def explain(rec):
-    if "skip" in rec and str(rec["skip"]).startswith("old"):
-        return f"NOT ANNOUNCED - not a new ad ({rec['skip']}): an old ad lifted by bump/VIP/edit"
+    if rec.get("recovered"):
+        return f"SENT by recover_missed.py on {rec['recovered'][:10]} (was wrongly filed earlier)"
     if rec.get("owner") is True:
-        return "ANNOUNCED as an owner post"
+        return "SENT as an owner post (never sent twice)"
     if rec.get("owner") is False:
-        why = rec.get("skip") or "judged an agent (see the tap/lalafo log line below)"
-        return f"NOT ANNOUNCED - {why}"
+        why = rec.get("skip") or "judged an agent (see the log line below for the reasons)"
+        extra = "; re-checked by recover_missed.py" if rec.get("rechecked") else ""
+        return f"NOT SENT - {why}{extra}"
     if "owner" in rec and rec.get("owner") is None:
-        return (f"UNDECIDED after {rec.get('tries', 0)} read(s) - page had no clear "
-                "seller signal; retried until 4 reads")
+        t = rec.get("tries", rec.get("owner_tries", 0))
+        return (f"UNDECIDED after {t} read(s) - the page had no clear seller signal"
+                + ("; retried up to 4 reads" if t < 4 else "; gave up"))
+    if str(rec.get("skip", "")).startswith("old"):
+        return ("HIDDEN by 2026-10-18-a as 'not new' (that rule was wrong). From 2026-11-07-a "
+                "it is checked and, if an owner ad, sent once - marked old - the next time "
+                "it appears in the search")
+    base = ("RECORDED SILENTLY (first run, search-URL change, or no seller label) - never sent. "
+            "It is sent once, marked old, if its owner renews it (yeniemlak/lalafo) or puts "
+            "it on VIP/Premium (bina)")
     if rec.get("price_history") is not None:
-        return ("RECORDED by the bina price tracker without an owner verdict (first run, "
-                "URL change, or 'no seller label after 4 reads')")
-    return ("RECORDED SILENTLY - seeded on a first run / search-URL change, never "
-            "announced by design")
+        base += "; bina also tracks its price"
+    return base
 
 
 def main():

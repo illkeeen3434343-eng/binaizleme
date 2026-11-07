@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-10-18-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-07-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -837,7 +837,8 @@ def _parse_lalafo_page(raw):
                     "_text": f"{title} {desc}",
                     # lalafo keeps the ORIGINAL creation date when an ad is edited
                     # (ad 42756259: created 22.12.2025, updated 15.10.2026)
-                    "created_ts": _to_epoch(it.get("created_time"))})
+                    "created_ts": _to_epoch(it.get("created_time")),
+                    "updated_ts": _to_epoch(it.get("updated_time"))})
     # Does a genuine next page exist? Prefer the server's own "next" link; fall
     # back to page counters. When false, the next ?page= would be filler content.
     has_next = bool(links.get("next"))
@@ -1838,7 +1839,17 @@ check_is_owner.last_reason = ""
 
 
 def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
-    lines = [f"‼️ <b>Yeni elan</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
+    # Ads older than NEW_MAX_AGE_DAYS (renewed, bumped, VIP/Premium, or missed earlier)
+    # are still sent - once - but marked so you can tell them from brand-new ones.
+    age = l.get("_age_days")
+    old = isinstance(age, (int, float)) and age > NEW_MAX_AGE_DAYS
+    head = "♻️ <b>Yenilənmiş elan</b>" if old else "‼️ <b>Yeni elan</b>"
+    lines = [f"{head} · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
+    if old:
+        pre = "ən azı " if l.get("_age_kind") == "min" else "~"
+        lines.append(f"🕓 <b>Yerləşdirilib:</b> {pre}{max(1, int(round(age)))} gün əvvəl")
+    if l.get("_note"):
+        lines.append(f"ℹ️ {html.escape(str(l['_note']))}")
     if l.get("price") is not None:
         lines.append(f"💰 <b>Qiymət:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
     if l.get("rooms") is not None:
@@ -1879,13 +1890,28 @@ def _seller_counts(seen):
 NEW_MAX_AGE_DAYS = float(os.environ.get("NEW_MAX_AGE_DAYS", "3"))
 
 
+OLD_MAX_PER_RUN = int(os.environ.get("OLD_MAX_PER_RUN", "15"))     # per source per run
+IDCLOCK_GAP_MULT = float(os.environ.get("IDCLOCK_GAP_MULT", "50"))
+
+
 class IdClock:
+    """LOWER BOUND on a listing's age, learned from our own history. Used ONLY to label
+    messages; it can never hide an ad.
+
+    Within one id series, ids grow over time: if we recorded an id y >= x at time t,
+    listing x already existed at t. But a site can run SEVERAL series at once
+    (yeniemlak: sequential 1xx,xxx-2xx,xxx plus a separate 9xx,xxx range). The
+    2026-10-18-a version used the earliest time ANY larger id was seen, so 9xx ids
+    recorded in August made every new yeniemlak ad look ~75 days old and hid it
+    (ad 234096, Nov 2026). Now only ids a short distance above x count (same series);
+    with no close neighbour the age is unknown."""
+
     def __init__(self):
-        self.ts, self.ids = [], []         # parallel lists; ids strictly increasing
+        self.ids, self.ts, self.gap = [], [], 0      # sorted by id; gap in id units
 
     @classmethod
     def from_seen(cls, seen, source_name, prefix):
-        pts = []
+        best = {}
         for k, v in seen.items():
             if not isinstance(v, dict) or v.get("source") != source_name:
                 continue
@@ -1895,28 +1921,114 @@ class IdClock:
             if not num.isdigit():
                 continue
             t = _to_epoch(v.get("first_seen"))
-            if t is not None:
-                pts.append((t, int(num)))
-        pts.sort()
+            if t is None:
+                continue
+            i = int(num)
+            if i not in best or t < best[i]:
+                best[i] = t
         c = cls()
-        for t, i in pts:
-            if not c.ids or i > c.ids[-1]:
-                c.ts.append(t)
-                c.ids.append(i)
+        c.ids = sorted(best)
+        c.ts = [best[i] for i in c.ids]
+        if len(c.ids) >= 3:
+            diffs = sorted(b - a for a, b in zip(c.ids, c.ids[1:]))
+            c.gap = max(1, int(diffs[len(diffs) // 2] * IDCLOCK_GAP_MULT))
         return c
 
     def age_days(self, iid, now_ts):
-        """Lower bound on the age of listing `iid` in days; None if no history."""
+        """Lower bound on the age of listing `iid` in days; None if unknown."""
         try:
             iid = int(iid)
         except (TypeError, ValueError):
             return None
-        if not self.ids:
+        if not self.ids or self.gap <= 0:
             return None
-        idx = bisect.bisect_left(self.ids, iid)
-        if idx >= len(self.ids):
-            return 0.0                     # newer than anything we have ever seen
-        return max(0.0, (now_ts - self.ts[idx]) / 86400.0)
+        j = bisect.bisect_left(self.ids, iid)
+        earliest = None
+        while j < len(self.ids) and self.ids[j] - iid <= self.gap:
+            if earliest is None or self.ts[j] < earliest:
+                earliest = self.ts[j]
+            j += 1
+        if earliest is None:
+            return None
+        return max(0.0, (now_ts - earliest) / 86400.0)
+
+
+_BAKU_TZ = dt.timezone(dt.timedelta(hours=4))
+
+
+def _dmy_epoch(v):
+    """'06.11.2026' (Baku date) -> epoch of that day's 00:00 Baku; None if unusable."""
+    m_ = re.fullmatch(r"\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*", str(v or ""))
+    if not m_:
+        return None
+    try:
+        return dt.datetime(int(m_.group(3)), int(m_.group(2)), int(m_.group(1)),
+                           tzinfo=_BAKU_TZ).timestamp()
+    except ValueError:
+        return None
+
+
+def _age_estimate(l, clock, now_ts, rec=None):
+    """(age_days or None, kind). kind "exact" = the site's creation date (lalafo);
+    "min" = a lower bound (our id history, or when we first recorded the ad)."""
+    created = l.get("created_ts")
+    if isinstance(created, (int, float)) and created > 0:
+        return max(0.0, (now_ts - created) / 86400.0), "exact"
+    a = clock.age_days(l.get("id"), now_ts) if clock is not None else None
+    fs = _to_epoch((rec or {}).get("first_seen"))
+    if fs is not None:
+        b = max(0.0, (now_ts - fs) / 86400.0)
+        a = b if a is None else max(a, b)
+        # tap.az has ONE id series, so the age 2026-10-18-a wrote when it hid an ad
+        # ("old ~100d") was a valid lower bound. NOT for yeniemlak: there it came from
+        # the two-series bug (new ads were written down as "old ~75d").
+        sk = re.match(r"old ~(\d+)d", str((rec or {}).get("skip", "")))
+        if sk and (rec or {}).get("source") == "tap.az":
+            c = float(sk.group(1)) + b
+            a = max(a, c)
+    return a, "min"
+
+
+def _renewed_since_recorded(stype, l, rec, now_ts):
+    """A listing we recorded silently (never sent) that its owner renewed or bumped
+    AFTER we recorded it, recently. Only for sites that publish a trustworthy date:
+    yeniemlak "Tarix" (posted/renewed date, ad 152232: recorded 24 Aug, Tarix 06.11)
+    and lalafo updated_time."""
+    fs = _to_epoch(rec.get("first_seen"))
+    if fs is None:
+        return False
+    if stype == "yeniemlak":
+        d = _dmy_epoch(l.get("updated_at"))
+        return (d is not None and d >= fs + 2 * 86400
+                and now_ts - d <= (NEW_MAX_AGE_DAYS + 1) * 86400)
+    if stype == "lalafo":
+        u = l.get("updated_ts")
+        return (isinstance(u, (int, float)) and u >= fs + 86400
+                and now_ts - u <= NEW_MAX_AGE_DAYS * 86400)
+    return False
+
+
+def _candidate_kind(stype, l, rec, now_ts):
+    """Why this listing should be looked at now - or None.
+      new      never recorded
+      retry    an earlier check was inconclusive (tries left)
+      hidden   recorded by 2026-10-18-a as "not new" and never checked or sent
+      renewed  recorded silently, then renewed/bumped by its owner
+    A listing that was sent (owner True) or judged an agent (owner False) is never
+    looked at again: nothing is ever sent twice."""
+    if rec is None:
+        return "new"
+    if rec.get("owner") is True or rec.get("owner") is False:
+        return None
+    if _is_retryable(rec):
+        return "retry"
+    if "owner" in rec:
+        return None                        # inconclusive after max reads: gave up
+    if str(rec.get("skip", "")).startswith("old"):
+        return "hidden"
+    if _renewed_since_recorded(stype, l, rec, now_ts):
+        return "renewed"
+    return None
 
 
 def listing_age_days(l, clock, now_ts):
@@ -2023,15 +2135,64 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
         if not owner:
             log(f"{name}: {l['url']} -> AGENT (not announced)")
         if owner:
-            if is_stale_promoted(l):
-                age = _listing_age_days(l)
-                log(f"{name}: {l['url']} -> promoted bump of a ~{age:.0f}-day-old ad; "
-                    f"recorded, not announced")
-                continue              # seeded by process_source; never announced as new
+            age = _listing_age_days(l)
+            if age is not None and age > NEW_MAX_AGE_DAYS:
+                # old ad (promoted or not) that you were never sent: send, marked old
+                l["_age_days"], l["_age_kind"] = age, "approx"
             if photo:
                 l["photo"] = photo    # keep API photo if detail gave none
             if notify_new_owner_msg(l, name, owner_label):
                 notified += 1
+
+    # Known listings you were NEVER sent (recorded silently: first run, URL change,
+    # or no seller label) that are now VIP/Premium: the owner paid to lift an old ad.
+    # Check each one once; owners are sent once, marked old. Capped per run.
+    now_ts = time.time()
+    old_used = 0
+    for l in items:
+        if (checks >= MAX_OWNER_CHECKS or fail_streak >= OWNER_FETCH_FAIL_STREAK
+                or old_used >= OLD_MAX_PER_RUN):
+            break
+        if not l.get("_promoted"):
+            continue
+        rec = seen.get(prefix + str(l["id"]))
+        if rec is None or "owner" in rec:
+            continue                  # new (handled above), or already decided/sent
+        old_used += 1
+        if source.get("type") == "bina":
+            owner, photo = bina_is_owner(l["url"])
+            reason = getattr(bina_is_owner, "last_reason", "")
+        else:
+            owner, photo = check_is_owner(l["url"], owner_label)
+            reason = getattr(check_is_owner, "last_reason", "")
+        checks += 1
+        if PAGE_DELAY:
+            time.sleep(PAGE_DELAY)
+        if owner is None:
+            if reason == "fetch":
+                fail_streak += 1      # page not read: retry next run, no try used
+                continue
+            fail_streak = 0
+            rec["owner_tries"] = rec.get("owner_tries", 0) + 1
+            if rec["owner_tries"] >= OWNER_MAX_TRIES:
+                rec["owner"] = None   # gave up: never looked at again
+            continue
+        fail_streak = 0
+        rec["owner"] = bool(owner)    # decided: never looked at again, never sent twice
+        if not owner:
+            continue
+        age = _listing_age_days(l)
+        fs = _to_epoch(rec.get("first_seen"))
+        if fs is not None:
+            seen_days = max(0.0, (now_ts - fs) / 86400.0)
+            age = seen_days if age is None else max(age, seen_days)
+        if age is not None and age > NEW_MAX_AGE_DAYS:
+            l["_age_days"], l["_age_kind"] = age, "approx"
+        if photo:
+            l["photo"] = photo
+        log(f"{name}: {l['url']} -> VIP/Premium owner ad never sent before; sending once")
+        if notify_new_owner_msg(l, name, owner_label):
+            notified += 1
     if checks or deferred:
         log(f"{name}: owner-checked {checks} new, announced {notified}, "
             f"deferred {len(deferred)}")
@@ -2067,22 +2228,31 @@ def process_owner_new(items, source, seen, seeded_flags):
     seller_apts = _seller_apartments(seen) if stype == "tap" else {}
     tap_profile_cache = {}
     clock = IdClock.from_seen(seen, name, prefix)
-    checks = notified = fail_streak = 0
+    checks = notified = fail_streak = old_used = 0
     for l in items:
         key = prefix + str(l["id"])
         rec = seen.get(key)
-        if rec is not None and not _is_retryable(rec):
-            continue                       # known: announced, rejected, seeded or given up
+        kind = _candidate_kind(stype, l, rec, now_ts)
+        if kind is None:
+            continue                       # sent, agent, given up, or quietly known
         first_seen = (rec or {}).get("first_seen", now)
 
-        # Really new? An old ad lifted by İrəli çək / VIP / Premium / an edit is
-        # recorded quietly and never announced as "Yeni elan".
-        age = listing_age_days(l, clock, now_ts)
-        if age is not None and age > NEW_MAX_AGE_DAYS:
-            seen[key] = {"url": l["url"], "first_seen": first_seen, "source": name,
-                         "skip": f"old ~{age:.0f}d"}
-            log(f"{name}: {l['url']} -> not new (~{age:.0f} days old); recorded, not announced")
-            continue
+        # An OLD ad you were never sent (renewed, İrəli çək, VIP/Premium, or missed
+        # earlier) is sent once, marked old. Age only chooses the label. Old ads are
+        # capped per run so brand-new ones are never delayed behind a backlog.
+        age, age_kind = _age_estimate(l, clock, now_ts, rec)
+        is_old = age is not None and age > NEW_MAX_AGE_DAYS
+        if is_old or kind in ("hidden", "renewed"):
+            if old_used >= OLD_MAX_PER_RUN:
+                continue                   # not recorded: looked at again next run
+            old_used += 1
+        if is_old:
+            l["_age_days"], l["_age_kind"] = age, age_kind
+        if kind == "hidden":
+            l["_note"] = "Bu elan əvvəl göndərilməmişdi"
+        if kind != "new":
+            log(f"{name}: {l['url']} -> looking again ({kind}"
+                + (f", ~{age:.0f} days old" if age is not None else "") + ")")
 
         if prefiltered:
             # "prefiltered" only means the SEARCH URL asked for owner posts. lalafo still

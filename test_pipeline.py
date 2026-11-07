@@ -75,7 +75,9 @@ def install_tap(mod, ad_html):
 AD_48628115 = tap_ad("Neftçilər metrosuna 5 dəqiqə. Maklerlər yazmasın. WhatsApp aktivdir")
 OLD_PATH = os.path.join(HERE, "monitor.before.py")      # optional: the 2026-09-08-c file
 old = load(OLD_PATH, "monitor_before") if os.path.exists(OLD_PATH) else None
-if old is not None:
+OLD_V = getattr(old, "VERSION", "") if old is not None else ""
+# Each "OLD code" proof only applies to the version that had that bug.
+if old is not None and OLD_V < "2026-10-18-a":
     print("\n[C1] tap profile count - the production bug, reproduced on the OLD code")
     install_tap(old, AD_48628115)
     v_old, _, _ = old.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menziller/48628115", {}, {})
@@ -168,7 +170,7 @@ for page, want, label in [(OWNER_PAGE, True, "owner who writes 'Vasitəçilər n
     m.http_get = lambda url, headers=None, params=None, timeout=30, browser=False, _p=page: R(_p)
     v, _ = m.bina_is_owner("https://bina.az/items/1")
     check(v is want, label, f"{V[v]} via {m.bina_is_owner.last_reason}")
-if old is not None:
+if old is not None and OLD_V < "2026-10-18-a":
     old.http_get = lambda url, headers=None, params=None, timeout=30, browser=False: R(
         '<html><div>Mülkiyyətçi</div><p>Vasitəçilər narahat etməsin</p></html>' + "x" * 2000)
     v_old, _ = old.bina_is_owner("https://bina.az/items/1")
@@ -200,7 +202,7 @@ check(not m._is_retryable({"owner": None, "tries": 4}), "undecided after max tri
 check(not m._is_retryable({"url": "u"}), "record without owner key is NOT retried")
 
 # --------------------------------------------------------------------------- #
-print("\n[C10] really-new guard")
+print("\n[C10] age estimate (2026-11-07-a: labels only, never hides an ad)")
 day = 86400.0
 t_now = time.time()
 
@@ -215,14 +217,16 @@ hist = {f"tap:{48000000 + i * 10000}": {"source": "tap.az", "first_seen": iso(t_
 clock = m.IdClock.from_seen(hist, "tap.az", "tap:")
 a_new = clock.age_days(48400000 + 5000, t_now)
 a_old = clock.age_days(48290603, t_now)        # bumped ad seen on tap page 1 (18 Oct)
-check(a_new is not None and a_new <= 1.01, "id newer than our latest -> age ~0", f"{a_new:.2f}")
+check(a_new is None or a_new <= 1.01, "id newer than our latest -> unknown/new", str(a_new))
 check(a_old is not None and a_old > 3, "old bumped id -> clearly older than 3 days", f"{a_old:.1f}")
-check(clock.age_days(99999999, t_now) == 0.0, "brand-new id above all history -> 0")
+check(clock.age_days(99999999, t_now) is None, "id far above all history -> unknown (new)")
 check(m.IdClock().age_days(5, t_now) is None, "no history -> unknown (never suppress)")
 old_lalafo = {"created_ts": t_now - 300 * day}
 check(m.listing_age_days(old_lalafo, None, t_now) > 299, "lalafo creation date wins")
 
 sent.clear()
+got = []
+m.notify_new_owner_msg = lambda l, n, ol="": (sent.append(l["id"]), got.append(dict(l)))[0] or True
 tsrc = {"name": "tap.az", "type": "tap", "prefix": "tap:", "mode": "owner_new",
         "owner_label": "Sahibindən", "url": "https://tap.az/x"}
 seen3 = dict(hist)
@@ -233,11 +237,17 @@ bumped = {"id": "48290603", "url": "https://tap.az/elanlar/dasinmaz-emlak/menzil
 fresh = {"id": "48405000", "url": "https://tap.az/elanlar/dasinmaz-emlak/menziller/48405000",
          "rooms": 3, "area": 75}
 m.process_owner_new([bumped, fresh], tsrc, seen3, flags3)
-check(sent == ["48405000"], "bumped old owner ad suppressed, fresh owner ad announced", str(sent))
-check(str(seen3.get("tap:48290603", {}).get("skip", "")).startswith("old"),
-      "suppressed ad is recorded with skip=old (never re-checked)")
+check(sent == ["48290603", "48405000"], "bumped OLD owner ad never sent before -> sent too", str(sent))
+check((got[0].get("_age_days") or 0) > 3 and got[1].get("_age_days") is None,
+      "bumped one marked old, fresh one marked new",
+      f"{got[0].get('_age_days')}, {got[1].get('_age_days')}")
+check(seen3["tap:48290603"].get("owner") is True and "skip" not in seen3["tap:48290603"],
+      "sent ad recorded as owner (never sent twice)")
 check(seen3.get("tap:48405000", {}).get("seller") == "22702915"
       and seen3["tap:48405000"].get("rooms") == 3, "tap record keeps seller + rooms/area")
+sent.clear()
+m.process_owner_new([bumped, fresh], tsrc, seen3, flags3)
+check(sent == [], "next run: nothing sent twice", str(sent))
 
 # --------------------------------------------------------------------------- #
 print("\n[URL] changing a search URL re-seeds silently")
@@ -308,10 +318,13 @@ agent_item = {"id": "900001", "url": "https://lalafo.az/baku/ads/baki-hmdli-2-ot
 owner_item = {"id": "900002", "url": "https://lalafo.az/baku/ads/baki-hmdli-3-otaqli-id-900002",
               "location": "Bakı, Əhmədli", "_agent": False, "created_ts": t_now,
               "_text": "Makler deyiləm, ev özümündür"}
+got.clear()
 m.process_owner_new([agent_item, owner_item, dict(owner_item, id="900003",
                     created_ts=t_now - 300 * day)], lsrc, seen6, flags6)
-check(sent == ["900002"], "EKSKLUZIV agent skipped, fresh owner sent, 300-day-old owner skipped",
+check(sent == ["900002", "900003"], "EKSKLUZIV agent skipped; fresh owner and 300-day-old owner sent",
       str(sent))
+check(got[-1].get("_age_kind") == "exact" and got[-1]["_age_days"] > 299,
+      "300-day-old one marked old with lalafo's real creation date")
 
 # --------------------------------------------------------------------------- #
 print("\n[C12] phrases restored + percent handling")
@@ -325,6 +338,172 @@ for phrase, want_owner in [("Mənim evimdir, təcili", True), ("Sahibi mənəm",
 print("\n[ORDER] page-1 sources run before the long bina scan")
 check([s_["name"] for s_ in m.SOURCES] == ["tap.az", "lalafo.az", "yeniemlak.az", "bina.az"],
       "source order", str([s_["name"] for s_ in m.SOURCES]))
+
+# --------------------------------------------------------------------------- #
+print("\n[NOV-1] yeniemlak runs two id series: new ads must not look old (ad 234096)")
+import datetime as _dt
+BAKU = _dt.timezone(_dt.timedelta(hours=4))
+
+
+def baku_date(ts):
+    return _dt.datetime.fromtimestamp(ts, BAKU).strftime("%d.%m.%Y")
+
+
+def ye_history():
+    h = {}
+    for i in range(300):          # first seed 80 days ago: ads of every age, BOTH series
+        h[f"ye:{100000 + i * 260}"] = {"source": "yeniemlak.az", "first_seen": iso(t_now - 80 * day)}
+    for i in range(60):
+        h[f"ye:{900000 + i * 1600}"] = {"source": "yeniemlak.az", "first_seen": iso(t_now - 80 * day)}
+    nid = 178600                  # then ~40 genuinely new arrivals a day, sequential ids
+    for d_ in range(79, 0, -1):
+        for k_ in range(40):
+            nid += 20
+            h[f"ye:{nid}"] = {"source": "yeniemlak.az",
+                              "first_seen": iso(t_now - d_ * day + k_ * 2000)}
+    return h, nid
+
+
+ye_hist, ye_top = ye_history()
+NEW_ID = str(ye_top + 20)                      # posted right now
+if old is not None and OLD_V == "2026-10-18-a":
+    oc = old.IdClock.from_seen(ye_hist, "yeniemlak.az", "ye:")
+    a_bug = oc.age_days(NEW_ID, t_now)
+    check(a_bug is not None and a_bug > 3, "OLD code: brand-new yeniemlak ad looked old -> hidden",
+          f"{a_bug:.0f} days")
+nc = m.IdClock.from_seen(ye_hist, "yeniemlak.az", "ye:")
+a_fix = nc.age_days(NEW_ID, t_now)
+check(a_fix is None or a_fix <= 1, "NEW code: brand-new yeniemlak ad -> new", str(a_fix))
+check((nc.age_days("152232", t_now) or 0) > 70, "old id from the first-seed era -> old")
+check((nc.age_days("230000", t_now) or 0) > 10, "id first seen ~15 days ago -> old")
+
+print("\n[NOV-2] yeniemlak: new / hidden-by-bug / renewed / unchanged / gave-up / agent")
+yesrc = {"name": "yeniemlak.az", "type": "yeniemlak", "prefix": "ye:", "mode": "owner_new",
+         "owner_label": "Əmlak sahibi", "url": "https://yeniemlak.az/x"}
+yflags = {"yeniemlak.az": True, "yeniemlak.az:url": m._url_fingerprint(yesrc["url"])}
+m.check_is_owner = lambda url, label="": (setattr(m.check_is_owner, "last_reason", "ok"), True)[1:] + (None,)
+m.PAGE_DELAY = 0
+ys = dict(ye_hist)
+ys["ye:230000"] = dict(ys["ye:230000"], skip="old ~75d")              # hidden by 10-18-a
+ys["ye:152232"] = {"source": "yeniemlak.az", "first_seen": iso(t_now - 75 * day)}   # seeded
+ys["ye:152400"] = {"source": "yeniemlak.az", "first_seen": iso(t_now - 75 * day)}   # seeded
+ys["ye:200000"] = dict(ys["ye:200000"], owner=None, tries=4)            # gave up
+ys["ye:210000"] = dict(ys["ye:210000"], owner=False)                    # agent
+
+
+def ye_item(iid, tarix_ts):
+    return {"id": iid, "url": f"https://yeniemlak.az/elan/x-{iid}", "price": 100000,
+            "location": "Bakı Xətai rayonu", "updated_at": baku_date(tarix_ts)}
+
+
+feed = [ye_item(NEW_ID, t_now), ye_item("230000", t_now - 15 * day),
+        ye_item("152232", t_now - 3600), ye_item("152400", t_now - 75 * day),
+        ye_item("200000", t_now - 30 * day), ye_item("210000", t_now - 20 * day)]
+sent.clear()
+got.clear()
+m.process_owner_new(feed, yesrc, ys, yflags)
+check(sent == [NEW_ID, "230000", "152232"], "sent: new ad, the one hidden by the bug, the renewed one",
+      str(sent))
+check(got and got[0].get("_age_days") is None, "new ad -> '‼️ Yeni elan'")
+check(len(got) > 1 and got[1].get("_age_days", 0) > 10 and got[1].get("_note"),
+      "hidden one -> marked old + 'not sent before' note")
+check(len(got) > 2 and got[2].get("_age_days", 0) > 70, "renewed 152232 -> marked old (~75 days)")
+check(all(ys[f"ye:{i}"].get("owner") is True for i in (NEW_ID, "230000", "152232")),
+      "all three recorded as sent")
+sent.clear()
+m.process_owner_new(feed, yesrc, ys, yflags)
+check(sent == [], "next run: nothing sent twice", str(sent))
+
+a_tap, _ = m._age_estimate({"id": "47325885"}, None, t_now,
+                           {"source": "tap.az", "first_seen": iso(t_now - 2 * day), "skip": "old ~100d"})
+a_ye, _ = m._age_estimate({"id": NEW_ID}, None, t_now,
+                          {"source": "yeniemlak.az", "first_seen": iso(t_now - 2 * day), "skip": "old ~75d"})
+check(a_tap > 100, "hidden tap ad keeps its real age (one id series)", f"{a_tap:.0f}")
+check(a_ye < 3, "hidden yeniemlak ad ignores the bug's '75 days' -> new", f"{a_ye:.1f}")
+
+print("\n[NOV-3] old backlog is capped per run so new ads are never delayed")
+ys2 = dict(ye_hist)
+backlog = [str(231000 + 20 * i) for i in range(20)]
+for i in backlog:
+    ys2[f"ye:{i}"] = dict(ys2[f"ye:{i}"], skip="old ~75d")
+feed2 = [ye_item(NEW_ID, t_now)] + [ye_item(i, t_now - 12 * day) for i in backlog]
+sent.clear()
+m.process_owner_new(feed2, yesrc, ys2, yflags)
+check(len(sent) == 1 + m.OLD_MAX_PER_RUN and sent[0] == NEW_ID,
+      f"run 1: the new ad + {m.OLD_MAX_PER_RUN} old ones", str(len(sent)))
+sent.clear()
+m.process_owner_new(feed2, yesrc, ys2, yflags)
+check(len(sent) == 20 - m.OLD_MAX_PER_RUN, "run 2: the rest of the backlog", str(len(sent)))
+sent.clear()
+m.process_owner_new(feed2, yesrc, ys2, yflags)
+check(sent == [], "run 3: nothing left", str(sent))
+
+print("\n[NOV-4] lalafo: silently recorded ad renewed by its owner -> once, marked old")
+ls = {"lala:1": {"url": "u", "first_seen": now_iso, "source": "lalafo.az", "owner": True},
+      "lala:800001": {"url": "u", "first_seen": iso(t_now - 30 * day), "source": "lalafo.az"},
+      "lala:800002": {"url": "u", "first_seen": iso(t_now - 30 * day), "source": "lalafo.az"}}
+lfeed = [{"id": "800001", "url": "https://lalafo.az/baku/ads/baki-hmdli-3-otaqli-id-800001",
+          "location": "Bakı, Əhmədli", "_agent": False, "_text": "3 otaqlı",
+          "created_ts": t_now - 200 * day, "updated_ts": t_now - 3600},
+         {"id": "800002", "url": "https://lalafo.az/baku/ads/baki-hmdli-2-otaqli-id-800002",
+          "location": "Bakı, Əhmədli", "_agent": False, "_text": "2 otaqlı",
+          "created_ts": t_now - 200 * day, "updated_ts": t_now - 31 * day}]
+sent.clear()
+got.clear()
+m.process_owner_new(lfeed, lsrc, ls, flags6)
+check(sent == ["800001"], "renewed one sent; untouched one stays quiet", str(sent))
+check(got and got[0].get("_age_kind") == "exact" and got[0]["_age_days"] > 199,
+      "labelled with lalafo's real creation date (~200 days)")
+sent.clear()
+m.process_owner_new(lfeed, lsrc, ls, flags6)
+check(sent == [], "next run: nothing sent twice", str(sent))
+
+print("\n[NOV-5] bina: old owner ads are labelled, not hidden; never-sent VIP/Premium -> once")
+bsrc2 = dict(bsrc)
+bflags = {"bina.az:owner_seeded": True, "bina.az:url": m._url_fingerprint(bsrc2["url"])}
+m.bina_is_owner = lambda url: (setattr(m.bina_is_owner, "last_reason", "ok"), True)[1:] + (None,)
+m._BINA_MAX_ID["v"] = 6470000
+bs = {"6400100": {"url": "u", "first_seen": iso(t_now - 40 * day), "source": "bina.az",
+                  "price": 1, "price_history": []},                         # seeded, never sent
+      "6400101": {"url": "u", "first_seen": iso(t_now - 40 * day), "source": "bina.az",
+                  "price": 1, "price_history": []},                         # seeded, not promoted
+      "6400102": {"url": "u", "first_seen": iso(t_now - 40 * day), "source": "bina.az",
+                  "price": 1, "price_history": [], "owner": False}}         # agent
+bfeed = [{"id": "6400200", "url": "https://bina.az/items/6400200", "price": 150000, "_promoted": True},
+         {"id": "6400100", "url": "https://bina.az/items/6400100", "price": 150000, "_promoted": True},
+         {"id": "6400101", "url": "https://bina.az/items/6400101", "price": 150000, "_promoted": False},
+         {"id": "6400102", "url": "https://bina.az/items/6400102", "price": 150000, "_promoted": True}]
+sent.clear()
+got.clear()
+n_, deferred_, decided_ = m.process_new_owner_checks(bfeed, bsrc2, bs, bflags, tries_map={})
+check(sent == ["6400200", "6400100"],
+      "unseen promoted 25-day-old owner ad sent (was hidden); never-sent VIP owner ad sent",
+      str(sent))
+check(all(g.get("_age_days", 0) > 3 for g in got), "both marked old")
+check(bs["6400100"].get("owner") is True and "owner" not in bs["6400101"],
+      "VIP one recorded as sent; non-promoted known one untouched")
+if old is not None and OLD_V == "2026-10-18-a":
+    old.bina_is_owner = m.bina_is_owner
+    old._BINA_MAX_ID["v"] = 6470000
+    old.notify_new_owner_msg = lambda l, n, ol="": True
+    n_old, _, _ = old.process_new_owner_checks([dict(bfeed[0])], bsrc2, {}, dict(bflags), tries_map={})
+    check(n_old == 0, "OLD code: the same promoted owner ad was hidden")
+sent.clear()
+bs["6400200"] = {"url": "u", "first_seen": now_iso, "source": "bina.az", "owner": True}
+m.process_new_owner_checks(bfeed, bsrc2, bs, bflags, tries_map={})
+check(sent == [], "next run: nothing sent twice", str(sent))
+
+print("\n[NOV-6] message header")
+t_old = m.format_new_owner({"url": "https://x", "price": 100000, "_age_days": 75.2,
+                            "_age_kind": "min", "_note": "Bu elan əvvəl göndərilməmişdi"},
+                           "yeniemlak.az", "Əmlak sahibi")
+check("♻️ <b>Yenilənmiş elan</b>" in t_old and "ən azı 75 gün əvvəl" in t_old
+      and "göndərilməmişdi" in t_old, "old ad: ♻️ header, 'at least 75 days ago', note")
+t_ex = m.format_new_owner({"url": "https://x", "_age_days": 200.4, "_age_kind": "exact"},
+                          "lalafo.az", "Mülkiyyətçi")
+check("~200 gün əvvəl" in t_ex, "exact creation date: '~200 days ago'")
+t_new = m.format_new_owner({"url": "https://x", "price": 1, "_age_days": 1.5}, "tap.az", "Sahibindən")
+check("‼️ <b>Yeni elan</b>" in t_new and "🕓" not in t_new, "new ad: ‼️ header, no age line")
 
 # --------------------------------------------------------------------------- #
 print("\n[E2E] two full runs of main() with every site faked")
