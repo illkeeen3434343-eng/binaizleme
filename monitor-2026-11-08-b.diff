@@ -1,0 +1,131 @@
+--- /mnt/user-data/outputs/2026-11-08-a/monitor.py	2026-11-07 20:48:22.841331000 +0000
++++ monitor.py	2026-11-07 21:31:00.664560483 +0000
+@@ -25,7 +25,7 @@
+ 
+ import requests
+ 
+-VERSION = "2026-11-08-a"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-08-b"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -1543,6 +1543,7 @@
+     tap_check_owner.last_reason = "fetch"
+     tap_check_owner.last_score, tap_check_owner.last_reasons = None, []
+     tap_check_owner.last_location = None
++    tap_check_owner.last_details = {}
+     try:
+         r, raw = _fetch_tap_html(url, tries=2)
+     except Exception as e:
+@@ -1551,13 +1552,9 @@
+     if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw) or len(raw) < 2000:
+         return None, None, None
+     tap_check_owner.last_reason = "undecided"
+-    # The ad's own title carries the same "2-otaqlı mənzil, Əhmədli m., 60 m²" heading as
+-    # the list card: keep its location so a message built from this page has an address.
+-    tm = (re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', raw)
+-          or re.search(r"<title>(.*?)</title>", raw, re.S))
+-    lm_ = re.search(r"\d+-otaqlı[^,]*,\s*(.+?),\s*[\d.]+\s*m²",
+-                    html.unescape(tm.group(1)) if tm else "")
+-    tap_check_owner.last_location = lm_.group(1).strip() if lm_ else None
++    # price / rooms / area / location from the ad's own page (for the message)
++    tap_check_owner.last_details = _tap_details(raw)
++    tap_check_owner.last_location = tap_check_owner.last_details.get("location")
+ 
+     seller = (re.search(r"/elanlar\?user_id=(\d+)", raw) or [None, None])[1]
+     photo = None
+@@ -1625,6 +1622,53 @@
+ tap_check_owner.last_score = None
+ tap_check_owner.last_reasons = []
+ tap_check_owner.last_location = None
++tap_check_owner.last_details = {}
++
++
++def _meta_tags(raw):
++    """{property-or-name: content} for a page's <meta> tags (attribute order free)."""
++    out = {}
++    for tag in re.findall(r"<meta\b[^>]*>", (raw or "")[:300000], re.I):
++        attrs = {k.lower(): html.unescape(v)
++                 for k, v in re.findall(r'([\w:.-]+)\s*=\s*"([^"]*)"', tag)}
++        key = attrs.get("property") or attrs.get("name")
++        if key and "content" in attrs and key not in out:
++            out[key] = attrs["content"]
++    return out
++
++
++def _tap_details(raw):
++    """Price, rooms, area and location of a tap ad from its OWN page, so a message built
++    from the page (recovery) looks like every other message. Verified tap page meta:
++      og:title               "3-otaqlı mənzil, Əhmədli m., 80 m²"
++      product:price:amount   "165000.00"   product:price:currency "AZN"
++    Anything that does not match is simply left out."""
++    meta = _meta_tags(raw)
++    title = meta.get("og:title") or ""
++    if not title:
++        tm = re.search(r"<title>(.*?)</title>", raw or "", re.S)
++        title = html.unescape(tm.group(1)) if tm else ""
++    d = {}
++    rm = re.search(r"(\d+)-otaqlı", title)
++    if rm:
++        d["rooms"] = int(rm.group(1))
++    am = re.search(r"(\d+(?:[.,]\d+)?)\s*m²", title)
++    if am:
++        try:
++            d["area"] = float(am.group(1).replace(",", "."))
++        except ValueError:
++            pass
++    lm = re.search(r"\d+-otaqlı[^,]*,\s*(.+?),\s*[\d.,]+\s*m²", title)
++    if lm:
++        d["location"] = lm.group(1).strip()
++    try:
++        pv = int(float(meta.get("product:price:amount") or 0))
++        if pv > 0:
++            d["price"] = pv
++            d["currency"] = meta.get("product:price:currency") or "AZN"
++    except ValueError:
++        pass
++    return d
+ 
+ 
+ def _tap_blocked(body):
+@@ -2111,20 +2155,19 @@
+ 
+ def _posted_text(l, now_ts=None):
+     """Date the ad was placed, as dd.mm.yyyy (Baku):
+-    exact  = the site's own creation date          -> "12.04.2026"
+-    approx = estimate (bina id)                     -> "~12.04.2026"
+-    min    = we only know it existed by then        -> "ən gec 12.04.2026" (at the latest)"""
++    exact  = the site's own creation date                     -> "12.04.2026"
++    min    = the latest date it can have been placed           -> "12.04.2026"
++    approx = estimate (bina id)                                -> "~12.04.2026"
++    (8 Nov 2026: shown as a plain date, without "ən gec", as requested)"""
+     ts = l.get("_posted_ts")
+     if not isinstance(ts, (int, float)):
+         now_ts = time.time() if now_ts is None else now_ts
+         ts = now_ts - float(l.get("_age_days") or 0) * 86400.0
+     d = dt.datetime.fromtimestamp(ts, _BAKU_TZ).strftime("%d.%m.%Y")
+     kind = l.get("_age_kind")
+-    if kind == "exact":
+-        return d
+-    if kind == "min":
+-        return f"ən gec {d}"
+-    return f"~{d}"
++    if kind == "approx":
++        return f"~{d}"                    # bina estimate from the id
++    return d
+ 
+ 
+ def _seller_counts(seen):
+@@ -2608,6 +2651,12 @@
+                 new_rec["area"] = l.get("area")
+                 seller_apts.setdefault(seller, set()).add(_apt_key(l))
+         seen[key] = new_rec
++        if stype == "tap":
++            # fill what the list card did not show (price, rooms, area, address) from the
++            # ad's own page, so tap messages have the same lines as the others
++            for k_, v_ in (getattr(tap_check_owner, "last_details", None) or {}).items():
++                if l.get(k_) in (None, ""):
++                    l[k_] = v_
+         if owner and notify_new_owner_msg(l, name, owner_label):
+             notified += 1
+     if quiet_old:

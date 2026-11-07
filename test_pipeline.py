@@ -502,10 +502,11 @@ t_old = m.format_new_owner({"url": "https://x", "price": 100000, "_age_days": 75
                             "_age_kind": "min", "_posted_ts": _pt,
                             "_note": "Bu elan əvvəl göndərilməmişdi"},
                            "yeniemlak.az", "Əmlak sahibi")
-check("♻️ <b>Yenilənmiş elan</b>" in t_old and "🕓 <b>Yerləşdirilib:</b> ən gec 24.08.2026" in t_old,
-      "old ad: ♻️ header, 'Yerləşdirilib: ən gec 24.08.2026'", t_old.splitlines()[2])
-check("gün əvvəl" not in t_old and "ən azı" not in t_old and "göndərilməmişdi" not in t_old
-      and "ℹ️" not in t_old, "no 'N gün əvvəl', no 'ən azı', no note line")
+check("♻️ <b>Yenilənmiş elan</b>" in t_old and "🕓 <b>Yerləşdirilib:</b> 24.08.2026\n" in t_old,
+      "old ad: ♻️ header, 'Yerləşdirilib: 24.08.2026' (plain date)", t_old.splitlines()[2])
+check("gün əvvəl" not in t_old and "ən azı" not in t_old and "ən gec" not in t_old
+      and "göndərilməmişdi" not in t_old and "ℹ️" not in t_old,
+      "no 'N gün əvvəl', no 'ən azı', no 'ən gec', no note line")
 _pc = _dt.datetime(2026, 4, 12, 9, 30, tzinfo=BAKU).timestamp()
 t_ex = m.format_new_owner({"url": "https://x", "_age_days": 200.4, "_age_kind": "exact",
                            "_posted_ts": _pc}, "lalafo.az", "Mülkiyyətçi")
@@ -850,7 +851,7 @@ check("Ünvan" not in m.format_new_owner({"url": "u", "address": "", "location":
 _now15 = _dt.datetime(2026, 11, 8, 1, 30, tzinfo=BAKU).timestamp()      # just after midnight
 a15, k15 = m._age_estimate(it15, None, _now15, None)
 got15 = dict(it15, _age_days=a15, _age_kind=k15, _posted_ts=_now15 - a15 * 86400)
-check(k15 == "min" and "ən gec 27.10.2026" in m.format_new_owner(got15, "yeniemlak.az"),
+check(k15 == "min" and "Yerləşdirilib:</b> 27.10.2026\n" in m.format_new_owner(got15, "yeniemlak.az"),
       "date comes from the card's Tarix (27.10.2026), not the day after")
 ysrc15 = dict(yesrc)
 ys16 = dict(ye_hist)
@@ -859,11 +860,11 @@ ys16["ye:227514"] = {"url": "u", "first_seen": iso(t_now - 11 * day), "source": 
 got.clear()
 m.process_owner_new([dict(it15, updated_at=baku_date(t_now - 11 * day))], ysrc15, ys16, yflags)
 msg16 = m.format_new_owner(got[0], "yeniemlak.az", "Əmlak sahibi") if got else ""
-_dm = re.search(r"ən gec (\d\d)\.(\d\d)\.(\d{4})", msg16)
+_dm = re.search(r"Yerləşdirilib:</b> (\d\d)\.(\d\d)\.(\d{4})\n", msg16)
 _shown = _dt.datetime(int(_dm.group(3)), int(_dm.group(2)), int(_dm.group(1)), tzinfo=BAKU) if _dm else None
 _tarix = _dt.datetime.fromtimestamp(t_now - 11 * day, BAKU).replace(hour=0, minute=0, second=0, microsecond=0)
 check("♻️" in msg16 and _shown is not None and _shown <= _tarix and "ℹ️" not in msg16,
-      "real run: ♻️ + 'ən gec <date>' (on or before its Tarix) + no note",
+      "real run: ♻️ + plain date (on or before its Tarix) + no note",
       msg16.splitlines()[2] if msg16 else "")
 mt3 = load(os.path.join(HERE, "monitor.py"), "monitor_taploc")
 ad_t = tap_ad("Öz evimdi", multi=False).replace(
@@ -874,6 +875,42 @@ mt3.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menziller/48500099", 
                     listing={"id": "48500099"})
 check(mt3.tap_check_owner.last_location == "Əhmədli m.", "tap detail page -> location for the message",
       str(mt3.tap_check_owner.last_location))
+
+print("\n[NOV-16] tap messages have the same lines as the others (Qiymət, Otaq sayı, Sahə, Ünvan)")
+REAL_TAP_HEAD = ('<meta property="og:title" content="2-otaqlı mənzil, Neftçilər m., 44.3 m²">'
+                 '<meta content="2026-09-02T15:39:29+04:00" property="og:updated_time">'
+                 '<meta property="product:price:amount" content="118000.00">'
+                 '<meta property="product:price:currency" content="AZN">')
+d16 = m._tap_details("<html><head>" + REAL_TAP_HEAD + "</head></html>")
+check(d16 == {"rooms": 2, "area": 44.3, "location": "Neftçilər m.", "price": 118000, "currency": "AZN"},
+      "real tap page meta -> price, rooms, area, address", str(d16))
+check(m._tap_details("<html><title>Tap.Az</title></html>") == {}, "nothing matching -> nothing added")
+mt4 = load(os.path.join(HERE, "monitor.py"), "monitor_tapfill")
+install_tap(mt4, tap_ad("Öz evimdi, makler deyiləm", multi=False).replace("<html>", "<html>" + REAL_TAP_HEAD, 1))
+mt4.PAGE_DELAY = 0
+msgs16 = []
+mt4.notify_new_owner_msg = lambda l, n, ol="": msgs16.append(mt4.format_new_owner(l, n, ol)) or True
+tsrc16 = {"name": "tap.az", "type": "tap", "prefix": "tap:", "mode": "owner_new",
+          "owner_label": "Sahibindən", "url": "https://tap.az/x"}
+tflags16 = {"tap.az": True, "tap.az:url": mt4._url_fingerprint(tsrc16["url"])}
+tseen16 = {"tap:48900000": {"url": "u", "first_seen": iso(time.time() - day), "source": "tap.az",
+                            "owner": True}}
+card16 = {"id": "48900050", "url": "https://tap.az/elanlar/dasinmaz-emlak/menziller/48900050",
+          "rooms": None, "area": None, "price": None, "location": None}       # card gave nothing
+with contextlib.redirect_stdout(io.StringIO()):
+    mt4.process_owner_new([card16], tsrc16, tseen16, tflags16)
+t16 = msgs16[0] if msgs16 else ""
+check("💰 <b>Qiymət:</b> 118 000 AZN" in t16 and "🛏 <b>Otaq sayı:</b> 2" in t16
+      and "📐 <b>Sahə:</b> 44.3 m²" in t16 and "📍 <b>Ünvan:</b> Neftçilər m." in t16,
+      "live tap: missing card fields filled from the ad's page", " | ".join(t16.splitlines()[2:7]))
+check(tseen16["tap:48900050"].get("rooms") is None,
+      "flat counting still uses only the card's own values (no change to the 3-flats rule)")
+card16b = dict(card16, id="48900051", url=card16["url"][:-2] + "51", price=99000, location="Əhmədli m.")
+msgs16.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    mt4.process_owner_new([card16b], tsrc16, tseen16, tflags16)
+check(msgs16 and "99 000 AZN" in msgs16[0] and "Əhmədli m." in msgs16[0],
+      "values the card already had are kept (page only fills gaps)")
 
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
@@ -942,7 +979,9 @@ mr.PAGE_DELAY = 0.0001
 TAPU = "https://tap.az/elanlar/dasinmaz-emlak/menziller/"
 pages_r = {
     "48500001": tap_ad("Mənzil öz evimdi, makler deyiləm", seller="Elvin", uid="1001").replace(
-        "<html>", '<html><meta property="og:title" content="3-otaqlı mənzil, Neftçilər m., 75 m²">', 1),
+        "<html>", '<html><meta property="og:title" content="3-otaqlı mənzil, Neftçilər m., 75 m²">'
+                  '<meta content="165000.00" property="product:price:amount">'
+                  '<meta property="product:price:currency" content="AZN">', 1),
     "48500002": tap_ad("Təmirli 2 otaqlı mənzil, sənədləri qaydasındadır", seller="Nigar", uid="1002"),
     "48500003": tap_ad("Təmirli mənzil", seller="Kamran", uid="1003"),
     "48500004": tap_ad("Təmirli mənzil", seller="Kamran", uid="1003"),
@@ -1005,10 +1044,14 @@ with contextlib.redirect_stdout(io.StringIO()):
 st_r = json.load(open(mr.STATE_FILE, encoding="utf-8"))["listings"]
 check(sorted(sent_r) == ["48500001", "48500007"], "SEND=1 sends exactly the 2 proven owners", str(sent_r))
 m01 = msgs_r.get("48500001", "")
-check("♻️" in m01 and "Yerləşdirilib:</b> ən gec 10.10.2026" in m01 and "səhvən" not in m01
-      and "ℹ️" not in m01, "recovered message: ♻️ + 'ən gec 10.10.2026' (first seen), no note",
+check("♻️" in m01 and "Yerləşdirilib:</b> 10.10.2026\n" in m01 and "səhvən" not in m01
+      and "ℹ️" not in m01 and "ən gec" not in m01,
+      "recovered message: ♻️ + '10.10.2026' (first seen), no note",
       m01.splitlines()[2] if m01 else "")
 check("📍 <b>Ünvan:</b> Neftçilər m." in m01, "recovered tap message has its address")
+check("💰 <b>Qiymət:</b> 165 000 AZN" in m01 and "🛏 <b>Otaq sayı:</b> 3" in m01
+      and "📐 <b>Sahə:</b> 75 m²" in m01, "recovered tap message has Qiymət / Otaq sayı / Sahə",
+      " | ".join(m01.splitlines()[2:7]))
 check(st_r["tap:48500001"]["owner"] is True and st_r["tap:48500007"]["owner"] is True
       and "skip" not in st_r["tap:48500007"], "they are recorded as sent (never twice)")
 check(st_r["tap:48500002"]["owner"] is False and "rechecked" not in st_r["tap:48500002"],

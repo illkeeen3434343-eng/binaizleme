@@ -54,15 +54,19 @@ def tap_recheck(cands, origin):
     apts, cache, out = m._seller_apartments(m._RUNTIME["state"]["listings"]), {}, []
     for k, v in cands:
         iid = k.split(":", 1)[1]
-        lst = {"id": iid, "url": v["url"], "rooms": v.get("rooms"), "area": v.get("area")}
-        verdict, photo, seller = m.tap_check_owner(v["url"], apts, cache, listing=lst)
+        # flat identity for the 3-flats rule: ONLY what the record knew (same key as the
+        # bot's history, so a re-checked ad is never counted twice)
+        count_l = {"id": iid, "rooms": v.get("rooms"), "area": v.get("area")}
+        verdict, photo, seller = m.tap_check_owner(v["url"], apts, cache, listing=count_l)
         reasons = list(getattr(m.tap_check_owner, "last_reasons", None) or [])
-        where = getattr(m.tap_check_owner, "last_location", None)
-        if where:
-            lst["location"] = where            # address line for the message
-        out.append({"k": k, "v": v, "lst": lst, "verdict": verdict, "photo": photo,
-                    "seller": seller, "reasons": reasons, "origin": origin,
-                    "akey": m._apt_key(lst)})
+        lst = dict(count_l, url=v["url"])
+        # price / rooms / area / address from the ad's page: same lines as other messages
+        for k_, v_ in (getattr(m.tap_check_owner, "last_details", None) or {}).items():
+            if lst.get(k_) in (None, ""):
+                lst[k_] = v_
+        out.append({"k": k, "v": v, "lst": lst, "count_l": count_l, "verdict": verdict,
+                    "photo": photo, "seller": seller, "reasons": reasons, "origin": origin,
+                    "akey": m._apt_key(count_l)})
         time.sleep(m.PAGE_DELAY or 0.3)
     return out
 
@@ -83,7 +87,7 @@ def tap_batch_counts(entries, history):
         print(f"   batch: seller {e['seller']} has {len(flats)} different flats -> re-judging "
               f"{e['lst']['url']}")
         verdict, photo, _s = m.tap_check_owner(e["lst"]["url"], {e["seller"]: flats}, {},
-                                               listing=e["lst"])
+                                               listing=e["count_l"])
         if verdict is not None:
             e["verdict"] = verdict
             e["reasons"] = list(getattr(m.tap_check_owner, "last_reasons", None) or [])
@@ -217,7 +221,7 @@ def main():
         age, kind = m._age_estimate(lst, clocks.get(src), now_ts, rec)
         if age is not None:
             lst["_age_days"], lst["_age_kind"] = age, kind
-            lst["_posted_ts"] = now_ts - age * 86400.0   # shown as "ən gec dd.mm.yyyy"
+            lst["_posted_ts"] = now_ts - age * 86400.0   # shown as a date (dd.mm.yyyy)
         if m.notify_new_owner_msg(lst, src, label):
             sent += 1
         rec["owner"] = True                  # never sent twice
