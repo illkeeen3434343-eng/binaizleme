@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-11-07-c"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-08-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -210,6 +210,18 @@ def _listing_age_days(l):
         if gap >= 0:
             return gap / BINA_IDS_PER_DAY
     return None
+
+
+def _bina_age(l, now_ts):
+    """(age_days, kind, posted_ts) for a bina listing, for the message label only.
+    kind "exact" = bina's own creation date; "approx" = estimated from the id."""
+    ts = _to_epoch(l.get("created_at")) if isinstance(l.get("created_at"), str) else None
+    if ts is not None:
+        return max(0.0, (now_ts - ts) / 86400.0), "exact", ts
+    a = _listing_age_days(l)
+    if a is None:
+        return None, None, None
+    return a, "approx", now_ts - a * 86400.0
 
 
 def is_stale_promoted(l):
@@ -606,6 +618,50 @@ def ye_passes(l):
     return any(k in loc for k in YE_KEYWORDS)
 
 
+# Baku metro stations as yeniemlak writes them (plus common short forms). Used ONLY to
+# cut the station name cleanly out of the card text for the message's address line.
+_BAKU_METROS = sorted({
+    "İçərişəhər", "Sahil", "28 May", "Gənclik", "Nəriman Nərimanov", "N.Nərimanov",
+    "Nərimanov", "Bakmil", "Ulduz", "Koroğlu", "Qara Qarayev", "Q.Qarayev", "Neftçilər",
+    "Xalqlar Dostluğu", "Əhmədli", "Həzi Aslanov", "H.Aslanov", "Şah İsmayıl Xətai",
+    "Xətai", "Cəfər Cabbarlı", "Nizami", "Elmlər Akademiyası", "İnşaatçılar", "20 Yanvar",
+    "Memar Əcəmi", "Nəsimi", "Azadlıq prospekti", "Dərnəgül", "Avtovağzal", "8 Noyabr",
+    "Xocəsən"}, key=len, reverse=True)
+
+
+def _ye_address(raw_loc):
+    """Clean address for the message from the text after "Ünvan:" on a yeniemlak card:
+      'Bakı Xətai rayonu Əhmədli metro. Əhmədli Xudu Məmmədov küç Təcili satılır ...'
+        -> 'Bakı, Xətai rayonu, Əhmədli m.'
+      'Bakı Xətai rayonu metro Mənzil təcili olaraq satılır ...' -> 'Bakı, Xətai rayonu'
+    On the list page the street runs straight into the ad's description, so the street
+    is left out (the link opens the full ad). The old address line showed that run-on
+    text (description words, half a street name). "" = nothing usable."""
+    raw_loc = re.sub(r"\s+", " ", raw_loc or "").strip()
+    mm = re.match(r"(.*?)\s*\bmetro\b(\.?)\s*(.*)$", raw_loc)
+    if mm and len(mm.group(1).split()) <= 7:
+        head, dotted, tail = mm.group(1).strip(), mm.group(2) == ".", mm.group(3)
+    else:
+        rm = re.match(r"(.{0,60}?\brayonu)\b", raw_loc)
+        head, dotted, tail = (rm.group(1) if rm else ""), False, ""
+    hm = re.match(r"(\S+)\s+(.+?\brayonu)\b\s*(.*)$", head)
+    parts = [hm.group(1), hm.group(2), hm.group(3)] if hm else [head]
+    parts = [p.strip(" ,") for p in parts if p and p.strip(" ,")]
+    metro = None
+    if dotted:
+        low = tail.casefold()
+        for name in _BAKU_METROS:
+            n = name.casefold()
+            if low.startswith(n) and (len(low) == len(n) or not low[len(n)].isalnum()):
+                metro = name
+                break
+    if metro:
+        if parts and parts[-1].casefold() == metro.casefold():
+            parts.pop()                    # "Əhmədli, Əhmədli m." -> "Əhmədli m."
+        parts.append(f"{metro} m.")
+    return ", ".join(parts)
+
+
 def _with_page(url, n):
     parts = urlparse(url)
     q = parse_qs(parts.query, keep_blank_values=True)
@@ -641,17 +697,20 @@ def _parse_yeniemlak_page(raw):
         area = re.search(r"(\d+)\s*m2", b)
         date = re.search(r"Tarix:\s*([\d.]+)", b)
         loc = None
+        address = None
         lm = re.search(r"Ünvan:\s*(.+)", b)
         if lm:
             raw_loc = lm.group(1).strip()
             mm = re.search(r"(.*?metro\.\s*\S+(?:\s\S+)?)", raw_loc)
-            loc = (mm.group(1) if mm else raw_loc[:70]).strip()
+            loc = (mm.group(1) if mm else raw_loc[:70]).strip()   # area filter: unchanged
+            address = _ye_address(raw_loc)                          # message only
         out.append({"id": iid, "url": id_url.get(iid, f"https://yeniemlak.az/elan/{iid}"),
                     "rooms": int(rooms.group(1)) if rooms else None,
                     "area": int(area.group(1)) if area else None, "area_units": "m²",
                     "floor": int(fl.group(2)) if fl else None,
                     "floors": int(fl.group(1)) if fl else None,
-                    "price": price, "currency": "AZN", "location": loc, "location_id": None,
+                    "price": price, "currency": "AZN", "location": loc, "address": address,
+                    "location_id": None,
                     "updated_at": date.group(1) if date else None, "deal": deal,
                     "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
                     "photo": None})
@@ -1483,6 +1542,7 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
     "undecided" (read fine, signals inconclusive)."""
     tap_check_owner.last_reason = "fetch"
     tap_check_owner.last_score, tap_check_owner.last_reasons = None, []
+    tap_check_owner.last_location = None
     try:
         r, raw = _fetch_tap_html(url, tries=2)
     except Exception as e:
@@ -1491,6 +1551,13 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
     if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw) or len(raw) < 2000:
         return None, None, None
     tap_check_owner.last_reason = "undecided"
+    # The ad's own title carries the same "2-otaqlı mənzil, Əhmədli m., 60 m²" heading as
+    # the list card: keep its location so a message built from this page has an address.
+    tm = (re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', raw)
+          or re.search(r"<title>(.*?)</title>", raw, re.S))
+    lm_ = re.search(r"\d+-otaqlı[^,]*,\s*(.+?),\s*[\d.]+\s*m²",
+                    html.unescape(tm.group(1)) if tm else "")
+    tap_check_owner.last_location = lm_.group(1).strip() if lm_ else None
 
     seller = (re.search(r"/elanlar\?user_id=(\d+)", raw) or [None, None])[1]
     photo = None
@@ -1557,6 +1624,7 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
 tap_check_owner.last_reason = ""
 tap_check_owner.last_score = None
 tap_check_owner.last_reasons = []
+tap_check_owner.last_location = None
 
 
 def _tap_blocked(body):
@@ -2021,10 +2089,7 @@ def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
     head = "♻️ <b>Yenilənmiş elan</b>" if old else "‼️ <b>Yeni elan</b>"
     lines = [f"{head} · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
     if old:
-        pre = "ən azı " if l.get("_age_kind") == "min" else "~"
-        lines.append(f"🕓 <b>Yerləşdirilib:</b> {pre}{max(1, int(round(age)))} gün əvvəl")
-    if l.get("_note"):
-        lines.append(f"ℹ️ {html.escape(str(l['_note']))}")
+        lines.append(f"🕓 <b>Yerləşdirilib:</b> {_posted_text(l)}")
     if l.get("price") is not None:
         lines.append(f"💰 <b>Qiymət:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
     if l.get("rooms") is not None:
@@ -2034,11 +2099,32 @@ def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
         lines.append(f"📐 <b>Sahə:</b> {area} {l.get('area_units', 'm²')}")
     if l.get("floor") and l.get("floors"):
         lines.append(f"🏢 <b>Mərtəbə:</b> {l['floor']}/{l['floors']}")
-    if l.get("location"):
-        lines.append(f"📍 <b>Ünvan:</b> {html.escape(str(l['location']))}")
+    addr = l.get("address")              # clean display address (yeniemlak); "" = none
+    if addr is None:
+        addr = l.get("location")
+    if addr:
+        lines.append(f"📍 <b>Ünvan:</b> {html.escape(str(addr))}")
     lines.append("")
     lines.append(f'🔗 <a href="{html.escape(l["url"])}">Elana bax</a>')
     return "\n".join(lines)
+
+
+def _posted_text(l, now_ts=None):
+    """Date the ad was placed, as dd.mm.yyyy (Baku):
+    exact  = the site's own creation date          -> "12.04.2026"
+    approx = estimate (bina id)                     -> "~12.04.2026"
+    min    = we only know it existed by then        -> "ən gec 12.04.2026" (at the latest)"""
+    ts = l.get("_posted_ts")
+    if not isinstance(ts, (int, float)):
+        now_ts = time.time() if now_ts is None else now_ts
+        ts = now_ts - float(l.get("_age_days") or 0) * 86400.0
+    d = dt.datetime.fromtimestamp(ts, _BAKU_TZ).strftime("%d.%m.%Y")
+    kind = l.get("_age_kind")
+    if kind == "exact":
+        return d
+    if kind == "min":
+        return f"ən gec {d}"
+    return f"~{d}"
 
 
 def _seller_counts(seen):
@@ -2154,7 +2240,7 @@ def _age_estimate(l, clock, now_ts, rec=None):
     # as the end of that day (a renewed ad carries today's date -> adds nothing)
     d = _dmy_epoch(l.get("updated_at"))
     if d is not None:
-        t = max(0.0, (now_ts - (d + 86400)) / 86400.0)
+        t = max(0.0, (now_ts - (d + 86399)) / 86400.0)    # last second of that day
         a = t if a is None else max(a, t)
     fs = _to_epoch((rec or {}).get("first_seen"))
     if fs is not None:
@@ -2320,10 +2406,10 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
         if not owner:
             log(f"{name}: {l['url']} -> AGENT (not announced)")
         if owner:
-            age = _listing_age_days(l)
+            age, akind, posted = _bina_age(l, time.time())
             if age is not None and age > NEW_MAX_AGE_DAYS:
                 # old ad (promoted or not) that you were never sent: send, marked old
-                l["_age_days"], l["_age_kind"] = age, "approx"
+                l["_age_days"], l["_age_kind"], l["_posted_ts"] = age, akind, posted
             if photo:
                 l["photo"] = photo    # keep API photo if detail gave none
             if notify_new_owner_msg(l, name, owner_label):
@@ -2368,13 +2454,14 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
         rec["owner"] = bool(owner)    # decided: never looked at again, never sent twice
         if not owner:
             continue
-        age = _listing_age_days(l)
+        age, akind, posted = _bina_age(l, now_ts)
         fs = _to_epoch(rec.get("first_seen"))
-        if fs is not None:
+        if fs is not None and akind != "exact":
             seen_days = max(0.0, (now_ts - fs) / 86400.0)
-            age = seen_days if age is None else max(age, seen_days)
+            if age is None or seen_days > age:
+                age, akind, posted = seen_days, "min", fs   # we saw it already then
         if age is not None and age > NEW_MAX_AGE_DAYS:
-            l["_age_days"], l["_age_kind"] = age, "approx"
+            l["_age_days"], l["_age_kind"], l["_posted_ts"] = age, akind, posted
         if photo:
             l["photo"] = photo
         log(f"{name}: {l['url']} -> VIP/Premium owner ad never sent before; sending once")
@@ -2447,8 +2534,7 @@ def process_owner_new(items, source, seen, seeded_flags):
             old_used += 1
         if is_old:
             l["_age_days"], l["_age_kind"] = age, age_kind
-        if kind == "hidden" and is_old:      # a 1-day-old ad needs no "not sent before" note
-            l["_note"] = "Bu elan əvvəl göndərilməmişdi"
+            l["_posted_ts"] = now_ts - age * 86400.0     # shown as a date in the message
         if kind != "new":
             log(f"{name}: {l['url']} -> looking again ({kind}"
                 + (f", ~{age:.0f} days old" if age is not None else "") + ")")

@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import os
 import sys
 import tempfile
@@ -407,8 +408,8 @@ m.process_owner_new(feed, yesrc, ys, yflags)
 check(sent == [NEW_ID, "230000", "152232"], "sent: new ad, the one hidden by the bug, the renewed one",
       str(sent))
 check(got and got[0].get("_age_days") is None, "new ad -> '‼️ Yeni elan'")
-check(len(got) > 1 and got[1].get("_age_days", 0) > 10 and got[1].get("_note"),
-      "hidden one -> marked old + 'not sent before' note")
+check(len(got) > 1 and got[1].get("_age_days", 0) > 10 and not got[1].get("_note"),
+      "hidden one -> marked old (no extra note)")
 check(len(got) > 2 and got[2].get("_age_days", 0) > 70, "renewed 152232 -> marked old (~75 days)")
 check(all(ys[f"ye:{i}"].get("owner") is True for i in (NEW_ID, "230000", "152232")),
       "all three recorded as sent")
@@ -495,15 +496,23 @@ bs["6400200"] = {"url": "u", "first_seen": now_iso, "source": "bina.az", "owner"
 m.process_new_owner_checks(bfeed, bsrc2, bs, bflags, tries_map={})
 check(sent == [], "next run: nothing sent twice", str(sent))
 
-print("\n[NOV-6] message header")
+print("\n[NOV-6] message header (2026-11-08-a: a date instead of 'N gün əvvəl', no note)")
+_pt = _dt.datetime(2026, 8, 24, 15, 0, tzinfo=BAKU).timestamp()
 t_old = m.format_new_owner({"url": "https://x", "price": 100000, "_age_days": 75.2,
-                            "_age_kind": "min", "_note": "Bu elan əvvəl göndərilməmişdi"},
+                            "_age_kind": "min", "_posted_ts": _pt,
+                            "_note": "Bu elan əvvəl göndərilməmişdi"},
                            "yeniemlak.az", "Əmlak sahibi")
-check("♻️ <b>Yenilənmiş elan</b>" in t_old and "ən azı 75 gün əvvəl" in t_old
-      and "göndərilməmişdi" in t_old, "old ad: ♻️ header, 'at least 75 days ago', note")
-t_ex = m.format_new_owner({"url": "https://x", "_age_days": 200.4, "_age_kind": "exact"},
-                          "lalafo.az", "Mülkiyyətçi")
-check("~200 gün əvvəl" in t_ex, "exact creation date: '~200 days ago'")
+check("♻️ <b>Yenilənmiş elan</b>" in t_old and "🕓 <b>Yerləşdirilib:</b> ən gec 24.08.2026" in t_old,
+      "old ad: ♻️ header, 'Yerləşdirilib: ən gec 24.08.2026'", t_old.splitlines()[2])
+check("gün əvvəl" not in t_old and "ən azı" not in t_old and "göndərilməmişdi" not in t_old
+      and "ℹ️" not in t_old, "no 'N gün əvvəl', no 'ən azı', no note line")
+_pc = _dt.datetime(2026, 4, 12, 9, 30, tzinfo=BAKU).timestamp()
+t_ex = m.format_new_owner({"url": "https://x", "_age_days": 200.4, "_age_kind": "exact",
+                           "_posted_ts": _pc}, "lalafo.az", "Mülkiyyətçi")
+check("Yerləşdirilib:</b> 12.04.2026" in t_ex, "site's own creation date: '12.04.2026'")
+t_ap = m.format_new_owner({"url": "https://x", "_age_days": 40, "_age_kind": "approx",
+                           "_posted_ts": _pc}, "bina.az", "Mülkiyyətçi")
+check("Yerləşdirilib:</b> ~12.04.2026" in t_ap, "estimate: '~12.04.2026'")
 t_new = m.format_new_owner({"url": "https://x", "price": 1, "_age_days": 1.5}, "tap.az", "Sahibindən")
 check("‼️ <b>Yeni elan</b>" in t_new and "🕓" not in t_new, "new ad: ‼️ header, no age line")
 
@@ -805,6 +814,67 @@ m.process_owner_new([ye_item(NEW14, t_now)], yesrc, ys15, yflags)
 check(got and not got[0].get("_note") and got[0].get("_age_days") is None,
       "hidden but only hours old -> plain '‼️ Yeni elan', no 'not sent before' note")
 
+print("\n[NOV-15] yeniemlak address line: clean, no description or half street names")
+ADDR_CASES = [   # text after "Ünvan:" on real cards -> address line in the message
+    ("Bakı Xətai rayonu Əhmədli metro. Əhmədli Xudu Məmmədov küçəsi Təcili satılır Ətraflı >>",
+     "Bakı, Xətai rayonu, Əhmədli m."),
+    ("Bakı Xətai rayonu metro Mənzil təcili olaraq satılır qiymətdə cüzi endirim Ətraflı >>",
+     "Bakı, Xətai rayonu"),
+    ("Bakı Xətai rayonu Ağ şəhər metro. Xətai 1 ci yaşıl ada küç Təcili satilir",
+     "Bakı, Xətai rayonu, Ağ şəhər, Xətai m."),
+    ("Bakı Nizami rayonu 8-ci kilometr metro. Qara Qarayev Behruz Nuriyev küç",
+     "Bakı, Nizami rayonu, 8-ci kilometr, Qara Qarayev m."),
+    ("Bakı Xətai rayonu H.Aslanov qəs. metro. Həzi Aslanov Gənclər parkının qarşısı",
+     "Bakı, Xətai rayonu, H.Aslanov qəs., Həzi Aslanov m."),
+    ("Bakı Nərimanov rayonu metro. Nəriman Nərimanov Təbriz küçəsi",
+     "Bakı, Nərimanov rayonu, Nəriman Nərimanov m."),
+    ("Bakı Nəsimi rayonu metro. 28 may Azadlıq pr", "Bakı, Nəsimi rayonu, 28 May m."),
+    ("Bakı Xətai rayonu metro. Naməlum stansiya küç", "Bakı, Xətai rayonu"),
+    ("Bakı Xətai rayonu H.Aslanov qəs. metro", "Bakı, Xətai rayonu, H.Aslanov qəs."),
+]
+bad_addr = [(a, m._ye_address(a), b) for a, b in ADDR_CASES if m._ye_address(a) != b]
+check(not bad_addr, f"{len(ADDR_CASES)} real address shapes -> clean address", str(bad_addr))
+card15 = ("<html>Nəticə: 1 <div>Satılır 185 000 Baxış sayı: 12| Tarix: 27.10.2026| Elan: 227514 "
+          "Bina evi menzil / Köhnə tikili 2 otaq 50 m2 5 / 3 Mərtəbə Ünvan: <b>Bakı</b><b>Xətai rayonu"
+          "</b><b>Əhmədli</b> metro. <b>Əhmədli</b> Xudu Məmmədov küçəsi</div><div>Təcili satılır, "
+          "Əhmədli metrosuna 5 dəqiqə</div><a href='/elan/satilir-2-otaqli-bina-evi-menzil-xetai-rayonu-"
+          "ehmedli-xudu-memmedov-kucesi-227514'>Ətraflı >></a></html>")
+it15 = m._parse_yeniemlak_page(card15)[0][0]
+check(it15["address"] == "Bakı, Xətai rayonu, Əhmədli m." and m.ye_passes(it15),
+      "parsed card: clean address; area filter unchanged", f"{it15['address']!r} | {it15['location']!r}")
+msg15 = m.format_new_owner(dict(it15), "yeniemlak.az", "Əmlak sahibi")
+check("📍 <b>Ünvan:</b> Bakı, Xətai rayonu, Əhmədli m.\n" in msg15 and "Xudu" not in msg15
+      and "Təcili" not in msg15, "message shows the clean address only")
+check("Ünvan" not in m.format_new_owner({"url": "u", "address": "", "location": "junk text"},
+                                         "yeniemlak.az"), "nothing usable -> no address line (not junk)")
+_now15 = _dt.datetime(2026, 11, 8, 1, 30, tzinfo=BAKU).timestamp()      # just after midnight
+a15, k15 = m._age_estimate(it15, None, _now15, None)
+got15 = dict(it15, _age_days=a15, _age_kind=k15, _posted_ts=_now15 - a15 * 86400)
+check(k15 == "min" and "ən gec 27.10.2026" in m.format_new_owner(got15, "yeniemlak.az"),
+      "date comes from the card's Tarix (27.10.2026), not the day after")
+ysrc15 = dict(yesrc)
+ys16 = dict(ye_hist)
+ys16["ye:227514"] = {"url": "u", "first_seen": iso(t_now - 11 * day), "source": "yeniemlak.az",
+                     "skip": "old ~75d"}
+got.clear()
+m.process_owner_new([dict(it15, updated_at=baku_date(t_now - 11 * day))], ysrc15, ys16, yflags)
+msg16 = m.format_new_owner(got[0], "yeniemlak.az", "Əmlak sahibi") if got else ""
+_dm = re.search(r"ən gec (\d\d)\.(\d\d)\.(\d{4})", msg16)
+_shown = _dt.datetime(int(_dm.group(3)), int(_dm.group(2)), int(_dm.group(1)), tzinfo=BAKU) if _dm else None
+_tarix = _dt.datetime.fromtimestamp(t_now - 11 * day, BAKU).replace(hour=0, minute=0, second=0, microsecond=0)
+check("♻️" in msg16 and _shown is not None and _shown <= _tarix and "ℹ️" not in msg16,
+      "real run: ♻️ + 'ən gec <date>' (on or before its Tarix) + no note",
+      msg16.splitlines()[2] if msg16 else "")
+mt3 = load(os.path.join(HERE, "monitor.py"), "monitor_taploc")
+ad_t = tap_ad("Öz evimdi", multi=False).replace(
+    "<html>", '<html><head><meta property="og:title" content="2-otaqlı mənzil, Əhmədli m., 60 m² - Tap.az">'
+              '<title>x</title></head>', 1)
+install_tap(mt3, ad_t)
+mt3.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menziller/48500099", {}, {},
+                    listing={"id": "48500099"})
+check(mt3.tap_check_owner.last_location == "Əhmədli m.", "tap detail page -> location for the message",
+      str(mt3.tap_check_owner.last_location))
+
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
 install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))
@@ -871,7 +941,8 @@ mr.USE_API = False
 mr.PAGE_DELAY = 0.0001
 TAPU = "https://tap.az/elanlar/dasinmaz-emlak/menziller/"
 pages_r = {
-    "48500001": tap_ad("Mənzil öz evimdi, makler deyiləm", seller="Elvin", uid="1001"),
+    "48500001": tap_ad("Mənzil öz evimdi, makler deyiləm", seller="Elvin", uid="1001").replace(
+        "<html>", '<html><meta property="og:title" content="3-otaqlı mənzil, Neftçilər m., 75 m²">', 1),
     "48500002": tap_ad("Təmirli 2 otaqlı mənzil, sənədləri qaydasındadır", seller="Nigar", uid="1002"),
     "48500003": tap_ad("Təmirli mənzil", seller="Kamran", uid="1003"),
     "48500004": tap_ad("Təmirli mənzil", seller="Kamran", uid="1003"),
@@ -909,7 +980,9 @@ def write_state():
 os.environ["SOURCES"] = "tap"
 rr = load(os.path.join(HERE, "recover_missed.py"), "recover_missed")
 sent_r = []
-mr.notify_new_owner_msg = lambda l, n, ol="": sent_r.append(l["id"]) or True
+msgs_r = {}
+mr.notify_new_owner_msg = lambda l, n, ol="": (sent_r.append(l["id"]),
+                                               msgs_r.__setitem__(l["id"], mr.format_new_owner(l, n, ol)))[0] or True
 write_state()
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
@@ -931,6 +1004,11 @@ with contextlib.redirect_stdout(io.StringIO()):
     rr.main()
 st_r = json.load(open(mr.STATE_FILE, encoding="utf-8"))["listings"]
 check(sorted(sent_r) == ["48500001", "48500007"], "SEND=1 sends exactly the 2 proven owners", str(sent_r))
+m01 = msgs_r.get("48500001", "")
+check("♻️" in m01 and "Yerləşdirilib:</b> ən gec 10.10.2026" in m01 and "səhvən" not in m01
+      and "ℹ️" not in m01, "recovered message: ♻️ + 'ən gec 10.10.2026' (first seen), no note",
+      m01.splitlines()[2] if m01 else "")
+check("📍 <b>Ünvan:</b> Neftçilər m." in m01, "recovered tap message has its address")
 check(st_r["tap:48500001"]["owner"] is True and st_r["tap:48500007"]["owner"] is True
       and "skip" not in st_r["tap:48500007"], "they are recorded as sent (never twice)")
 check(st_r["tap:48500002"]["owner"] is False and "rechecked" not in st_r["tap:48500002"],

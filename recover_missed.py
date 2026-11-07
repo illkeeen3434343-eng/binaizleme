@@ -45,7 +45,6 @@ LIMIT = int(os.environ.get("LIMIT", "150"))
 WANT = {x.strip() for x in os.environ.get("SOURCES", "tap,bina,yeniemlak").split(",") if x.strip()}
 FROM = m._to_epoch(os.environ.get("FROM", "2026-09-04") + "T00:00:00+00:00")
 TO = m._to_epoch(os.environ.get("TO", "2026-10-21") + "T00:00:00+00:00")
-NOTE = "Bu elan əvvəl səhvən göndərilməmişdi"
 VERDICT = {True: "OWNER", False: "agent", None: "unreadable"}
 UNVERIFIED_TAG = "count-unknown:defaulted-to-owner"
 
@@ -58,6 +57,9 @@ def tap_recheck(cands, origin):
         lst = {"id": iid, "url": v["url"], "rooms": v.get("rooms"), "area": v.get("area")}
         verdict, photo, seller = m.tap_check_owner(v["url"], apts, cache, listing=lst)
         reasons = list(getattr(m.tap_check_owner, "last_reasons", None) or [])
+        where = getattr(m.tap_check_owner, "last_location", None)
+        if where:
+            lst["location"] = where            # address line for the message
         out.append({"k": k, "v": v, "lst": lst, "verdict": verdict, "photo": photo,
                     "seller": seller, "reasons": reasons, "origin": origin,
                     "akey": m._apt_key(lst)})
@@ -212,8 +214,10 @@ def main():
               for src, pfx in (("tap.az", "tap:"), ("yeniemlak.az", "ye:"))}
     for k, lst, src, label in found:
         rec = seen[k]
-        age, _kind = m._age_estimate(lst, clocks.get(src), now_ts, rec)
-        lst["_age_days"], lst["_age_kind"], lst["_note"] = age, "min", NOTE
+        age, kind = m._age_estimate(lst, clocks.get(src), now_ts, rec)
+        if age is not None:
+            lst["_age_days"], lst["_age_kind"] = age, kind
+            lst["_posted_ts"] = now_ts - age * 86400.0   # shown as "ən gec dd.mm.yyyy"
         if m.notify_new_owner_msg(lst, src, label):
             sent += 1
         rec["owner"] = True                  # never sent twice
