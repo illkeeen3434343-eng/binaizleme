@@ -44,7 +44,11 @@ is read far more often.
 |---|---|---|
 | `FULL_SCAN_EVERY_MIN` | `60` | minutes between full passes; `0` = always full (old behaviour) |
 | `QUICK_MIN_PAGES` | `3` | pages a quick scan always reads |
-| `QUICK_SCAN_SOURCES` | `bina.az` | sources allowed to quick-scan (add `yeniemlak.az` / `lalafo.az` only if their feed is newest-first) |
+| `QUICK_SCAN_SOURCES` | `bina.az,yeniemlak.az` | sources allowed to quick-scan (add `lalafo.az` only if its feed is newest-first) |
+| `YENIEMLAK_SEARCH_URL` | metro URL \| settlement URL | several URLs separated by `\|`, merged by id (yeniemlak ANDs settlement and metro filters, so "either" needs two searches) |
+| `OLD_AD_POLICY` | `label` | never-shown owner ad that is old (bumped/VIP/edited): `label` = send it marked "♻️ Köhnə elan", `skip` = record quietly |
+| `RENEWED_SOURCES` | `yeniemlak.az,bina.az` | recorded-but-undecided listings renewed/edited on the site get one owner check and are sent as "♻️ Yenilənmiş elan"; empty = off |
+| `BINA_RENEW_SINCE` | `2026-08-26` | bina records first seen before this (price-tracker era) are not re-checked on renewal |
 | `BINA_PAGE_TRIES` | `3` | attempts per bina page before the run gives up on bina |
 | `TG_TRIES` | `3` | Telegram attempts (429 `retry_after` is honoured) |
 | `OUTBOX_MAX_AGE_H` | `48` | undelivered alerts are re-sent on later runs for this long |

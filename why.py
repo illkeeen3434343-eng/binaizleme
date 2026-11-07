@@ -31,8 +31,13 @@ def keys_for(arg):
 
 
 def explain(rec):
+    renew = (" Since 2026-11-07 a yeniemlak/bina record like this gets one owner check "
+             "when the site shows it renewed/edited, and is announced as renewed if it is "
+             "an owner post.")
     if "skip" in rec and str(rec["skip"]).startswith("old"):
-        return f"NOT ANNOUNCED - not a new ad ({rec['skip']}): an old ad lifted by bump/VIP/edit"
+        return (f"NOT ANNOUNCED - not a new ad ({rec['skip']}): an old ad lifted by "
+                "bump/VIP/edit (since 2026-11-07 such ads are sent labelled instead, "
+                "unless OLD_AD_POLICY=skip)." + renew)
     if rec.get("owner") is True:
         return "ANNOUNCED as an owner post"
     if rec.get("owner") is False:
@@ -43,9 +48,9 @@ def explain(rec):
                 "seller signal; retried until 4 reads")
     if rec.get("price_history") is not None:
         return ("RECORDED by the bina price tracker without an owner verdict (first run, "
-                "URL change, or 'no seller label after 4 reads')")
+                "URL change, or 'no seller label after 4 reads')." + renew)
     return ("RECORDED SILENTLY - seeded on a first run / search-URL change, never "
-            "announced by design")
+            "announced by design." + renew)
 
 
 def main():

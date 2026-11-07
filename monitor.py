@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-10-20-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-07-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -51,9 +51,17 @@ def http_get(url, headers=None, params=None, timeout=30, browser=False):
 BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
     "https://bina.az/baki/alqi-satqi/menziller?has_bill_of_sale=true&has_repair=true&location_ids%5B%5D=51&location_ids%5B%5D=100&location_ids%5B%5D=16&location_ids%5B%5D=11&location_ids%5B%5D=74&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=54&location_ids%5B%5D=33&location_ids%5B%5D=99&location_ids%5B%5D=200"
 ))
-YENIEMLAK_SEARCH_URL = os.environ.get("YENIEMLAK_SEARCH_URL", (
-    "https://yeniemlak.az/elan/axtar?elan_nov=1&emlak=1&menzil_nov=&qiymet=&qiymet2=&mertebe=&mertebe2=&otaq=&otaq2=&sahe_m=&sahe_m2=&sahe_s=&sahe_s2=&seher%5B%5D=7&rayon%5B%5D=2&rayon%5B%5D=9&menteqe%5B%5D=20&menteqe%5B%5D=66&menteqe%5B%5D=72&menteqe%5B%5D=73&metro%5B%5D=1&metro%5B%5D=2&metro%5B%5D=3&metro%5B%5D=4&metro%5B%5D=5&photo=1"
-))
+# yeniemlak ANDs its settlement (menteqe) and metro filters, so one URL with both
+# silently dropped every post tagged "district + metro" without a settlement (ad
+# 234096: "Xətai rayonu, metro Əhmədli"). Two searches, merged, give
+# district AND (settlement OR metro). Separate several URLs with "|".
+_YE_BASE = ("https://yeniemlak.az/elan/axtar?elan_nov=1&emlak=1&menzil_nov=&qiymet=&qiymet2="
+            "&mertebe=&mertebe2=&otaq=&otaq2=&sahe_m=&sahe_m2=&sahe_s=&sahe_s2="
+            "&seher%5B%5D=7&rayon%5B%5D=2&rayon%5B%5D=9")
+YENIEMLAK_SEARCH_URL = os.environ.get("YENIEMLAK_SEARCH_URL", " | ".join([
+    _YE_BASE + "&metro%5B%5D=1&metro%5B%5D=2&metro%5B%5D=3&metro%5B%5D=4&metro%5B%5D=5&photo=1",
+    _YE_BASE + "&menteqe%5B%5D=20&menteqe%5B%5D=66&menteqe%5B%5D=72&menteqe%5B%5D=73&photo=1",
+]))
 TAP_SEARCH_URL = os.environ.get("TAP_SEARCH_URL", (
     "https://tap.az/elanlar/dasinmaz-emlak/menziller?keywords_source=typewritten&p%5B740%5D=3722&q%5Bregion_id%5D=420&q%5Bis_shop%5D=false"
 ))
@@ -66,7 +74,7 @@ LALAFO_SEARCH_URL = os.environ.get("LALAFO_SEARCH_URL", (
 # scan takes ~10 minutes and goes last; if a slow run makes cron skip a tick, the
 # page-1 sources are not the ones that lose coverage.
 SOURCES = [
-    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "owner_new", "owner_label": "Sahibindən"},
+    {"name": "tap.az", "type": "tap", "url": TAP_SEARCH_URL, "prefix": "tap:", "mode": "owner_new", "owner_label": "Sahibindən", "id_clock": True},
     {"name": "lalafo.az", "type": "lalafo", "url": LALAFO_SEARCH_URL, "prefix": "lala:", "mode": "owner_new", "owner_label": "Mülkiyyətçi", "prefiltered_owner": True},
     {"name": "yeniemlak.az", "type": "yeniemlak", "url": YENIEMLAK_SEARCH_URL, "prefix": "ye:", "mode": "owner_new", "owner_label": "Əmlak sahibi"},
     {"name": "bina.az", "type": "bina", "url": BINA_SEARCH_URL, "prefix": "", "mode": "price_owner", "owner_label": "Mülkiyyətçi"},
@@ -461,6 +469,9 @@ def _bina_node(node):
             "has_repair": node.get("hasRepair"), "updated_at": node.get("updatedAt"),
             "created_at": node.get("createdAt") or node.get("publishedAt"),
             "_promoted": _node_promoted(node),
+            # bina's own flag for agency (business) accounts; used only to skip the page
+            # fetch when such an account merely bumps a listing (see _renewal_due)
+            "_business": node.get("isBusiness") is True,
             "url": f"https://bina.az{path}" if path else f"https://bina.az/items/{node['id']}",
             "photo": photo}
 
@@ -671,7 +682,7 @@ def _parse_yeniemlak_page(raw):
         price = int(pm.group(1).replace(" ", "")) if pm else None
         fl = re.search(r"(\d+)\s*/\s*(\d+)\s*Mərtəbə", b)
         rooms = re.search(r"(\d+)\s*otaq", b)
-        area = re.search(r"(\d+)\s*m2", b)
+        area = re.search(r"(\d+(?:[.,]\d+)?)\s*m2", b)
         date = re.search(r"Tarix:\s*([\d.]+)", b)
         loc = None
         lm = re.search(r"Ünvan:\s*(.+)", b)
@@ -681,7 +692,8 @@ def _parse_yeniemlak_page(raw):
             loc = (mm.group(1) if mm else raw_loc[:70]).strip()
         out.append({"id": iid, "url": id_url.get(iid, f"https://yeniemlak.az/elan/{iid}"),
                     "rooms": int(rooms.group(1)) if rooms else None,
-                    "area": int(area.group(1)) if area else None, "area_units": "m²",
+                    "area": float(area.group(1).replace(",", ".")) if area else None,
+                    "area_units": "m²",
                     "floor": int(fl.group(2)) if fl else None,
                     "floors": int(fl.group(1)) if fl else None,
                     "price": price, "currency": "AZN", "location": loc, "location_id": None,
@@ -691,39 +703,47 @@ def _parse_yeniemlak_page(raw):
     return out, total
 
 
+def _split_urls(v):
+    """'url1 | url2' (or whitespace-separated) -> [url1, url2]."""
+    return [u for u in re.split(r"[|\s]+", v or "") if u]
+
+
 def fetch_yeniemlak(url, plan=None):
-    """Page through the yeniemlak result set. Stops when a page adds no new
-    listing IDs (also the graceful fallback if ?page is ever ignored), or - in a
-    quick scan - when a page holds nothing unknown. Listings the site leaked
-    outside the wanted districts are dropped by ye_passes()."""
-    all_out, seen_ids = [], set()
+    """Page through each yeniemlak search URL and merge the results by id. A URL
+    stops when a page adds no new listing IDs (also the graceful fallback if ?page is
+    ever ignored), or - in a quick scan - when a page holds nothing unknown.
+    Listings the site leaked outside the wanted districts are dropped by ye_passes()."""
+    all_out, kept_ids = [], set()
     total = None
-    parsed = 0
-    for page in range(1, YE_MAX_PAGES + 1):
-        purl = _with_page(url, page)
-        r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
-        if r.status_code != 200:
-            if page == 1:
-                raise RuntimeError(f"HTTP {r.status_code}")
-            break
-        listings, tot = _parse_yeniemlak_page(r.text)
-        if tot is not None:
-            total = tot
-        new = [l for l in listings if l["id"] not in seen_ids]
-        if not new:                       # no new IDs -> end of results (or page ignored)
-            break
-        kept = []
-        for l in new:
-            seen_ids.add(l["id"])         # always mark, so pagination still terminates
-            parsed += 1
-            if ye_passes(l):
-                kept.append(l)
-        all_out.extend(kept)
-        if plan is not None and plan.stop_after(page, kept):
-            break
-        if PAGE_DELAY:
-            time.sleep(PAGE_DELAY)
-    log(f"yeniemlak: kept {len(all_out)} of {parsed} parsed, {page} page(s)"
+    parsed = pages = 0
+    for surl in _split_urls(url):
+        seen_ids = set()                  # per URL: decides when THIS search has ended
+        for page in range(1, YE_MAX_PAGES + 1):
+            r = http_get(_with_page(surl, page), headers=HTML_HEADERS, timeout=30, browser=True)
+            if r.status_code != 200:
+                if page == 1:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+                break
+            listings, tot = _parse_yeniemlak_page(r.text)
+            if tot is not None and page == 1:
+                total = (total or 0) + tot
+            new = [l for l in listings if l["id"] not in seen_ids]
+            if not new:                   # no new IDs -> end of results (or page ignored)
+                break
+            kept = []
+            for l in new:
+                seen_ids.add(l["id"])     # always mark, so pagination still terminates
+                parsed += 1
+                if ye_passes(l):
+                    kept.append(l)
+            all_out.extend(l for l in kept if l["id"] not in kept_ids)
+            kept_ids.update(l["id"] for l in kept)
+            pages += 1
+            if plan is not None and plan.stop_after(page, kept):
+                break
+            if PAGE_DELAY:
+                time.sleep(PAGE_DELAY)
+    log(f"yeniemlak: kept {len(all_out)} of {parsed} parsed, {pages} page(s)"
         + (f" (~{total} on site)" if total is not None else ""))
     # Alarm on a PARSE failure, never on a legitimately empty filtered result.
     if not parsed and total and total > 0:
@@ -741,26 +761,33 @@ def fetch_yeniemlak(url, plan=None):
 # FULL_SCAN_EVERY_MIN still catches deep price changes and anything buried under a
 # burst of bumps. bina's full pass takes ~10 min, so quick runs mean tap.az (page 1
 # only) is read several times more often.
-# Only sources in QUICK_SCAN_SOURCES use it. Add "yeniemlak.az" / "lalafo.az" only
-# after confirming their feeds are sorted newest-first.
+# Only sources in QUICK_SCAN_SOURCES use it. yeniemlak sorts by its renewal date
+# (verified 7 Nov: page 1 = today's cards), so it qualifies; add "lalafo.az" only
+# after confirming its feed is sorted newest-first.
 # --------------------------------------------------------------------------- #
 FULL_SCAN_EVERY_MIN = float(os.environ.get("FULL_SCAN_EVERY_MIN", "60"))   # 0 = always full
 QUICK_MIN_PAGES = int(os.environ.get("QUICK_MIN_PAGES", "3"))
 QUICK_SCAN_SOURCES = {s.strip() for s in os.environ.get(
-    "QUICK_SCAN_SOURCES", "bina.az").split(",") if s.strip()}
+    "QUICK_SCAN_SOURCES", "bina.az,yeniemlak.az").split(",") if s.strip()}
 
 
 class ScanPlan:
     """How deep to read one source this run. full=True reads every page."""
 
-    def __init__(self, full, seen=None, prefix="", owner_new=False):
+    def __init__(self, full, seen=None, prefix="", owner_new=False, source=None,
+                 renew_since=None):
         self.full, self.seen, self.prefix, self.owner_new = full, seen or {}, prefix, owner_new
+        self.source, self.renew_since = source or {}, renew_since
 
     def known(self, l):
+        """Nothing to do for this listing: recorded, not waiting for a retry, and not
+        renewed since it was last looked at."""
         rec = self.seen.get(self.prefix + str(l["id"]))
         if rec is None:
             return False
-        return not (self.owner_new and _is_retryable(rec))
+        if self.owner_new and _is_retryable(rec):
+            return False
+        return not _renewal_due(rec, l, self.source, self.renew_since)
 
     def stop_after(self, page_no, listings):
         """True when a quick scan may stop here: past the minimum page count and
@@ -775,10 +802,10 @@ def plan_scan(source, state):
     name, prefix = source["name"], source.get("prefix", "")
     seen = state.get("listings", {})
     owner_new = source.get("mode") == "owner_new"
-    plan = ScanPlan(True, seen, prefix, owner_new)
+    flags = state.get("seeded", {})
+    plan = ScanPlan(True, seen, prefix, owner_new, source, flags.get(name + ":renew_since"))
     if FULL_SCAN_EVERY_MIN <= 0 or name not in QUICK_SCAN_SOURCES:
         return plan
-    flags = state.get("seeded", {})
     seeded = flags.get(name if owner_new else name + ":owner_seeded")
     if (owner_new and prefix and not flags.get(name + ":seeded_empty")
             and not any(k.startswith(prefix) for k in seen)):
@@ -2023,9 +2050,14 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
                 photo = cand
                 break
     check_is_owner.last_reason = "ok"
-    if owner_label in text:
+    # The seller type sits in the contact block: "Əlaqə <name> Əmlak sahibi Qeyd" or
+    # "Əlaqə <name> Vasitəçi / Rieltor Qeyd". The site menu carries the word "Rieltor"
+    # on EVERY page, so the whole page must not decide.
+    mb = re.search(r"Əlaqə (.{0,160}?) Qeyd", text)
+    block = mb.group(1) if mb else text
+    if owner_label in block:
         return True, photo
-    if "Vasitəçi" in text or "Rieltor" in text or "Vasitəç:" in text:
+    if "Vasitəçi" in block or "Vasitəç:" in block or (mb and "Rieltor" in block):
         return False, photo
     check_is_owner.last_reason = "nolabel"
     # Page read fine but carries no seller label -> UNKNOWN, not "agent". Returning
@@ -2039,7 +2071,8 @@ check_is_owner.last_reason = ""
 
 
 def format_new_owner(l, source_name, owner_label="Əmlak sahibi"):
-    lines = [f"‼️ <b>Yeni elan</b> · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
+    head = l.get("_note") or "‼️ <b>Yeni elan</b>"      # renewed / old-ad label if any
+    lines = [f"{head} · {html.escape(source_name)} · <i>{html.escape(owner_label)}</i>", ""]
     if l.get("price") is not None:
         lines.append(f"💰 <b>Qiymət:</b> {_spaced(l['price'])} {l.get('currency', 'AZN')}")
     return _details(l, lines)
@@ -2106,6 +2139,79 @@ def listing_age_days(l, clock, now_ts):
     return clock.age_days(l.get("id"), now_ts) if clock is not None else None
 
 
+# What to do with an owner ad the bot has never shown that turns out to be OLD (a
+# bump / VIP / edit lifted it to the top). "label" = announce it, marked as an old
+# ad brought back, so it is not mistaken for a fresh post; "skip" = record it quietly
+# (the 2026-10-18 behaviour, which hid ads like tap 47325885).
+OLD_AD_POLICY = os.environ.get("OLD_AD_POLICY", "label").strip().lower()
+
+
+def _old_note(age):
+    return f"♻️ <b>Köhnə elan önə çəkilib</b> (~{age:.0f} gün)"
+
+
+# --------------------------------------------------------------------------- #
+# Renewed listings  (yeniemlak / bina)
+#
+# A listing the bot RECORDED but never decided on - silent seed, bina price-tracker
+# record, an old-ad skip, or a page that never showed a seller label - used to stay
+# silent forever. When the site says it was renewed / edited (yeniemlak's card date,
+# bina's updatedAt) after this feature went live, it gets ONE owner check and, if it
+# is an owner post, is announced as renewed (ye 152232, bina 6460118). Decided
+# listings (owner True/False) never come back. Each source's start time is stored as
+# "<name>:renew_since" so turning this on does not replay the whole backlog.
+# --------------------------------------------------------------------------- #
+RENEWED_SOURCES = {s.strip() for s in os.environ.get(
+    "RENEWED_SOURCES", "yeniemlak.az,bina.az").split(",") if s.strip()}
+# bina records from before owner checks existed (pure price-tracker era) are the
+# ~13k listings that were already on the site when the bot started; leave them out.
+BINA_RENEW_SINCE = _to_epoch(os.environ.get("BINA_RENEW_SINCE", "2026-08-26T00:00:00+00:00"))
+
+
+def _site_ts(l):
+    """The site's own 'last renewed / edited' stamp as epoch seconds, or None.
+    yeniemlak gives a date (dd.mm.yyyy), bina an ISO timestamp."""
+    v = l.get("updated_at")
+    if isinstance(v, str):
+        mm = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", v.strip())
+        if mm:
+            d, mo, y = (int(x) for x in mm.groups())
+            try:
+                return dt.datetime(y, mo, d, tzinfo=dt.timezone.utc).timestamp()
+            except ValueError:
+                return None
+    return _to_epoch(v)
+
+
+def _renewal_due(rec, l, source, renew_since):
+    """True when a recorded-but-undecided listing was renewed since we last looked."""
+    if source.get("name") not in RENEWED_SOURCES or not renew_since:
+        return False
+    if rec.get("owner") is True or rec.get("owner") is False:
+        return False                       # already announced, or judged an agent
+    if source.get("type") == "bina" and BINA_RENEW_SINCE:
+        t = _to_epoch(rec.get("first_seen"))
+        if t is None or t < BINA_RENEW_SINCE:
+            return False
+    ts = _site_ts(l)
+    return ts is not None and ts > (rec.get("upd_ts") or renew_since)
+
+
+def _renew_note(rec):
+    first = str(rec.get("first_seen") or "")[:10]
+    return "♻️ <b>Yenilənmiş elan</b>" + (f" (ilk dəfə {first})" if first else "")
+
+
+def _rec(l, first_seen, name, **fields):
+    """A listing record; carries the site's renewal stamp so a later renewal is seen."""
+    r = {"url": l["url"], "first_seen": first_seen, "source": name}
+    r.update(fields)
+    ts = _site_ts(l)
+    if ts is not None and name in RENEWED_SOURCES:
+        r["upd_ts"] = ts
+    return r
+
+
 def _url_fingerprint(url):
     return hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:12]
 
@@ -2159,17 +2265,26 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None, 
         # a quick scan sees only the top pages: absence from it says nothing
         if (full_scan and k not in now_ids) or (prefix + k) in seen:
             tries_map.pop(k, None)
-    checks = notified = 0
+    checks = notified = renewals = 0
     fail_streak = 0
     deferred = set()
     decided = {}
+    renew_since = seeded_flags.get(name + ":renew_since")
     for l in items:
         iid = str(l["id"])
         key = prefix + iid
-        if key in seen:
-            continue                  # already known (price-tracked or checked before)
+        rec = seen.get(key)
+        if rec is not None:
+            # known: price-tracked or checked before. Only a renewal of a listing that
+            # never got an owner verdict is looked at again (see RENEWED_SOURCES).
+            if not _renewal_due(rec, l, source, renew_since):
+                continue
+            if l.get("_business"):
+                rec["upd_ts"] = _site_ts(l)   # agency account bumped its ad: no page fetch
+                continue
         if checks >= MAX_OWNER_CHECKS or fail_streak >= OWNER_FETCH_FAIL_STREAK:
-            deferred.add(iid)         # over budget / site refusing -> retry next run
+            if rec is None:
+                deferred.add(iid)     # over budget / site refusing -> retry next run
             continue
         if source.get("type") == "bina":
             owner, photo = bina_is_owner(l["url"])
@@ -2189,6 +2304,9 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None, 
                         "pausing owner checks until next run")
                 continue
             fail_streak = 0
+            if rec is not None:       # renewal with no label: wait for the next renewal
+                rec["upd_ts"] = _site_ts(l)
+                continue
             n = tries_map.get(iid, 0) + 1
             if n >= OWNER_MAX_TRIES:
                 tries_map.pop(iid, None)
@@ -2200,21 +2318,29 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None, 
             continue
         fail_streak = 0
         tries_map.pop(iid, None)
-        decided[iid] = bool(owner)
+        if rec is not None:
+            rec["owner"], rec["upd_ts"] = bool(owner), _site_ts(l)
+            renewals += 1
+            if owner:
+                l["_note"] = _renew_note(rec)
+        else:
+            decided[iid] = bool(owner)
         if not owner:
             log(f"{name}: {l['url']} -> AGENT (not announced)")
         if owner:
-            if is_stale_promoted(l):
+            if rec is None and is_stale_promoted(l):
                 age = _listing_age_days(l)
-                log(f"{name}: {l['url']} -> promoted bump of a ~{age:.0f}-day-old ad; "
-                    f"recorded, not announced")
-                continue              # seeded by process_source; never announced as new
+                if OLD_AD_POLICY == "skip":
+                    log(f"{name}: {l['url']} -> promoted bump of a ~{age:.0f}-day-old ad; "
+                        f"recorded, not announced")
+                    continue          # seeded by process_source; never announced as new
+                l["_note"] = _old_note(age)
             if photo:
                 l["photo"] = photo    # keep API photo if detail gave none
             if notify_new_owner_msg(l, name, owner_label):
                 notified += 1
     if checks or deferred:
-        log(f"{name}: owner-checked {checks} new, announced {notified}, "
+        log(f"{name}: owner-checked {checks} ({renewals} renewed), announced {notified}, "
             f"deferred {len(deferred)}")
     return notified, deferred, decided
 
@@ -2255,23 +2381,34 @@ def process_owner_new(items, source, seen, seeded_flags):
     prefiltered = source.get("prefiltered_owner", False)  # URL already asks for owner posts
     seller_apts = _seller_apartments(seen) if stype == "tap" else {}
     tap_profile_cache = {}
-    clock = IdClock.from_seen(seen, name, prefix)
+    # The id clock assumes ids grow with time. True for tap; NOT for yeniemlak, whose
+    # ids are scattered (100104 ... 999167 all live in Aug), which made every new
+    # yeniemlak ad look ~75 days old and silenced all of them since 2026-10-18.
+    clock = IdClock.from_seen(seen, name, prefix) if source.get("id_clock") else None
+    renew_since = seeded_flags.get(name + ":renew_since")
     checks = notified = fail_streak = 0
     for l in items:
         key = prefix + str(l["id"])
         rec = seen.get(key)
-        if rec is not None and not _is_retryable(rec):
+        renewed = rec is not None and _renewal_due(rec, l, source, renew_since)
+        if rec is not None and not _is_retryable(rec) and not renewed:
             continue                       # known: announced, rejected, seeded or given up
         first_seen = (rec or {}).get("first_seen", now)
 
-        # Really new? An old ad lifted by İrəli çək / VIP / Premium / an edit is
-        # recorded quietly and never announced as "Yeni elan".
-        age = listing_age_days(l, clock, now_ts)
-        if age is not None and age > NEW_MAX_AGE_DAYS:
-            seen[key] = {"url": l["url"], "first_seen": first_seen, "source": name,
-                         "skip": f"old ~{age:.0f}d"}
-            log(f"{name}: {l['url']} -> not new (~{age:.0f} days old); recorded, not announced")
-            continue
+        if renewed:
+            l["_note"] = _renew_note(rec)
+            log(f"{name}: {l['url']} -> renewed on the site ({l.get('updated_at')}); re-checking")
+        else:
+            # Really new? An old ad lifted by İrəli çək / VIP / Premium / an edit is
+            # never announced as "Yeni elan": it is labelled (or skipped, see policy).
+            age = listing_age_days(l, clock, now_ts)
+            if age is not None and age > NEW_MAX_AGE_DAYS:
+                if OLD_AD_POLICY == "skip":
+                    seen[key] = _rec(l, first_seen, name, skip=f"old ~{age:.0f}d")
+                    log(f"{name}: {l['url']} -> not new (~{age:.0f} days old); "
+                        "recorded, not announced")
+                    continue
+                l["_note"] = _old_note(age)
 
         if prefiltered:
             # "prefiltered" only means the SEARCH URL asked for owner posts. lalafo still
@@ -2288,11 +2425,9 @@ def process_owner_new(items, source, seen, seeded_flags):
                         why = "agent-text " + ",".join(rs)
                 if why:
                     log(f"lalafo.az: {l['url']} -> skipped ({why})")
-                    seen[key] = {"url": l["url"], "first_seen": first_seen,
-                                 "source": name, "owner": False, "skip": why}
+                    seen[key] = _rec(l, first_seen, name, owner=False, skip=why)
                     continue
-            seen[key] = {"url": l["url"], "first_seen": first_seen, "source": name,
-                         "owner": True}
+            seen[key] = _rec(l, first_seen, name, owner=True)
             if notify_new_owner_msg(l, name, owner_label):
                 notified += 1
             continue
@@ -2320,16 +2455,14 @@ def process_owner_new(items, source, seen, seeded_flags):
                 continue
             fail_streak = 0
             tries = (rec or {}).get("tries", 0) + 1
-            seen[key] = {"url": l["url"], "first_seen": first_seen, "source": name,
-                         "owner": None, "tries": tries}
+            seen[key] = _rec(l, first_seen, name, owner=None, tries=tries)
             if tries >= OWNER_MAX_TRIES:
                 log(f"{name}: {l['url']} undetermined after {tries} reads; giving up")
             continue
         fail_streak = 0
         if photo:
             l["photo"] = photo
-        new_rec = {"url": l["url"], "first_seen": first_seen, "source": name,
-                   "owner": bool(owner)}
+        new_rec = _rec(l, first_seen, name, owner=bool(owner))
         if seller:
             new_rec["seller"] = seller
             if stype == "tap":
@@ -2485,6 +2618,9 @@ def main():
     status = state.setdefault("source_status", {})   # source name -> last error ("" = healthy)
     seeded_flags = state.setdefault("seeded", {})     # owner_new sources -> initial seed done
     full_scans = state.setdefault("last_full_scan", {})
+    for source in SOURCES:            # renewals count only from the first run with the feature
+        if source["name"] in RENEWED_SOURCES:
+            seeded_flags.setdefault(source["name"] + ":renew_since", time.time())
     for source in SOURCES:
         name = source["name"]
         plan = plan_scan(source, state)

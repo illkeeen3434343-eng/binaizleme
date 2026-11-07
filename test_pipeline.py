@@ -5,6 +5,7 @@ Needs no network and sends nothing (all fetchers and Telegram are replaced)."""
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -223,8 +224,9 @@ old_lalafo = {"created_ts": t_now - 300 * day}
 check(m.listing_age_days(old_lalafo, None, t_now) > 299, "lalafo creation date wins")
 
 sent.clear()
+m.OLD_AD_POLICY = "skip"                       # the 2026-10-18 behaviour, still selectable
 tsrc = {"name": "tap.az", "type": "tap", "prefix": "tap:", "mode": "owner_new",
-        "owner_label": "Sahibindən", "url": "https://tap.az/x"}
+        "owner_label": "Sahibindən", "url": "https://tap.az/x", "id_clock": True}
 seen3 = dict(hist)
 flags3 = {"tap.az": True, "tap.az:url": m._url_fingerprint(tsrc["url"])}
 install_tap(m, tap_ad("Öz evimdi", multi=False))
@@ -238,6 +240,16 @@ check(str(seen3.get("tap:48290603", {}).get("skip", "")).startswith("old"),
       "suppressed ad is recorded with skip=old (never re-checked)")
 check(seen3.get("tap:48405000", {}).get("seller") == "22702915"
       and seen3["tap:48405000"].get("rooms") == 3, "tap record keeps seller + rooms/area")
+m.OLD_AD_POLICY = "label"                      # default since 2026-11-07
+sent.clear()
+seen3b = dict(hist)
+labels = []
+m.notify_new_owner_msg = lambda l, n, ol="": sent.append(l["id"]) or labels.append(l.get("_note")) or True
+m.process_owner_new([dict(bumped), dict(fresh)], tsrc, seen3b, flags3)
+check(sent == ["48290603", "48405000"] and "Köhnə elan" in (labels[0] or "") and labels[1] is None,
+      "default policy: old bumped owner ad IS sent, labelled as old; fresh ad sent as new",
+      str(list(zip(sent, labels))))
+m.notify_new_owner_msg = lambda l, n, ol="": sent.append(l["id"]) or True
 
 # --------------------------------------------------------------------------- #
 print("\n[URL] changing a search URL re-seeds silently")
@@ -308,8 +320,10 @@ agent_item = {"id": "900001", "url": "https://lalafo.az/baku/ads/baki-hmdli-2-ot
 owner_item = {"id": "900002", "url": "https://lalafo.az/baku/ads/baki-hmdli-3-otaqli-id-900002",
               "location": "Bakı, Əhmədli", "_agent": False, "created_ts": t_now,
               "_text": "Makler deyiləm, ev özümündür"}
+m.OLD_AD_POLICY = "skip"
 m.process_owner_new([agent_item, owner_item, dict(owner_item, id="900003",
                     created_ts=t_now - 300 * day)], lsrc, seen6, flags6)
+m.OLD_AD_POLICY = "label"
 check(sent == ["900002"], "EKSKLUZIV agent skipped, fresh owner sent, 300-day-old owner skipped",
       str(sent))
 
@@ -523,6 +537,111 @@ mq.process_owner_new([], tsrc_q, seen_q, flags_q)            # first run: nothin
 mq.process_owner_new([{"id": "48900009", "url": "https://tap.az/9"}], tsrc_q, seen_q, flags_q)
 check(sent_q == ["48900009"], "first listing after an empty seed is announced", str(sent_q))
 mq._RUNTIME["state"] = None
+
+# --------------------------------------------------------------------------- #
+print("\n[2026-11-07] the five missed listings")
+mr = load(os.path.join(HERE, "monitor.py"), "monitor_r")
+mr.time.sleep = lambda s: None
+mr.PAGE_DELAY = 0
+sent_r = []
+mr.notify_new_owner_msg = lambda l, n, ol="": sent_r.append((l["id"], l.get("_note"))) or True
+ysrc = {"name": "yeniemlak.az", "type": "yeniemlak", "prefix": "ye:", "mode": "owner_new",
+        "owner_label": "Əmlak sahibi", "url": "https://yeniemlak.az/x"}
+yflags = {"yeniemlak.az": True, "yeniemlak.az:url": mr._url_fingerprint(ysrc["url"]),
+          "yeniemlak.az:renew_since": time.mktime((2026, 11, 7, 12, 0, 0, 0, 0, 0))}
+# real shape of seen.json: yeniemlak ids are NOT time-ordered (999167 seen in Aug)
+yseen = {f"ye:{i}": {"url": "u", "first_seen": "2026-08-24T08:49:10+00:00", "source": "yeniemlak.az"}
+         for i in (100104, 152232, 175310, 954616, 999167)}
+real_check_is_owner = mr.check_is_owner
+mr.check_is_owner = lambda url, label="": (setattr(mr.check_is_owner, "last_reason", "ok") or True, None)
+ye_234096 = {"id": "234096", "url": "https://yeniemlak.az/elan/x-234096", "updated_at": "08.11.2026"}
+mr.process_owner_new([ye_234096], ysrc, yseen, yflags)
+check(sent_r == [("234096", None)], "ye 234096: a new id below old huge ids is announced as NEW "
+      "(no id-clock for yeniemlak)", str(sent_r))
+
+print("\n[2026-11-07] renewed listings")
+sent_r.clear()
+ye_152232 = {"id": "152232", "url": "https://yeniemlak.az/elan/x-152232", "updated_at": "06.11.2026"}
+mr.process_owner_new([dict(ye_152232)], ysrc, yseen, yflags)
+check(sent_r == [], "renewed BEFORE the feature started -> quiet (no backlog replay)", str(sent_r))
+mr.process_owner_new([dict(ye_152232, updated_at="09.11.2026")], ysrc, yseen, yflags)
+check(len(sent_r) == 1 and sent_r[0][0] == "152232" and "Yenilənmiş" in (sent_r[0][1] or ""),
+      "ye 152232: silently seeded in Aug, renewed later -> announced once as renewed", str(sent_r))
+check(yseen["ye:152232"].get("owner") is True and yseen["ye:152232"].get("first_seen", "").startswith("2026-08-24"),
+      "record keeps its first_seen and is now decided")
+mr.process_owner_new([dict(ye_152232, updated_at="12.11.2026")], ysrc, yseen, yflags)
+check(len(sent_r) == 1, "renewed again after being announced -> no duplicate", str(sent_r))
+yseen["ye:175310"]["owner"] = False
+mr.process_owner_new([{"id": "175310", "url": "u2", "updated_at": "12.11.2026"}], ysrc, yseen, yflags)
+check(len(sent_r) == 1, "agent (owner=False) renewing its ad stays quiet", str(sent_r))
+plan = mr.ScanPlan(False, yseen, "ye:", True, ysrc, yflags["yeniemlak.az:renew_since"])
+check(not plan.known({"id": "100104", "updated_at": "12.11.2026"})
+      and plan.known({"id": "100104", "updated_at": "01.11.2026"}),
+      "quick scan treats a renewed undecided listing as work to do")
+
+bsrc_r = {"name": "bina.az", "type": "bina", "prefix": "", "mode": "price_owner",
+          "owner_label": "Mülkiyyətçi", "url": "https://bina.az/x"}
+bflags = {"bina.az:owner_seeded": True, "bina.az:url": mr._url_fingerprint(bsrc_r["url"]),
+          "bina.az:renew_since": time.mktime((2026, 11, 7, 12, 0, 0, 0, 0, 0))}
+bseen = {"6460118": {"url": "u", "first_seen": "2026-09-14T12:00:00+00:00", "source": "bina.az",
+                     "price": 285000, "price_history": [{"price": 285000, "date": "x"}]},
+         "6100000": {"url": "u", "first_seen": "2026-08-10T12:00:00+00:00", "source": "bina.az",
+                     "price": 1, "price_history": []}}
+fetched = []
+mr.bina_is_owner = lambda url: (fetched.append(url), setattr(mr.bina_is_owner, "last_reason", "ok"))[0] or (True, None)
+sent_r.clear()
+b6460118 = {"id": "6460118", "url": "https://bina.az/items/6460118", "price": 285000,
+            "updated_at": "2026-11-08T10:00:00+04:00", "_business": False, "_promoted": False}
+mr.process_new_owner_checks([b6460118], bsrc_r, bseen, bflags, tries_map={})
+check(len(sent_r) == 1 and sent_r[0][0] == "6460118" and "Yenilənmiş" in (sent_r[0][1] or "")
+      and bseen["6460118"].get("owner") is True and bseen["6460118"]["price_history"],
+      "bina 6460118: ownerless Sept record edited later -> announced as renewed, history kept",
+      str(sent_r))
+mr.process_new_owner_checks([dict(b6460118, updated_at="2026-11-09T10:00:00+04:00")], bsrc_r,
+                            bseen, bflags, tries_map={})
+check(len(sent_r) == 1, "bina: decided now -> next edit is quiet")
+fetched.clear()
+mr.process_new_owner_checks([{"id": "6100000", "url": "u", "price": 1, "_business": False,
+                              "updated_at": "2026-11-09T10:00:00+04:00"}], bsrc_r, bseen, bflags, tries_map={})
+check(fetched == [], "bina: pre-owner-check (price-tracker era) record is not re-checked")
+bseen["6500001"] = {"url": "u", "first_seen": "2026-10-01T00:00:00+00:00", "source": "bina.az"}
+mr.process_new_owner_checks([{"id": "6500001", "url": "u", "price": 1, "_business": True,
+                              "updated_at": "2026-11-09T10:00:00+04:00"}], bsrc_r, bseen, bflags, tries_map={})
+check(fetched == [] and bseen["6500001"].get("upd_ts"),
+      "bina: agency account (isBusiness) bump -> no page fetch, stamp moved on")
+
+print("\n[2026-11-07] yeniemlak parsing")
+card = ("<div>Satılır 249000 Baxış sayı: 124 | Tarix: 06.11.2026 | Elan: 152232 Bina evi menzil / "
+        "Yeni tikili 3 otaq 102.5 m2 13 / 3 Mərtəbə Ünvan: Bakı Xətai rayonu Əhmədli metro. "
+        "Xalqlar Dostluğu</div><a href='/elan/satilir-y-152232'>x</a>")
+ls_, _ = mr._parse_yeniemlak_page(card)
+check(ls_ and ls_[0]["area"] == 102.5 and ls_[0]["floor"] == 3 and ls_[0]["floors"] == 13,
+      "area '102.5 m2' parsed as 102.5 (was 5)", str(ls_[0] if ls_ else None))
+NAV = "<div>Ana səhifə Axtarış Rieltor Faydalı</div>"
+for body, want, label in [
+        (NAV + "<p>Əlaqə</p><p>Zaur</p><p>Əmlak sahibi</p><p>Qeyd</p>", True, "owner label in contact block"),
+        (NAV + "<p>Əlaqə</p><p>Kamal bəy - Alo Estate</p><p>Vasitəçi / Rieltor</p><p>Qeyd</p>", False,
+         "'Vasitəçi / Rieltor' in contact block"),
+        (NAV + "<p>Əlaqə</p><p>Zaur</p><p>Qeyd</p>", None, "menu word 'Rieltor' alone no longer means agent")]:
+    mr.http_get = lambda url, headers=None, params=None, timeout=30, browser=False, _b=body: R(_b + "x" * 2000)
+    v, _ = real_check_is_owner("https://yeniemlak.az/elan/1", "Əmlak sahibi")
+    check(v is want, label, V[v])
+pages_y = {("A", 1): ["1", "2"], ("A", 2): ["3"], ("B", 1): ["2", "4"], ("B", 2): ["5"]}
+
+
+def ye_fake(url, headers=None, params=None, timeout=30, browser=False):
+    key = ("A" if "metro" in url else "B", int(re.search(r"page=(\d+)", url).group(1)))
+    ids_ = pages_y.get(key, [])
+    return R("".join(f"<div>Satılır 1000 Baxış sayı: 1 | Tarix: 07.11.2026 | Elan: {i} 2 otaq 50 m2 "
+                     f"Ünvan: Bakı Xətai rayonu</div>" for i in ids_) + "x" * 100)
+
+
+mr.http_get = ye_fake
+got = mr.fetch_yeniemlak("https://yeniemlak.az/a?metro=1 | https://yeniemlak.az/a?menteqe=1")
+check(sorted(l["id"] for l in got) == ["1", "2", "3", "4", "5"],
+      "two search URLs merged by id; 2nd URL's page 1 starting with a known id still pages on",
+      str(sorted(l["id"] for l in got)))
+check(len(mr._split_urls(mr.YENIEMLAK_SEARCH_URL)) == 2, "default yeniemlak search = metro URL + settlement URL")
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 sys.exit(1 if FAILS else 0)
