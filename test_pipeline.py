@@ -2,7 +2,9 @@
 """Regression tests for the 2026-10-18 review. Every case comes from a real listing
 or a confirmed code path. Run on the VM:   .venv/bin/python test_pipeline.py
 Needs no network and sends nothing (all fetchers and Telegram are replaced)."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -504,6 +506,383 @@ t_ex = m.format_new_owner({"url": "https://x", "_age_days": 200.4, "_age_kind": 
 check("~200 gün əvvəl" in t_ex, "exact creation date: '~200 days ago'")
 t_new = m.format_new_owner({"url": "https://x", "price": 1, "_age_days": 1.5}, "tap.az", "Sahibindən")
 check("‼️ <b>Yeni elan</b>" in t_new and "🕓" not in t_new, "new ad: ‼️ header, no age line")
+
+# --------------------------------------------------------------------------- #
+# 2026-11-07-b: yeniemlak rate limit (HTTP 429 after ~30 quick requests, 7 Nov 2026)
+# --------------------------------------------------------------------------- #
+class Clock:
+    """Virtual time for a module: sleep() only moves the clock (tests stay fast)."""
+    def __init__(self, t0=2_000_000_000.0):
+        self.t, self.slept = t0, []
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.slept.append(s)
+        self.t += max(0.0, s)
+
+
+class RH:
+    def __init__(self, code=200, text="", headers=None):
+        self.status_code, self.text, self.headers = code, text, headers or {}
+        self.content = text.encode("utf-8")
+
+
+OWNER_PAGE = "<html><div>Əmlak sahibi</div>" + "x" * 3000 + "</html>"
+print("\n[NOV-7] yeniemlak requests are spaced out; a 429 is waited out once, then left alone")
+mt = load(os.path.join(HERE, "monitor.py"), "monitor_net")
+ck = Clock()
+mt.time = ck
+mt.HOST_MIN_INTERVAL = {"yeniemlak.az": 2.5}
+mt.RATE_LIMIT_WAIT, mt.RATE_LIMIT_MAX_WAIT = 45.0, 90.0
+raw_calls, replies = [], []
+
+
+def fake_raw(url, headers=None, params=None, timeout=30, browser=False):
+    raw_calls.append((url, ck.t))
+    return replies.pop(0) if replies else RH(200, OWNER_PAGE)
+
+
+mt._raw_get = fake_raw
+for _ in range(3):
+    mt.http_get("https://yeniemlak.az/elan/axtar?page=1")
+gaps = [b[1] - a[1] for a, b in zip(raw_calls, raw_calls[1:])]
+check(all(g >= 2.5 - 1e-9 for g in gaps), "yeniemlak requests >= 2.5 s apart", str(gaps))
+raw_calls.clear()
+mt.http_get("https://tap.az/elanlar/1")
+mt.http_get("https://tap.az/elanlar/2")
+check(len(raw_calls) == 2 and raw_calls[1][1] - raw_calls[0][1] == 0, "other sites are not slowed down")
+raw_calls.clear()
+ck.slept.clear()
+replies[:] = [RH(429, "too many", {"Retry-After": "20"}), RH(200, OWNER_PAGE)]
+r_ = mt.http_get("https://yeniemlak.az/elan/x-1")
+check(r_.status_code == 200 and len(raw_calls) == 2 and 20 in ck.slept and not mt.RATE_LIMITED,
+      "429 -> waits Retry-After (20 s) -> retry succeeds", str(ck.slept))
+raw_calls.clear()
+ck.slept.clear()
+replies[:] = [RH(429, "", {"Retry-After": "600"}), RH(429, "")]
+r_ = mt.http_get("https://yeniemlak.az/elan/x-2")
+check(r_.status_code == 429 and mt.RATE_LIMITED.get("yeniemlak.az") and max(ck.slept) == 90.0,
+      "still 429 after a capped wait (90 s, not 600) -> host marked rate-limited", str(ck.slept))
+n_before = len(raw_calls)
+r_ = mt.http_get("https://yeniemlak.az/elan/x-3")
+check(r_.status_code == 429 and len(raw_calls) == n_before,
+      "after that: no more requests to yeniemlak this run")
+v_, p_ = mt.check_is_owner("https://yeniemlak.az/elan/x-4", "Əmlak sahibi")
+check(v_ is None and mt.check_is_owner.last_reason == "ratelimit" and len(raw_calls) == n_before,
+      "owner check -> 'ratelimit' (not a failed read), no request made")
+check(mt._retry_after_seconds(RH(429, "", {"Retry-After": "7"})) == 7.0
+      and mt._retry_after_seconds(RH(429, "", {"Retry-After": "soon"})) is None
+      and mt._retry_after_seconds(RH(429)) is None, "Retry-After parsing")
+mt.RATE_LIMITED.clear()
+raw_calls.clear()
+replies[:] = [RH(429, ""), RH(429, "")]
+v_, p_ = mt.check_is_owner("https://yeniemlak.az/elan/x-5", "Əmlak sahibi")
+check(v_ is None and mt.check_is_owner.last_reason == "ratelimit" and len(raw_calls) == 2,
+      "429 during an owner check: 2 requests in total, then stop (not 2 x 2)", str(len(raw_calls)))
+if old is not None and OLD_V == "2026-11-07-a":
+    oc_calls = []
+    old.time = Clock()
+    old.requests = type("Q", (), {"get": staticmethod(lambda *a, **k: oc_calls.append(1) or RH(200, "x"))})
+    old.HAS_CURL_CFFI = False
+    t0_ = old.time.t
+    for _ in range(3):
+        old.http_get("https://yeniemlak.az/elan/axtar?page=1")
+    check(old.time.t == t0_ and len(oc_calls) == 3, "OLD code: yeniemlak requests fired back to back")
+
+print("\n[NOV-8] rate-limited run: nothing recorded, no try used; next run checks them")
+mt.RATE_LIMITED.clear()
+mt.PAGE_DELAY = 0
+ye_src = {"name": "yeniemlak.az", "type": "yeniemlak", "prefix": "ye:", "mode": "owner_new",
+          "owner_label": "Əmlak sahibi", "url": "https://yeniemlak.az/x"}
+ye_flags = {"yeniemlak.az": True, "yeniemlak.az:url": mt._url_fingerprint(ye_src["url"])}
+ye_seen = {"ye:234000": {"url": "u", "first_seen": iso(ck.t - day), "source": "yeniemlak.az",
+                         "owner": True}}
+sent8 = []
+mt.notify_new_owner_msg = lambda l, n, ol="": sent8.append(l["id"]) or True
+feed8 = [{"id": str(234100 + i), "url": f"https://yeniemlak.az/elan/x-{234100 + i}",
+          "price": 100000, "location": "Bakı Xətai rayonu", "updated_at": baku_date(ck.t)}
+         for i in range(3)]
+replies[:] = [RH(429, ""), RH(429, "")]
+raw_calls.clear()
+mt.process_owner_new([dict(x) for x in feed8], ye_src, ye_seen, ye_flags)
+check(sent8 == [] and len(ye_seen) == 1, "run 1 (429): nothing sent, nothing recorded")
+check(len(raw_calls) == 2, "run 1: stopped after the refused page (no hammering)", str(len(raw_calls)))
+mt.RATE_LIMITED.clear()                       # a new run starts with a clean slate
+mt.process_owner_new([dict(x) for x in feed8], ye_src, ye_seen, ye_flags)
+check(sent8 == ["234100", "234101", "234102"], "run 2: all three checked and sent", str(sent8))
+check(all("tries" not in ye_seen[f"ye:{234100 + i}"] for i in range(3)), "no try was used up")
+
+print("\n[NOV-9] yeniemlak search: newest pages only, full read every few hours")
+
+
+def ye_page(cards):
+    out = []
+    for iid, tarix, loc in cards:
+        out.append(f'<div class="ad"><a href="/elan/satilir-2-otaqli-x-{iid}">x</a>'
+                   f"Satılır 150 000 Baxış 12 Elan: {iid} 2 otaq 60 m2 3/9 Mərtəbə "
+                   f"Tarix: {tarix} Ünvan: {loc}</div>")
+    return "<html>Nəticə: 250 " + "".join(out) + "</html>"
+
+
+XETAI, YAS = "Bakı Xətai rayonu, metro. Əhmədli", "Bakı Yasamal rayonu, metro. İnşaatçılar"
+TODAY, YDAY, OLD_D = baku_date(ck.t), baku_date(ck.t - day), baku_date(ck.t - 6 * day)
+
+
+def build_site(pages):
+    def fake_get(url, headers=None, params=None, timeout=30, browser=False):
+        n = int(mt.parse_qs(mt.urlparse(url).query).get("page", ["1"])[0])
+        fetched.append(n)
+        return RH(200, ye_page(pages[n - 1]) if n <= len(pages) else "<html>Nəticə: 250</html>")
+    return fake_get
+
+
+def ids(a, b):
+    return list(range(a, b))
+
+
+site = [[(i, TODAY, XETAI) for i in ids(240000, 240025)],
+        [(i, YDAY, XETAI) for i in ids(239900, 239925)]]
+site += [[(i, OLD_D, XETAI) for i in ids(239000 - 100 * p, 239025 - 100 * p)] for p in range(8)]
+known = {f"ye:{c[0]}": {"url": "u", "first_seen": iso(ck.t - 7 * day), "source": "yeniemlak.az",
+                        "owner": False} for pg in site for c in pg}
+fetched = []
+mt.http_get = build_site(site)
+act_known = (lambda l: mt._candidate_kind("yeniemlak", l, known.get("ye:" + str(l["id"])),
+                                          ck.t) is not None)
+got9 = mt.fetch_yeniemlak("https://yeniemlak.az/x")
+check(fetched == list(range(1, 12)) and len(got9) == 250, "full read: all 10 pages", str(fetched))
+fetched.clear()
+got9 = mt.fetch_yeniemlak("https://yeniemlak.az/x", actionable=act_known)
+check(fetched == [1, 2, 3, 4], "nothing new: today + yesterday + 2 quiet pages, then stop", str(fetched))
+fetched.clear()
+k2 = dict(known)
+k2.pop("ye:238910")                                   # unrecorded old-dated ad on page 4
+k2.pop("ye:238710")                                   # and on page 6
+act2 = (lambda l: mt._candidate_kind("yeniemlak", l, k2.get("ye:" + str(l["id"])), ck.t) is not None)
+got9 = mt.fetch_yeniemlak("https://yeniemlak.az/x", actionable=act2)
+check(fetched == [1, 2, 3, 4, 5, 6, 7, 8],
+      "unrecorded listings keep it reading (pages 4 and 6), stops 2 quiet pages later", str(fetched))
+fetched.clear()
+site3 = [list(pg) for pg in site]
+for p in range(2, 10):
+    site3[p] = [(c[0] + 5_000_000, OLD_D, YAS) for c in site3[p]]       # leaked out-of-area ads
+mt.http_get = build_site(site3)
+got9 = mt.fetch_yeniemlak("https://yeniemlak.az/x", actionable=act_known)
+check(fetched == [1, 2, 3, 4], "out-of-area ads (never recorded) do not keep it reading", str(fetched))
+fetched.clear()
+site4 = [list(pg) for pg in site]
+site4[2] = [(c[0], "??", XETAI) for c in site4[2]]
+mt.http_get = build_site(site4)
+mt.fetch_yeniemlak("https://yeniemlak.az/x", actionable=act_known)
+check(fetched == [1, 2, 3, 4, 5], "unreadable date counts as recent (keeps reading)", str(fetched))
+
+st9 = {"listings": dict(known), "seeded": dict(ye_flags)}
+mt._RUNTIME["state"] = None
+check(mt._ye_crawl_plan(ye_src, ck.t)[0] is None, "plan: no state -> full read")
+mt._RUNTIME["state"] = {"listings": dict(known), "seeded": {}}
+check(mt._ye_crawl_plan(ye_src, ck.t)[0] is None, "plan: first run -> full read")
+mt._RUNTIME["state"] = {"listings": dict(known), "seeded": {"yeniemlak.az": True,
+                                                           "yeniemlak.az:url": "different"}}
+check(mt._ye_crawl_plan(ye_src, ck.t)[1] == "search URL changed", "plan: URL changed -> full read")
+mt._RUNTIME["state"] = st9
+a1, w1 = mt._ye_crawl_plan(ye_src, ck.t)
+a2, w2 = mt._ye_crawl_plan(ye_src, ck.t + 600)
+a3, w3 = mt._ye_crawl_plan(ye_src, ck.t + mt.YE_FULL_CRAWL_HOURS * 3600 + 1)
+check(a1 is None and callable(a2) and a3 is None, "plan: full read, then newest pages, then full "
+      f"again after {mt.YE_FULL_CRAWL_HOURS:g} h", f"{w1} | {w2} | {w3}")
+st9["listings"]["ye:300001"] = {"url": "u", "first_seen": iso(ck.t), "source": "yeniemlak.az",
+                                "owner": True}
+st9["listings"]["ye:300002"] = {"url": "u", "first_seen": iso(ck.t - 30 * day), "source": "yeniemlak.az",
+                                "skip": "old ~75d"}
+st9["listings"]["ye:300003"] = {"url": "u", "first_seen": iso(ck.t - 30 * day), "source": "yeniemlak.az"}
+probe9 = [{"id": "300001", "updated_at": TODAY}, {"id": "300002", "updated_at": OLD_D},
+          {"id": "300003", "updated_at": TODAY}, {"id": "300003", "updated_at": OLD_D},
+          {"id": "399999", "updated_at": OLD_D}]
+check([a2(x) for x in probe9] == [False, True, True, False, True],
+      "worth a look: sent=no, hidden=yes, renewed=yes, quiet=no, unrecorded=yes")
+mt._RUNTIME["state"] = None
+if old is not None and OLD_V == "2026-11-07-a":
+    fetched.clear()
+    old.http_get = build_site(site)
+    old.PAGE_DELAY = 0
+    old.fetch_yeniemlak("https://yeniemlak.az/x")
+    check(len(fetched) == 11, "OLD code: every run read every page (what triggered the 429)")
+
+print("\n[NOV-12] main() end to end: first run seeds, then a full read, then newest pages only")
+me = load(os.path.join(HERE, "monitor.py"), "monitor_ye_e2e")
+tmpe = tempfile.mkdtemp()
+me.STATE_FILE = os.path.join(tmpe, "seen.json")
+me.USE_API = False
+me.PAGE_DELAY = 0
+me.SOURCES = [dict(s_) for s_ in me.SOURCES if s_["name"] == "yeniemlak.az"]
+out_e = []
+me.tg_send_message = lambda text: out_e.append(text) or True
+me.tg_send_photo = lambda photo, cap: out_e.append(cap) or True
+me.check_is_owner = lambda url, label="": (setattr(me.check_is_owner, "last_reason", "ok") or True, None)
+_tr = time.time()                                  # main() runs on the real clock
+_dates = {TODAY: baku_date(_tr), YDAY: baku_date(_tr - day), OLD_D: baku_date(_tr - 6 * day)}
+site_e = [[(c[0], _dates[c[1]], c[2]) for c in pg] for pg in site]
+fetched = []
+me.http_get = build_site(site_e)
+with contextlib.redirect_stdout(io.StringIO()):
+    me.main()                                      # run 1: first run -> full read, all recorded silently
+r1 = list(fetched)
+fetched.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    me.main()                                      # run 2: no full-read stamp yet -> full read
+r2 = list(fetched)
+fetched.clear()
+site_e[0] = [(240500, _dates[TODAY], XETAI)] + site_e[0][:-1]   # a brand-new ad appears on top
+with contextlib.redirect_stdout(io.StringIO()):
+    me.main()                                      # run 3: newest pages only
+r3 = list(fetched)
+st_e = json.load(open(me.STATE_FILE, encoding="utf-8"))
+check(len(r1) == 11 and len(r2) == 11, "runs 1-2: full reads", f"{len(r1)}, {len(r2)}")
+check(r3 == [1, 2, 3, 4], "run 3: only the newest pages", str(r3))
+check(len(out_e) == 1 and "240500" in out_e[0], "run 3: the brand-new ad is sent (and nothing else)",
+      str(len(out_e)))
+check("yeniemlak.az" in st_e.get("full_crawl", {}), "time of the last full read is saved in state")
+
+print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
+mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
+install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))
+seen10 = {"tap:48100001": {"url": "u", "first_seen": iso(time.time() - day), "source": "tap.az",
+                           "owner": False, "seller": "777"},
+          "tap:48100002": {"url": "u", "first_seen": iso(time.time() - day), "source": "tap.az",
+                           "owner": False, "seller": "777"}}
+v10, _p, _s = mt2.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menziller/48100001",
+                                  mt2._seller_apartments(seen10), {}, listing={"id": "48100001"})
+check(v10 is not False, "seller with 2 ads (this one + 1) is NOT made a 3-flat agent", V[v10])
+check("count-unknown:defaulted-to-owner" in mt2.tap_check_owner.last_reasons,
+      "reasons are exposed for the recovery script", str(mt2.tap_check_owner.last_reasons))
+
+print("\n[NOV-11] health report: Telegram delivery + what 'source ok' did not show")
+mh = load(os.path.join(HERE, "monitor.py"), "monitor")
+sys.modules["monitor"] = mh
+hh = load(os.path.join(HERE, "health.py"), "health")
+now_h = _dt.datetime.now(_dt.timezone.utc)
+log_lines = []
+for i in range(24):
+    t_ = (now_h - _dt.timedelta(minutes=15 * (24 - i))).isoformat(timespec="seconds")
+    log_lines += [f"monitor.py 2026-11-07-b starting {t_}\n",
+                  "tap.az: checked 2 new, announced 1 owner posts\n",
+                  "yeniemlak.az: RATE-LIMITED - HTTP 429 again after waiting; no more\n",
+                  "yeniemlak.az: checked 0 new, announced 0 owner posts\n",
+                  "bina.az: owner-checked 3 new, announced 0, deferred 0\n",
+                  "Done. notified=1 saved=True(local)\n"]
+old_t = (now_h - _dt.timedelta(hours=30)).isoformat(timespec="seconds")
+log_lines = [f"monitor.py 2026-11-07-a starting {old_t}\n",
+             "yeniemlak.az: checked 9 new, announced 4 owner posts\n"] + log_lines
+act = hh.scan_runs(log_lines, now_h)
+check(act["runs"] == 24 and act["announced"].get("tap.az") == 24
+      and act["checked"].get("yeniemlak.az", 0) == 0, "last-24h totals per source (older run ignored)",
+      str(act))
+iss = hh.activity_issues(act)
+check(any("yeniemlak.az refused the bot (HTTP 429" in x for x in iss)
+      and any("yeniemlak.az: not a single listing" in x for x in iss)
+      and not any(x.startswith("tap.az") for x in iss), "yeniemlak silence is reported", str(iss))
+tmpd = tempfile.mkdtemp()
+with open(os.path.join(tmpd, "run.log"), "w", encoding="utf-8") as fh_:
+    fh_.writelines(log_lines)
+with open(os.path.join(tmpd, "seen.json"), "w", encoding="utf-8") as fh_:
+    json.dump({"listings": {"a": {}}}, fh_)
+hh.LOG = os.path.join(tmpd, "run.log")
+mh.STATE_FILE = os.path.join(tmpd, "seen.json")
+tg_out = []
+mh.tg_send_message = lambda text: tg_out.append(text) or True
+os.environ["TG"] = "1"
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc_ = hh.main()
+finally:
+    os.environ.pop("TG", None)
+check(len(tg_out) == 1 and "PROBLEM" in tg_out[0] and "HTTP 429" in tg_out[0] and rc_ == 1,
+      "TG=1 really sends the report (it used to call a function that does not exist)")
+check(not hasattr(mh, "tg_send"), "monitor has no tg_send (so health must not use it)")
+
+print("\n[REC] recover_missed.py sends only PROVEN tap owners by default")
+mr = load(os.path.join(HERE, "monitor.py"), "monitor")
+sys.modules["monitor"] = mr
+tmpr = tempfile.mkdtemp()
+mr.STATE_FILE = os.path.join(tmpr, "seen.json")
+mr.USE_API = False
+mr.PAGE_DELAY = 0.0001
+TAPU = "https://tap.az/elanlar/dasinmaz-emlak/menziller/"
+pages_r = {
+    "48500001": tap_ad("Mənzil öz evimdi, makler deyiləm", seller="Elvin", uid="1001"),
+    "48500002": tap_ad("Təmirli 2 otaqlı mənzil, sənədləri qaydasındadır", seller="Nigar", uid="1002"),
+    "48500003": tap_ad("Təmirli mənzil", seller="Kamran", uid="1003"),
+    "48500004": tap_ad("Təmirli mənzil", seller="Kamran", uid="1003"),
+    "48500005": tap_ad("Təmirli mənzil", seller="Kamran", uid="1003"),
+    "48500006": tap_ad("OFİS HAQQI 1% təmirli mənzil", seller="Ruslan", uid="1006"),
+    "48500007": tap_ad("Sahibiyəm, öz evimdir, vasitəçilər narahat etməsin", seller="Leyla", uid="1007"),
+}
+
+
+def fake_tap_r(url, tries=3):
+    iid = url.rstrip("/").rsplit("/", 1)[-1]
+    body = pages_r[iid]
+    return R(body), body
+
+
+mr._fetch_tap_html = fake_tap_r
+mr._tap_blocked = lambda b: False
+rooms_area = {"48500003": (1, 40), "48500004": (2, 60), "48500005": (3, 80)}
+seen_r = {}
+for iid in ("48500001", "48500002", "48500003", "48500004", "48500005", "48500006"):
+    rec_ = {"url": TAPU + iid, "first_seen": "2026-10-10T10:00:00+00:00", "source": "tap.az",
+            "owner": False}
+    if iid in rooms_area:
+        rec_["rooms"], rec_["area"] = rooms_area[iid]
+    seen_r["tap:" + iid] = rec_
+seen_r["tap:48500007"] = {"url": TAPU + "48500007", "first_seen": "2026-10-25T10:00:00+00:00",
+                          "source": "tap.az", "skip": "old ~30d"}
+
+
+def write_state():
+    with open(mr.STATE_FILE, "w", encoding="utf-8") as fh_:
+        json.dump({"listings": json.loads(json.dumps(seen_r)), "seeded": {}}, fh_)
+
+
+os.environ["SOURCES"] = "tap"
+rr = load(os.path.join(HERE, "recover_missed.py"), "recover_missed")
+sent_r = []
+mr.notify_new_owner_msg = lambda l, n, ol="": sent_r.append(l["id"]) or True
+write_state()
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rr.main()
+out_r = buf.getvalue()
+send_list = out_r.split("owner listing(s) to send")[-1]
+check(TAPU + "48500001" in send_list and TAPU + "48500007" in send_list,
+      "proven owners (owner wording) are in the send list")
+check(TAPU + "48500002" not in send_list and "UNVERIFIED" in out_r and TAPU + "48500002" in out_r,
+      "count-unknown seller is listed as UNVERIFIED, not sent")
+check(all(TAPU + i not in send_list for i in ("48500003", "48500004", "48500005", "48500006")),
+      "same seller with 3 flats in the batch -> agent; 'ofis haqqi' -> agent")
+check("seller 1003 has 3 different flats" in out_r, "batch count is shown")
+check(sent_r == [] and json.load(open(mr.STATE_FILE))["listings"] == seen_r,
+      "dry run: nothing sent, seen.json untouched")
+rr.SEND = True
+write_state()
+with contextlib.redirect_stdout(io.StringIO()):
+    rr.main()
+st_r = json.load(open(mr.STATE_FILE, encoding="utf-8"))["listings"]
+check(sorted(sent_r) == ["48500001", "48500007"], "SEND=1 sends exactly the 2 proven owners", str(sent_r))
+check(st_r["tap:48500001"]["owner"] is True and st_r["tap:48500007"]["owner"] is True
+      and "skip" not in st_r["tap:48500007"], "they are recorded as sent (never twice)")
+check(st_r["tap:48500002"]["owner"] is False and "rechecked" not in st_r["tap:48500002"],
+      "unverified one is left as it was (can be verified later)")
+check(all("rechecked" in st_r[f"tap:{i}"] for i in ("48500003", "48500004", "48500005", "48500006")),
+      "re-confirmed agents are marked rechecked")
+sent_r.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    rr.main()
+check(sent_r == [], "running it again sends nothing twice", str(sent_r))
+os.environ.pop("SOURCES", None)
+sys.modules.pop("monitor", None)
 
 # --------------------------------------------------------------------------- #
 print("\n[E2E] two full runs of main() with every site faked")

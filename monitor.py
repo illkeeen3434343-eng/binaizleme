@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-11-07-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-07-b"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -34,13 +34,86 @@ except Exception:
     HAS_CURL_CFFI = False
 
 
-def http_get(url, headers=None, params=None, timeout=30, browser=False):
+def _raw_get(url, headers=None, params=None, timeout=30, browser=False):
     """GET a URL. For bot-protected HTML sites (browser=True) use curl_cffi with a
     real Chrome TLS fingerprint; otherwise plain requests."""
     if browser and HAS_CURL_CFFI:
         return cf_requests.get(url, headers=headers, params=params, timeout=timeout,
                                impersonate="chrome")
     return requests.get(url, headers=headers, params=params, timeout=timeout)
+
+
+# Per-site politeness. yeniemlak.az answers HTTP 429 ("too many requests") after about
+# 30 quick requests: on 7 Nov 2026 the bot read 30 search pages in ~40 s and then every
+# detail page was refused (429), so no yeniemlak owner check could finish. Requests to
+# the hosts below are spaced out; a 429 is waited out ONCE (Retry-After, capped); if the
+# site still refuses, that host is left alone for the rest of the run (nothing is
+# recorded, so those listings are simply checked on the next run).
+HOST_MIN_INTERVAL = {"yeniemlak.az": float(os.environ.get("YE_MIN_INTERVAL", "2.5"))}
+RATE_LIMIT_WAIT = float(os.environ.get("RATE_LIMIT_WAIT", "45"))         # no Retry-After given
+RATE_LIMIT_MAX_WAIT = float(os.environ.get("RATE_LIMIT_MAX_WAIT", "90"))
+_HOST_LAST = {}          # host -> time of our last request to it
+RATE_LIMITED = {}        # host -> True once a 429 survived the wait (this run only)
+
+
+def _host(url):
+    h = (urlparse(url).hostname or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def _retry_after_seconds(r):
+    """Seconds from a Retry-After header (number or HTTP date); None if absent/odd."""
+    try:
+        v = (getattr(r, "headers", None) or {}).get("Retry-After")
+    except Exception:
+        return None
+    if not v:
+        return None
+    v = str(v).strip()
+    if v.isdigit():
+        return float(v)
+    try:
+        from email.utils import parsedate_to_datetime
+        return max(0.0, parsedate_to_datetime(v).timestamp() - time.time())
+    except Exception:
+        return None
+
+
+class _Refused:
+    """Stand-in response for a host that already rate-limited us this run."""
+    status_code = 429
+    text = ""
+    content = b""
+    headers = {}
+
+
+def http_get(url, headers=None, params=None, timeout=30, browser=False):
+    host = _host(url)
+    gap = HOST_MIN_INTERVAL.get(host)
+    if not gap:
+        return _raw_get(url, headers=headers, params=params, timeout=timeout, browser=browser)
+    if RATE_LIMITED.get(host):
+        return _Refused()                     # do not keep knocking on a refusing site
+    r = None
+    for attempt in (1, 2):
+        wait = _HOST_LAST.get(host, 0.0) + gap - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = _raw_get(url, headers=headers, params=params, timeout=timeout, browser=browser)
+        finally:
+            _HOST_LAST[host] = time.time()
+        if getattr(r, "status_code", 0) != 429:
+            return r
+        if attempt == 1:
+            ra = _retry_after_seconds(r)
+            w = max(gap, min(RATE_LIMIT_MAX_WAIT, ra if ra is not None else RATE_LIMIT_WAIT))
+            log(f"{host}: HTTP 429 (too many requests); waiting {w:.0f}s, then one retry")
+            time.sleep(w)
+    RATE_LIMITED[host] = True
+    log(f"{host}: RATE-LIMITED - HTTP 429 again after waiting; no more {host} requests "
+        "this run (unchecked listings are checked next run)")
+    return r
 
 # --------------------------------------------------------------------------- #
 # YOUR SEARCHES  (paste the normal search URL from each site's address bar)
@@ -563,34 +636,68 @@ def _parse_yeniemlak_page(raw):
     return out, total
 
 
-def fetch_yeniemlak(url):
-    """Page through the whole yeniemlak result set. Stops when a page adds no new
-    listing IDs (also the graceful fallback if ?page is ever ignored). Listings the
-    site leaked outside the wanted districts are dropped by ye_passes()."""
+# Reading all ~30 result pages every 15 minutes is what made yeniemlak rate-limit the
+# bot. The results are newest first (by "Tarix", the posted/renewed date), so a normal
+# run reads only until it has passed every listing dated today or yesterday AND
+# YE_QUIET_PAGES pages in a row held nothing to look at (every wanted-area listing
+# already sent / judged / quietly known). Any unrecorded listing keeps it reading.
+# A full read still happens every YE_FULL_CRAWL_HOURS, on the first run and after the
+# search URL changes.
+YE_RECENT_DAYS = float(os.environ.get("YE_RECENT_DAYS", "1"))     # today + N days back
+YE_QUIET_PAGES = int(os.environ.get("YE_QUIET_PAGES", "2"))
+YE_FULL_CRAWL_HOURS = float(os.environ.get("YE_FULL_CRAWL_HOURS", "3"))
+
+
+def _ye_recent(l, now_ts):
+    """Dated today or within YE_RECENT_DAYS before (Baku dates). Unknown date = recent."""
+    d = _dmy_epoch(l.get("updated_at"))
+    return d is None or now_ts - d < (YE_RECENT_DAYS + 1) * 86400
+
+
+def fetch_yeniemlak(url, actionable=None):
+    """Page through the yeniemlak result set. Stops when a page adds no new listing IDs
+    (also the graceful fallback if ?page is ever ignored). Listings the site leaked
+    outside the wanted districts are dropped by ye_passes().
+
+    actionable: None = read every page. Otherwise a function(listing) -> bool ("worth
+    a look") and paging stops after YE_QUIET_PAGES quiet pages in a row (see above)."""
     all_out, seen_ids = [], set()
     total = None
-    parsed = 0
+    parsed = pages = quiet = 0
+    stop = "end of results"
+    now_ts = time.time()
     for page in range(1, YE_MAX_PAGES + 1):
         purl = _with_page(url, page)
         r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
         if r.status_code != 200:
             if page == 1:
                 raise RuntimeError(f"HTTP {r.status_code}")
+            stop = f"HTTP {r.status_code} on page {page}"
             break
+        pages += 1
         listings, tot = _parse_yeniemlak_page(r.text)
         if tot is not None:
             total = tot
         new = [l for l in listings if l["id"] not in seen_ids]
         if not new:                       # no new IDs -> end of results (or page ignored)
             break
+        busy = False
         for l in new:
             seen_ids.add(l["id"])         # always mark, so pagination still terminates
             parsed += 1
             if ye_passes(l):
                 all_out.append(l)
+                if actionable is not None and not busy:
+                    busy = _ye_recent(l, now_ts) or bool(actionable(l))
+        if actionable is not None:
+            quiet = 0 if busy else quiet + 1
+            if quiet >= YE_QUIET_PAGES:
+                stop = f"{quiet} pages in a row with nothing new"
+                break
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
-    log(f"yeniemlak: kept {len(all_out)} of {parsed} parsed"
+    log(f"yeniemlak: read {pages} page(s) [{'full' if actionable is None else 'newest'}; "
+        f"stopped: {stop}], kept {len(all_out)} of {parsed} parsed"
         + (f" (~{total} on site)" if total is not None else ""))
     # Alarm on a PARSE failure, never on a legitimately empty filtered result.
     if not parsed and total and total > 0:
@@ -598,11 +705,42 @@ def fetch_yeniemlak(url):
     return all_out
 
 
+def _ye_crawl_plan(source, now_ts=None):
+    """(actionable-or-None, why) for this run's yeniemlak read. None = full read."""
+    now_ts = time.time() if now_ts is None else now_ts
+    st = _RUNTIME.get("state")
+    if not isinstance(st, dict) or source.get("mode") != "owner_new":
+        return None, "full read"
+    seen = st.get("listings") or {}
+    flags = st.get("seeded") or {}
+    name, prefix = source["name"], source.get("prefix") or ""
+    if not flags.get(name) or not prefix or not any(k.startswith(prefix) for k in seen):
+        return None, "first run"           # everything must be recorded silently once
+    fp_old = flags.get(name + ":url")
+    if fp_old != _url_fingerprint(source.get("url")):
+        return None, ("search URL changed" if fp_old else "full read (no URL fingerprint yet)")
+    fulls = st.setdefault("full_crawl", {})
+    last = _to_epoch(fulls.get(name))
+    if last is None or now_ts - last >= YE_FULL_CRAWL_HOURS * 3600:
+        # stamped when TRIED (not when finished): a site that keeps refusing must not
+        # make every run a full read
+        fulls[name] = dt.datetime.fromtimestamp(now_ts, dt.timezone.utc).isoformat(
+            timespec="seconds")
+        return None, f"full read (every {YE_FULL_CRAWL_HOURS:g} h)"
+    stype = source.get("type")
+
+    def actionable(l):
+        return _candidate_kind(stype, l, seen.get(prefix + str(l["id"])), now_ts) is not None
+    return actionable, "newest pages"
+
+
 def fetch_for_source(source):
     if source["type"] == "bina":
         return fetch_bina(source["url"])
     if source["type"] == "yeniemlak":
-        return fetch_yeniemlak(source["url"])
+        actionable, why = _ye_crawl_plan(source)
+        log(f"yeniemlak: {why}")
+        return fetch_yeniemlak(source["url"], actionable=actionable)
     if source["type"] == "tap":
         return fetch_tap(source["url"])
     if source["type"] == "lalafo":
@@ -1308,8 +1446,11 @@ def _seller_apartments(seen):
         t = _to_epoch(v.get("first_seen"))
         if t is not None and t < cutoff:
             continue
+        # id WITHOUT the "tap:" prefix, so it matches _apt_key(listing) for the same ad
+        # (re-checking a recorded ad must not count it twice)
         out.setdefault(sid, set()).add(
-            _apt_key({"rooms": v.get("rooms"), "area": v.get("area"), "id": k}))
+            _apt_key({"rooms": v.get("rooms"), "area": v.get("area"),
+                      "id": k.split(":", 1)[-1]}))
     return out
 
 
@@ -1319,6 +1460,7 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
     tap_check_owner.last_reason: "fetch" (page unreadable -> retry, no try used) or
     "undecided" (read fine, signals inconclusive)."""
     tap_check_owner.last_reason = "fetch"
+    tap_check_owner.last_score, tap_check_owner.last_reasons = None, []
     try:
         r, raw = _fetch_tap_html(url, tries=2)
     except Exception as e:
@@ -1383,6 +1525,7 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
     # else: leave undecided (TAP_UNKNOWN_DEFAULT=defer)
     if verdict is not None:
         tap_check_owner.last_reason = "ok"
+    tap_check_owner.last_score, tap_check_owner.last_reasons = score, list(reasons)
 
     log(f"tap.az: {url} score={score} -> "
         f"{ {True: 'OWNER', False: 'AGENT', None: 'DEFER'}[verdict] } {reasons}")
@@ -1390,6 +1533,8 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
 
 
 tap_check_owner.last_reason = ""
+tap_check_owner.last_score = None
+tap_check_owner.last_reasons = []
 
 
 def _tap_blocked(body):
@@ -1795,7 +1940,13 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
     an unreadable page as UNKNOWN rather than "agent"."""
     check_is_owner.last_reason = "fetch"
     raw = text = None
+    host = _host(url)
     for attempt in range(max(1, OWNER_FETCH_TRIES)):
+        if RATE_LIMITED.get(host):
+            # the site refused us even after waiting: not this listing's fault. No try is
+            # used and nothing is recorded; it is checked on the next run.
+            check_is_owner.last_reason = "ratelimit"
+            return None, None
         try:
             r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
             if r.status_code == 200 and len(r.text or "") > 1500:
@@ -1806,9 +1957,11 @@ def check_is_owner(url, owner_label="Əmlak sahibi"):
                 f"len={len(getattr(r, 'text', '') or '')} (attempt {attempt + 1})")
         except Exception as e:
             log(f"owner-check {url} -> {e} (attempt {attempt + 1})")
-        if attempt + 1 < OWNER_FETCH_TRIES:
+        if attempt + 1 < OWNER_FETCH_TRIES and not RATE_LIMITED.get(host):
             time.sleep(2.0)
     if raw is None:
+        if RATE_LIMITED.get(host):
+            check_is_owner.last_reason = "ratelimit"
         return None, None
     photo = None
     # Try several patterns, most specific first, so we catch the main photo even when
@@ -2112,6 +2265,10 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
+            if reason == "ratelimit":
+                fail_streak = OWNER_FETCH_FAIL_STREAK     # stop checking; rest deferred
+                deferred.add(iid)
+                continue
             if reason == "fetch":
                 fail_streak += 1
                 deferred.add(iid)     # page not read: retry next run, no try used
@@ -2169,6 +2326,8 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
+            if reason == "ratelimit":
+                break                 # site refusing: retry next run, no try used
             if reason == "fetch":
                 fail_streak += 1      # page not read: retry next run, no try used
                 continue
@@ -2296,6 +2455,11 @@ def process_owner_new(items, source, seen, seeded_flags):
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
         if owner is None:
+            if reason == "ratelimit":
+                checks -= 1                # refused, not checked (keeps the log honest)
+                log(f"{name}: site is rate-limiting us (HTTP 429); the rest is checked "
+                    "next run (no try used, nothing recorded)")
+                break
             if reason == "fetch":
                 fail_streak += 1           # page not read: retry next run, no try used
                 continue

@@ -19,6 +19,18 @@ Dry run (default) only prints; nothing is sent, seen.json is not touched.
 Options (env): SOURCES=tap,bina,yeniemlak  LIMIT=150 (per source)
                FROM=2026-09-04  TO=2026-10-21
 bina and yeniemlak listings are only checked if they are STILL in today's search.
+
+tap.az - only PROVEN owners are sent (2026-11-07-b):
+  proven      the ad's own words say owner ("öz evimdi", "makler deyiləm", ...), or
+              the seller's apartment count is known and below 3;
+  unverified  the seller has other ads ("İstifadəçinin bütün elanları"), the count
+              could not be read and the text says nothing either way. The live bot's
+              default calls these "owner", but they are NOT sent from here: many may be
+              agents. They stay as they are (nothing changes) so they can be verified
+              later with the browser count (TAP_PROFILE_BROWSER=1).
+  INCLUDE_UNVERIFIED=1 sends them too (not recommended).
+A seller who shows up with 3+ different flats in this batch (plus the bot's history)
+is re-judged with that count - the same "3 or more apartments = agent" rule.
 """
 import datetime as dt
 import os
@@ -28,12 +40,60 @@ import time
 import monitor as m
 
 SEND = os.environ.get("SEND") == "1"
+INCLUDE_UNVERIFIED = os.environ.get("INCLUDE_UNVERIFIED") == "1"
 LIMIT = int(os.environ.get("LIMIT", "150"))
 WANT = {x.strip() for x in os.environ.get("SOURCES", "tap,bina,yeniemlak").split(",") if x.strip()}
 FROM = m._to_epoch(os.environ.get("FROM", "2026-09-04") + "T00:00:00+00:00")
 TO = m._to_epoch(os.environ.get("TO", "2026-10-21") + "T00:00:00+00:00")
 NOTE = "Bu elan əvvəl səhvən göndərilməmişdi"
 VERDICT = {True: "OWNER", False: "agent", None: "unreadable"}
+UNVERIFIED_TAG = "count-unknown:defaulted-to-owner"
+
+
+def tap_recheck(cands, origin):
+    """Judge each tap candidate with today's checks. Returns a list of entries."""
+    apts, cache, out = m._seller_apartments(m._RUNTIME["state"]["listings"]), {}, []
+    for k, v in cands:
+        iid = k.split(":", 1)[1]
+        lst = {"id": iid, "url": v["url"], "rooms": v.get("rooms"), "area": v.get("area")}
+        verdict, photo, seller = m.tap_check_owner(v["url"], apts, cache, listing=lst)
+        reasons = list(getattr(m.tap_check_owner, "last_reasons", None) or [])
+        out.append({"k": k, "v": v, "lst": lst, "verdict": verdict, "photo": photo,
+                    "seller": seller, "reasons": reasons, "origin": origin,
+                    "akey": m._apt_key(lst)})
+        time.sleep(m.PAGE_DELAY or 0.3)
+    return out
+
+
+def tap_batch_counts(entries, history):
+    """A seller with 3+ different flats among these ads (plus history) is an agent by
+    the user's rule, even if each single ad looked fine. Re-judge their 'owner' ads."""
+    by_seller = {}
+    for e in entries:
+        if e["seller"] and e["verdict"] is not None:
+            by_seller.setdefault(e["seller"], set()).add(e["akey"])
+    for e in entries:
+        if e["verdict"] is not True or not e["seller"]:
+            continue
+        flats = set(history.get(e["seller"], set())) | by_seller.get(e["seller"], set())
+        if len(flats) < m.TAP_MAX_APARTMENTS:
+            continue
+        print(f"   batch: seller {e['seller']} has {len(flats)} different flats -> re-judging "
+              f"{e['lst']['url']}")
+        verdict, photo, _s = m.tap_check_owner(e["lst"]["url"], {e["seller"]: flats}, {},
+                                               listing=e["lst"])
+        if verdict is not None:
+            e["verdict"] = verdict
+            e["reasons"] = list(getattr(m.tap_check_owner, "last_reasons", None) or [])
+            e["photo"] = photo or e["photo"]
+        time.sleep(m.PAGE_DELAY or 0.3)
+
+
+def tap_line(e):
+    tag = VERDICT[e["verdict"]]
+    if e["verdict"] is True and UNVERIFIED_TAG in e["reasons"]:
+        tag = "UNVERIFIED"
+    return f"   {tag:10} {e['lst']['url']}  seller={e['seller']}  {e['reasons']}"
 
 
 def in_window(rec):
@@ -55,26 +115,14 @@ def main():
     print(f"window {os.environ.get('FROM', '2026-09-04')} .. {os.environ.get('TO', '2026-10-21')}, "
           f"up to {LIMIT} per source\n")
     found = []                          # (key, listing-for-message, source name, label)
+    unverified = []                     # tap "owners" by default only - not sent
 
     if "tap" in WANT:
         cands = newest_first([(k, v) for k, v in seen.items()
                               if v.get("source") == "tap.az" and v.get("owner") is False
                               and in_window(v)])
         print(f"tap.az: {len(cands)} listings filed as agent in the window")
-        apts, cache = m._seller_apartments(seen), {}
-        for k, v in cands:
-            iid = k.split(":", 1)[1]
-            lst = {"id": iid, "url": v["url"], "rooms": v.get("rooms"), "area": v.get("area")}
-            verdict, photo, _seller = m.tap_check_owner(v["url"], apts, cache, listing=lst)
-            print(f"   {VERDICT[verdict]:10} {v['url']}")
-            if verdict is True:
-                lst["photo"] = photo
-                found.append((k, lst, "tap.az", "Sahibindən"))
-            elif verdict is False:
-                v["_recheck_agent"] = True
-            time.sleep(m.PAGE_DELAY or 0.3)
-
-    if "tap" in WANT:
+        entries = tap_recheck(cands, "agent-filed")
         # tap ads that 2026-10-18-a hid as "not new" (never checked, never sent). The bot
         # only reads tap's first page, so ones that already fell off it are looked up here.
         hidden = sorted([(k, v) for k, v in seen.items()
@@ -82,18 +130,25 @@ def main():
                          and str(v.get("skip", "")).startswith("old")],
                         key=lambda kv: kv[1].get("first_seen", ""), reverse=True)[:LIMIT]
         print(f"\ntap.az: {len(hidden)} listings hidden as 'not new' since 20 Oct (newest first)")
-        apts, cache = m._seller_apartments(seen), {}
-        for k, v in hidden:
-            iid = k.split(":", 1)[1]
-            lst = {"id": iid, "url": v["url"]}
-            verdict, photo, _seller = m.tap_check_owner(v["url"], apts, cache, listing=lst)
-            print(f"   {VERDICT[verdict]:10} {v['url']}")
-            if verdict is True:
-                lst["photo"] = photo
-                found.append((k, lst, "tap.az", "Sahibindən"))
-            elif verdict is False:
-                v["_hidden_agent"] = True
-            time.sleep(m.PAGE_DELAY or 0.3)
+        entries += tap_recheck(hidden, "hidden")
+        print("\ntap.az: same seller with 3+ different flats in this batch?")
+        tap_batch_counts(entries, m._seller_apartments(seen))
+        print("\ntap.az results:")
+        for e in entries:
+            print(tap_line(e))
+            if e["seller"]:
+                e["v"].setdefault("seller", e["seller"])   # helps future flat counting
+            if e["verdict"] is True:
+                e["lst"]["photo"] = e["photo"]
+                item = (e["k"], e["lst"], "tap.az", "Sahibindən")
+                if UNVERIFIED_TAG in e["reasons"]:
+                    unverified.append(item)
+                    if INCLUDE_UNVERIFIED:
+                        found.append(item)
+                else:
+                    found.append(item)
+            elif e["verdict"] is False:
+                e["v"]["_hidden_agent" if e["origin"] == "hidden" else "_recheck_agent"] = True
 
     if "bina" in WANT:
         cands = [(k, v) for k, v in seen.items()
@@ -135,7 +190,16 @@ def main():
                 v["_recheck_agent"] = True
             time.sleep(m.PAGE_DELAY or 0.3)
 
-    print(f"\n==> {len(found)} owner listing(s) that were wrongly filed:")
+    if unverified:
+        print(f"\n--> {len(unverified)} tap.az listing(s) UNVERIFIED (seller has other ads, "
+              "apartment count unknown, no owner wording):")
+        for k, lst, src, _ in unverified:
+            print(f"   {src:13} {lst['url']}")
+        print("    " + ("INCLUDE_UNVERIFIED=1: these ARE in the send list below." if INCLUDE_UNVERIFIED
+                        else "NOT sent and not changed. They can be verified later with the "
+                             "browser count (TAP_PROFILE_BROWSER=1)."))
+    print(f"\n==> {len(found)} owner listing(s) to send (proven"
+          + (" + unverified" if INCLUDE_UNVERIFIED else "") + "):")
     for k, lst, src, _ in found:
         print(f"   {src:13} {lst['url']}")
     if not SEND:
