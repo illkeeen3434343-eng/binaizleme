@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-11-07-b"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-07-c"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -577,8 +577,29 @@ YE_KEYWORDS = [k.strip() for k in os.environ.get(
 ).split(",") if k.strip()]
 
 
+# The search asks for SALE ads (elan_nov=1), but the site also returns rentals
+# ("Kirayə") and "Girov" ads - ad 235014 ("kiraye-1-otaqli", 7 Nov 2026) reached the
+# owner check. Only sale ads are wanted. Set YE_DEALS="" to disable this guard.
+YE_DEALS = [d.strip() for d in os.environ.get("YE_DEALS", "Satılır").split(",") if d.strip()]
+_YE_SLUG_DEAL = {"satilir": "Satılır", "kiraye": "Kirayə", "girov": "Girov"}
+
+
+def ye_deals(l):
+    """Deal type(s) the card text and the link's slug say; empty set if neither is known."""
+    out = set()
+    if l.get("deal"):
+        out.add(l["deal"])
+    mm = re.search(r"/elan/(satilir|kiraye|girov)-", l.get("url") or "")
+    if mm:
+        out.add(_YE_SLUG_DEAL[mm.group(1)])
+    return out
+
+
 def ye_passes(l):
-    """True if the parsed address matches one of the wanted areas."""
+    """True if it is a sale ad (or its type is unknown) AND the parsed address matches
+    one of the wanted areas."""
+    if YE_DEALS and any(d not in YE_DEALS for d in ye_deals(l)):
+        return False                       # rental / girov (either signal is enough)
     if not YE_KEYWORDS:
         return True
     loc = l.get("location") or ""
@@ -612,8 +633,9 @@ def _parse_yeniemlak_page(raw):
         if not m_id:
             continue
         iid = m_id.group(1)
-        pm = re.search(r"(?:Satılır|Kirayə|Girov)\s*(\d[\d ]*?)\s*(?:Kreditlə\s*)?Baxış", b)
-        price = int(pm.group(1).replace(" ", "")) if pm else None
+        pm = re.search(r"(Satılır|Kirayə|Girov)\s*(\d[\d ]*?)\s*(?:Kreditlə\s*)?Baxış", b)
+        price = int(pm.group(2).replace(" ", "")) if pm else None
+        deal = pm.group(1) if pm else None
         fl = re.search(r"(\d+)\s*/\s*(\d+)\s*Mərtəbə", b)
         rooms = re.search(r"(\d+)\s*otaq", b)
         area = re.search(r"(\d+)\s*m2", b)
@@ -630,7 +652,7 @@ def _parse_yeniemlak_page(raw):
                     "floor": int(fl.group(2)) if fl else None,
                     "floors": int(fl.group(1)) if fl else None,
                     "price": price, "currency": "AZN", "location": loc, "location_id": None,
-                    "updated_at": date.group(1) if date else None,
+                    "updated_at": date.group(1) if date else None, "deal": deal,
                     "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
                     "photo": None})
     return out, total
@@ -2128,6 +2150,12 @@ def _age_estimate(l, clock, now_ts, rec=None):
     if isinstance(created, (int, float)) and created > 0:
         return max(0.0, (now_ts - created) / 86400.0), "exact"
     a = clock.age_days(l.get("id"), now_ts) if clock is not None else None
+    # yeniemlak "Tarix" (dd.mm.yyyy) is the posted/renewed DAY: the ad is at least as old
+    # as the end of that day (a renewed ad carries today's date -> adds nothing)
+    d = _dmy_epoch(l.get("updated_at"))
+    if d is not None:
+        t = max(0.0, (now_ts - (d + 86400)) / 86400.0)
+        a = t if a is None else max(a, t)
     fs = _to_epoch((rec or {}).get("first_seen"))
     if fs is not None:
         b = max(0.0, (now_ts - fs) / 86400.0)
@@ -2387,7 +2415,13 @@ def process_owner_new(items, source, seen, seeded_flags):
     seller_apts = _seller_apartments(seen) if stype == "tap" else {}
     tap_profile_cache = {}
     clock = IdClock.from_seen(seen, name, prefix)
-    checks = notified = fail_streak = old_used = 0
+    # yeniemlak: since 2026-11-07-b the bot reads ALL result pages (~74), not just the
+    # first 30 (the 429 used to cut it off there). Listings dated before the bot's first
+    # yeniemlak record were never on top while the bot ran and never came back to the
+    # top since, so they are recorded silently - not sent as "old" ads. If one of them
+    # is renewed later, its new date brings it back and it is sent once (marked old).
+    ye_start = min(clock.ts) if (stype == "yeniemlak" and clock.ts) else None
+    checks = notified = fail_streak = old_used = quiet_old = 0
     for l in items:
         key = prefix + str(l["id"])
         rec = seen.get(key)
@@ -2395,6 +2429,12 @@ def process_owner_new(items, source, seen, seeded_flags):
         if kind is None:
             continue                       # sent, agent, given up, or quietly known
         first_seen = (rec or {}).get("first_seen", now)
+        if kind == "new" and ye_start is not None:
+            d = _dmy_epoch(l.get("updated_at"))
+            if d is not None and d + 86400 <= ye_start:
+                seen[key] = {"url": l["url"], "first_seen": now, "source": name}
+                quiet_old += 1
+                continue
 
         # An OLD ad you were never sent (renewed, İrəli çək, VIP/Premium, or missed
         # earlier) is sent once, marked old. Age only chooses the label. Old ads are
@@ -2407,7 +2447,7 @@ def process_owner_new(items, source, seen, seeded_flags):
             old_used += 1
         if is_old:
             l["_age_days"], l["_age_kind"] = age, age_kind
-        if kind == "hidden":
+        if kind == "hidden" and is_old:      # a 1-day-old ad needs no "not sent before" note
             l["_note"] = "Bu elan əvvəl göndərilməmişdi"
         if kind != "new":
             log(f"{name}: {l['url']} -> looking again ({kind}"
@@ -2484,6 +2524,9 @@ def process_owner_new(items, source, seen, seeded_flags):
         seen[key] = new_rec
         if owner and notify_new_owner_msg(l, name, owner_label):
             notified += 1
+    if quiet_old:
+        log(f"{name}: recorded {quiet_old} old listing(s) silently (dated before the bot "
+            f"first read {name}; never came back to the top)")
     log(f"{name}: checked {checks} new, announced {notified} owner posts")
     return notified
 

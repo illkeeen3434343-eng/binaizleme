@@ -745,6 +745,66 @@ check(len(out_e) == 1 and "240500" in out_e[0], "run 3: the brand-new ad is sent
       str(len(out_e)))
 check("yeniemlak.az" in st_e.get("full_crawl", {}), "time of the last full read is saved in state")
 
+print("\n[NOV-13] yeniemlak: only SALE ads (rental 235014 'kiraye-1-otaqli' got through, 7 Nov)")
+
+
+def ye_card(iid, deal, slug, price="150 000", extra=""):
+    return (f'<div class="ad"><a href="/elan/{slug}-1-otaqli-bina-evi-menzil-xetai-rayonu-{iid}">x</a>'
+            f"{deal} {price} {extra}Baxış 12 Elan: {iid} 1 otaq 45 m2 3/9 Mərtəbə "
+            f"Tarix: {TODAY} Ünvan: Bakı Xətai rayonu H.Aslanov qəs. metro. Həzi Aslanov</div>")
+
+
+page13 = ("<html>Nəticə: 4 " + ye_card(235001, "Satılır", "satilir")
+          + ye_card(235014, "Kirayə", "kiraye", price="600")
+          + ye_card(235020, "Girov", "girov", price="20 000")
+          + ye_card(235030, "Satılır", "satilir", price="98 000", extra="Kreditlə ") + "</html>")
+p13, _t = mt._parse_yeniemlak_page(page13)
+check([x["deal"] for x in p13] == ["Satılır", "Kirayə", "Girov", "Satılır"]
+      and [x["price"] for x in p13] == [150000, 600, 20000, 98000], "deal type + price parsed",
+      str([(x["deal"], x["price"]) for x in p13]))
+check([mt.ye_passes(x) for x in p13] == [True, False, False, True], "rent and girov dropped, sales kept")
+check(not mt.ye_passes({"url": "https://yeniemlak.az/elan/kiraye-1-otaqli-bina-evi-menzil-xetai-"
+                               "rayonu-h-aslanov-qes-vunq-tau-235014", "location": "Bakı Xətai rayonu"}),
+      "the real 235014 link alone is enough to drop it")
+check(mt.ye_passes({"url": "https://yeniemlak.az/elan/235099", "location": "Bakı Xətai rayonu"}),
+      "unknown deal type is kept (never lose a sale ad over parsing)")
+if old is not None and OLD_V == "2026-11-07-b":
+    po, _t = old._parse_yeniemlak_page(page13)
+    check(sum(1 for x in po if old.ye_passes(x)) == 4, "OLD code: rent and girov ads were kept")
+fetched = []
+mt.http_get = lambda url, **k: (fetched.append(1), RH(200, page13 if len(fetched) == 1 else "<html></html>"))[1]
+got13 = mt.fetch_yeniemlak("https://yeniemlak.az/x")
+check([x["id"] for x in got13] == ["235001", "235030"], "the search result keeps only the 2 sale ads")
+
+print("\n[NOV-14] yeniemlak pages 31-74 (read for the first time): old ads recorded, not sent")
+ys14 = dict(ye_hist)                           # bot's first yeniemlak record: 80 days ago
+NEW14 = str(ye_top + 40)
+pre_bot = [str(140000 + i) for i in range(20)]  # dated before the bot ever read yeniemlak
+feed14 = ([ye_item(NEW14, t_now)] + [ye_item(i, t_now - 100 * day) for i in pre_bot]
+          + [ye_item("205555", t_now - 40 * day)])   # dated after bot start, but never recorded
+sent.clear()
+got.clear()
+m.process_owner_new(feed14, yesrc, ys14, yflags)
+check(sent == [NEW14, "205555"], "sent: the new ad + the one the bot missed while running", str(sent))
+check(len(got) == 2 and got[0].get("_age_days") is None and (got[1].get("_age_days") or 0) > 38,
+      "missed one is marked old (at least ~39 days, from its Tarix)")
+check(all(f"ye:{i}" in ys14 and "owner" not in ys14[f"ye:{i}"] for i in pre_bot),
+      "all 20 pre-bot ads recorded silently (not capped, nothing sent)")
+sent.clear()
+m.process_owner_new(feed14, yesrc, ys14, yflags)
+check(sent == [], "next run: nothing", str(sent))
+ys14["ye:140003"]["first_seen"] = iso(t_now - 5 * day)
+feed14b = [ye_item("140003", t_now)]               # its owner renews it -> today's date
+m.process_owner_new(feed14b, yesrc, ys14, yflags)
+check(sent == ["140003"], "if a pre-bot ad is renewed later, it is sent once", str(sent))
+ys15 = dict(ye_hist)
+ys15[f"ye:{NEW14}"] = {"url": "u", "first_seen": iso(t_now - 3600), "source": "yeniemlak.az",
+                       "skip": "old ~75d"}
+got.clear()
+m.process_owner_new([ye_item(NEW14, t_now)], yesrc, ys15, yflags)
+check(got and not got[0].get("_note") and got[0].get("_age_days") is None,
+      "hidden but only hours old -> plain '‼️ Yeni elan', no 'not sent before' note")
+
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
 install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))
