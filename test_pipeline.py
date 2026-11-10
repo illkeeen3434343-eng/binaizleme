@@ -1054,6 +1054,63 @@ if old is not None and OLD_V == "2026-11-08-c":
     vo, _p, so = old.tap_check_owner(U18, {}, {}, listing={"id": "49172190"})
     check(vo is True and so is None, "OLD code: seller None -> sent as owner by default", f"{V[vo]} {so}")
 
+print("\n[NOV-19] bina: 'mülkiyyətçi' label + agency wording in the ad's own text -> agent")
+import html as html_mod
+OG19 = "AZE🇦🇿 ENG🇬🇧 RUS🇷🇺\n\n🇦🇿 Əhmədlidə Neapol dairəsindən 2dəqiqə məsafədə yerləşən Leninqrad layihəli, 9/9, 3 otaqlı, tam yeni..."
+FULL19 = OG19[:-3] + " təmirli mənzil satılır. Çıxarış var. 🇬🇧 ENG: 3-room flat near Neapol. 🇷🇺 RUS: квартира."
+
+
+def bina_page(full, label="mülkiyyətçi", og=OG19, where="ld+json", extra=""):
+    data = {"ld+json": '<script type="application/ld+json">' + json.dumps(
+                {"@type": "Product", "name": "3 otaqlı", "description": full}, ensure_ascii=False) + "</script>",
+            "data": "<script>window.__S__=" + json.dumps({"item": {"description": full}}) + "</script>",
+            "html": '<div class="product-description__content">' + full.replace(". ", ".<br>") + "</div>",
+            "none": ""}[where]
+    return ("<html><head>" + f'<meta property="og:description" content="{html_mod.escape(og)}">' + "</head>"
+            + f'<div class="owner"><div>Elvin</div><div>{label}</div></div>' + data + extra
+            + '<a href="/agentlikler">Agentliklər</a></html>' + "x" * 2000)
+
+
+mb = load(os.path.join(HERE, "monitor.py"), "monitor_binatext")
+for where in ("ld+json", "data", "html"):
+    d19, s19 = mb._bina_description(bina_page(FULL19 + " Ofis haqqı 1%", where=where))
+    check(s19 == where and d19.rstrip().endswith("Ofis haqqı 1%"),
+          f"full description found in the page ({where}), not just the cut og text", f"{s19} {len(d19)}")
+other = ('<script>x={"description":"Başqa elan: Xətai, ofis haqqı 1%, zəng edin indi"}</script>')
+d19, s19 = mb._bina_description(bina_page(FULL19, where="none", extra=other))
+check(s19 == "og" and "ofis" not in mb.az_normalize(d19),
+      "another ad's description on the page is never used (must start like og:description)")
+
+
+def bina_check(page):
+    mb.http_get = lambda url, headers=None, params=None, timeout=30, browser=False: R(page)
+    return mb.bina_is_owner("https://bina.az/items/6058940")[0]
+
+
+check(bina_check(bina_page(FULL19 + " Ofis haqqı 1% alınır.")) is False
+      and "agency:ofis haqqi" in mb.bina_is_owner.last_text["reasons"],
+      "label 'mülkiyyətçi' + 'Ofis haqqı 1%' at the END of the text -> AGENT",
+      str(mb.bina_is_owner.last_text))
+check(bina_check(bina_page(FULL19)) is True,
+      "6058940-style AZE/ENG/RUS text without agency words -> stays owner (no 3-language rule)")
+check(bina_check(bina_page("Komissiya yoxdur, sahibindən satılır. Əhmədli, 3 otaqlı, təmirli mənzil",
+                           og="Komissiya yoxdur, sahibindən satılır. Əhmədli, 3 otaqlı, təmirli...")) is True,
+      "'Komissiya yoxdur' (no fee) does not make an owner an agent")
+check(bina_check(bina_page("Agentliyimiz sizə ən yaxşı mənzilləri təklif edir. Əhmədli 3 otaqlı",
+                           og="Agentliyimiz sizə ən yaxşı mənzilləri təklif edir. Əhmədli 3...")) is False,
+      "'Agentliyimiz ...' -> AGENT")
+check(bina_check(bina_page(FULL19 + " Ofis haqqı 1%", label="vasitəçi (agent)")) is False
+      and bina_check(bina_page(FULL19 + " Ofis haqqı 1%", label="")) is None,
+      "agent label and no label behave as before")
+check(m.owner_signal_score("Komissiyasız. Vasitəçilik haqqı yoxdur. Ofis haqqı alınmır.", "", None)[0] == 0
+      and m.owner_signal_score("OFİS HAQQI 1%", "", None)[0] <= m.SCORE_AGENT_AT,
+      "tap too: 'komissiyasız / haqqı yoxdur / alınmır' are no longer agent words; 'ofis haqqı 1%' still is")
+if old is not None and OLD_V == "2026-11-11-a":
+    old.http_get = lambda url, headers=None, params=None, timeout=30, browser=False: R(
+        bina_page(FULL19 + " Ofis haqqı 1% alınır."))
+    check(old.bina_is_owner("https://bina.az/items/6058940")[0] is True,
+          "OLD code: 'mülkiyyətçi' label alone -> sent as owner")
+
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
 install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))

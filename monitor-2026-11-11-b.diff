@@ -1,0 +1,115 @@
+--- /mnt/user-data/outputs/2026-11-11-a/monitor.py	2026-11-10 21:40:57.342650000 +0000
++++ monitor.py	2026-11-10 21:55:51.729984041 +0000
+@@ -25,7 +25,7 @@
+ 
+ import requests
+ 
+-VERSION = "2026-11-11-a"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-11-b"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -1332,6 +1332,17 @@
+     r"\b(makler|vasiteci|agent|rieltor)\w*\s+islemirem\b",
+     r"\b(makler|vasiteci|agent|rieltor)\w*\s+lazim\s+deyil\b",
+ ]
++# --- "no fee" statements: NOT agency wording (masked, worth 0) -------------- #
++# "Komissiyasız", "Vasitəçilik haqqı yoxdur", "Ofis haqqı alınmır" used to score as
++# AGENT (-4) because the fee word matched. They say there is NO fee, so they count
++# for neither side. (11 Nov 2026, before bina descriptions were checked too.)
++_NO_FEE_PATTERNS = [
++    r"\b(ofis|xidmet|komissiya|komisyon|vasitecilik|agentlik|makler)\w*\s+(haqq\w*\s+)?"
++    r"(yoxdur|yox|alinmir|alinmayacaq|odenilmir|teleb\s+olunmur|olmayacaq)\b",
++    r"\b(komissiya|komisyon)\w*(siz|suz)\b",
++    r"\b(ofis|xidmet|vasitecilik|komissiya)\s+haqq\w*(siz|suz)\b",
++    r"\b(ofis|xidmet|vasitecilik|komissiya)\s+haqq\w*\s+(olmadan|odemeden)\b",
++]
+ # --- agency wording (checked only AFTER owner spans are masked out) ------- #
+ _AGENCY_PATTERNS = [
+     # ANY "... haqqi" fee (ofis haqqi, xidmet haqqi, komissiya haqqi, vasitecilik
+@@ -1376,6 +1387,11 @@
+             masked = masked[:mm.start()] + " " * (mm.end() - mm.start()) + masked[mm.end():]
+     score = min(score, 8)                       # cap: repetition is not more proof
+ 
++    for pat in _NO_FEE_PATTERNS:                # "komissiya yoxdur" is not a fee
++        for mm in list(re.finditer(pat, masked)):
++            reasons.append("no-fee:" + mm.group(0).strip())
++            masked = masked[:mm.start()] + " " * (mm.end() - mm.start()) + masked[mm.end():]
++
+     for pat in _AGENCY_PATTERNS:
+         mm = re.search(pat, masked)
+         if mm:
+@@ -2126,6 +2142,45 @@
+     return None
+ 
+ 
++def _bina_description(raw):
++    """(text, source) of a bina ad's OWN description. og:description is cut after
++    ~150 characters (6058940: "... 3 otaqlı, tam yeni..."), and fee wording often
++    comes at the end, so the full text is looked for in the page's structured data
++    (JSON-LD, embedded JSON "description") and description elements - but only a
++    text that STARTS like og:description is taken, so it is always this ad's own
++    text (never a similar ad, the menu or the footer). Falls back to og:description."""
++    meta = _meta_tags(raw)
++    og = (meta.get("og:description") or "").strip()
++    anchor = az_normalize(re.sub(r"(\.\.\.|…)\s*$", "", og)).strip()[:60]
++    if len(anchor) < 15:
++        return og, "og"
++    cands = []
++    for mm in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
++                          raw, re.S):
++        try:
++            data = json.loads(mm.group(1).strip())
++        except Exception:
++            continue
++        for obj in _iter_dicts(data):
++            v = obj.get("description")
++            if isinstance(v, str):
++                cands.append((v, "ld+json"))
++    for mm in re.finditer(r'"description"\s*:\s*"((?:[^"\\]|\\.){20,})"', raw):
++        try:
++            cands.append((json.loads('"' + mm.group(1) + '"'), "data"))
++        except Exception:
++            pass
++    for mm in re.finditer(r'<(div|p|section|article)\b[^>]*class="[^"]*desc[^"]*"[^>]*>(.*?)</\1>',
++                          raw, re.S):
++        body = re.sub(r"<br\s*/?>", "\n", mm.group(2))
++        cands.append((html.unescape(re.sub(r"<[^>]+>", " ", body)), "html"))
++    best, src = og, "og"
++    for text, where in cands:
++        if az_normalize(text).strip().startswith(anchor) and len(text) > len(best):
++            best, src = text, where
++    return best, src
++
++
+ def bina_is_owner(url):
+     """bina.az owner vs agent from the detail page. Returns (is_owner, photo).
+     None = undetermined. bina_is_owner.last_reason: "fetch" (page not read) or
+@@ -2160,6 +2215,19 @@
+             verdict, src = True, "text"
+         elif agent_sub and not owner_sub:
+             verdict, src = False, "text"
++    bina_is_owner.last_text = None
++    if verdict is True:
++        # bina says "mülkiyyətçi" (owner), but an agent can register as a private owner.
++        # The ad's own text decides against it only on clear agency wording (ofis haqqı,
++        # komissiya, agentlik...; Azerbaijani wording only, user 11 Nov 2026).
++        desc, dsrc = _bina_description(raw)
++        tscore, treasons = owner_signal_score(desc or "", "", None)
++        bina_is_owner.last_text = {"source": dsrc, "chars": len(desc or ""),
++                                   "score": tscore, "reasons": treasons}
++        if tscore <= SCORE_AGENT_AT:
++            log(f"bina.az: {url} labelled mülkiyyətçi, but the text is agency wording "
++                f"{treasons} -> AGENT")
++            verdict, src = False, "text-agency"
+     bina_is_owner.last_reason = "ok" if verdict is not None else "nolabel"
+     if not _BINA_DBG["done"]:
+         _BINA_DBG["done"] = True
+@@ -2168,6 +2236,7 @@
+ 
+ 
+ bina_is_owner.last_reason = ""
++bina_is_owner.last_text = None
+ 
+ 
+ OWNER_MAX_TRIES = int(os.environ.get("OWNER_MAX_TRIES", "4"))
