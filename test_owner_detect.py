@@ -3,9 +3,28 @@
 Run: .venv/bin/python -m pytest test_owner_detect.py -q     (or plain: python test_owner_detect.py)
 Phrases come from real listings; no listing ID is special-cased anywhere.
 """
-import os, sys
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
-os.environ.setdefault("TELEGRAM_CHAT_ID", "c")
+import os, re, sys
+# Run with the bot's DEFAULT settings and dummy tokens, whatever the shell exported.
+# After `set -a && . ./.env` the shell carries your live settings (11 Nov 2026:
+# TAP_PROFILE_BROWSER=1 / TAP_COUNT_SCOPE=property made 7 checks fail and opened real
+# tap.az profiles), and real tokens must never reach Telegram or GitHub from a test.
+def _isolate_env(here):
+    keys = {"GH_TOKEN", "GH_REPO", "GITHUB_TOKEN", "SEND", "SOURCES", "TG"}
+    for fn in ("monitor.py", "recover_missed.py", "health.py"):
+        try:
+            src = open(os.path.join(here, fn), encoding="utf-8").read()
+        except OSError:
+            continue
+        for pat in (r'os\.environ\.get\(\s*"([A-Z0-9_]+)"', r'os\.getenv\(\s*"([A-Z0-9_]+)"',
+                    r'os\.environ\[\s*"([A-Z0-9_]+)"\s*\]'):
+            keys |= set(re.findall(pat, src))
+    for k in keys:
+        os.environ.pop(k, None)
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test-token-not-real"
+    os.environ["TELEGRAM_CHAT_ID"] = "0"
+
+
+_isolate_env(os.path.dirname(os.path.abspath(__file__)))
 import monitor as m
 
 OWNER_PHRASES = [
