@@ -1,0 +1,91 @@
+--- /mnt/user-data/outputs/2026-11-08-c/monitor.py	2026-11-07 22:11:53.884107000 +0000
++++ monitor.py	2026-11-10 21:39:26.690806427 +0000
+@@ -25,7 +25,7 @@
+ 
+ import requests
+ 
+-VERSION = "2026-11-08-c"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-11-a"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -1257,6 +1257,7 @@
+     "vasitəçi olmadan,sahibindən,sahibinden,mülkiyyətçidən,mulkiyyetciden,birbaşa sahibi,"
+     # supplied by the user + spelling/diacritic variants
+     "evin sahibiyəm,evin sahibiyem,ev sahibiyəm,ev sahibiyem,öz evimdi,oz evimdi,"
++    "öz sahibiyəm,oz sahibiyem,öz evim,oz evim,evin öz sahibiyəm,evin oz sahibiyem,"
+     "öz evimdir,oz evimdir,özümün evimdi,ozumun evimdi,ev özümündü,ev ozumundu,"
+     # close variants worth covering
+     "mənim evimdir,menim evimdir,mənim mənzilimdir,menim menzilimdir,"
+@@ -1309,6 +1310,11 @@
+     r"\bmenim\s+(ev|menzil)im\w*",                  # "mənim evimdir / mənzilimdir"
+     r"\b(ev|menzil)in\s+sahibi\w*",
+     r"\b(ev|menzil)\s*sahibiyem\b",
++    # with "öz" in the middle (user, 11 Nov 2026: "öz sahibiyəm", "öz evim(di)" are owner
++    # sentences; ad 49172190 "Men evin oz sahibiyem" scored 0)
++    r"\b(ev|menzil)\w*\s+oz\s+sahibi\w*",          # "evin öz sahibiyəm / sahibi mənəm"
++    r"\boz\s+sahibiy(em|ik)\b",                     # "öz sahibiyəm / sahibiyik"
++    r"\bsahibiy(em|ik)\b",                           # "(mən) sahibiyəm"
+     r"\bsahibi\s+(ozumem|menem|ozum)\b",            # "sahibi özüməm / mənəm"
+     r"\bmulkiyyetci(yem|\s+olaraq)\w*",
+     r"\bbirbasa\s+(ozum|sahib|mulkiyyet)\w*",
+@@ -1627,7 +1633,8 @@
+     tap_check_owner.last_details = _tap_details(raw)
+     tap_check_owner.last_location = tap_check_owner.last_details.get("location")
+ 
+-    seller = (re.search(r"/elanlar\?user_id=(\d+)", raw) or [None, None])[1]
++    seller, seller_how = _tap_seller_id(raw)
++    tap_check_owner.last_seller_how = seller_how
+     photo = None
+     pm = re.search(r'(https?://tap\.azstatic\.com/uploads/[^\s"\'<>]+\.(?:jpg|jpeg|png|webp))', raw)
+     if pm:
+@@ -1642,6 +1649,10 @@
+     block = _tap_seller_block(raw)
+     flat = az_normalize(re.sub(r"<[^>]+>", " ", raw))
+     has_multi = any(az_normalize(mk).strip() in flat for mk in TAP_MULTI_MARKERS)
++    if seller_how == "data":
++        # newer page: the "İstifadəçinin bütün elanları" link is built by JavaScript, so
++        # its absence proves nothing - ask the profile (history / browser count)
++        has_multi = True
+ 
+     # How many APARTMENTS does this seller have? Unrelated ads (phones, books) never
+     # count. Source 1: flats WE have recorded from this seller (re-posts of the same
+@@ -1694,6 +1705,38 @@
+ tap_check_owner.last_reasons = []
+ tap_check_owner.last_location = None
+ tap_check_owner.last_details = {}
++tap_check_owner.last_seller_how = None
++
++
++_TAP_USER_GID = re.compile(r"Z2lkOi8vdGFwL1VzZXIv([A-Za-z0-9+/]+=*)")   # base64 "gid://tap/User/"
++
++
++def _tap_seller_id(raw):
++    """(seller_id, how) for a tap ad page; how = "link" | "data" | None.
++    Older pages link the profile: /elanlar?user_id=123. Newer pages build that link
++    with JavaScript and carry the seller only in the embedded page data, e.g. ad
++    49172190 (11 Nov 2026): {"__typename":"User","id":"Z2lkOi8vdGFwL1VzZXIvMjM5NTk4NzU",
++    "legacyId":"23959875"} - the id is base64 of "gid://tap/User/23959875". Without
++    this the bot saw no seller, so neither the "3 or more = agent" rule nor the
++    profile count could run. More than one user in the data = ambiguous = None."""
++    m1 = re.search(r"/elanlar\?user_id=(\d+)", raw or "")
++    if m1:
++        return m1.group(1), "link"
++    ids = set()
++    for tail in _TAP_USER_GID.findall(raw or ""):
++        try:
++            dec = base64.b64decode("Z2lkOi8vdGFwL1VzZXIv" + tail + "=" * (-len(tail) % 4))
++            mm = re.fullmatch(rb"gid://tap/User/(\d+)", dec)
++            if mm:
++                ids.add(mm.group(1).decode())
++        except Exception:
++            pass
++    for mm in re.finditer(r'"__typename"\s*:\s*"User"\s*,\s*"id"\s*:\s*"[^"]*"\s*,'
++                          r'\s*"legacyId"\s*:\s*"(\d+)"', raw or ""):
++        ids.add(mm.group(1))
++    if len(ids) == 1:
++        return ids.pop(), "data"
++    return None, None
+ 
+ 
+ def _meta_tags(raw):

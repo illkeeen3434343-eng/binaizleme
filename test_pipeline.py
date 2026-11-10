@@ -976,6 +976,65 @@ v17c, _p, _s = mp.tap_check_owner("https://tap.az/elanlar/dasinmaz-emlak/menzill
 check(v17c is True and "count-unknown:defaulted-to-owner" in mp.tap_check_owner.last_reasons,
       "browser could not tell -> same as today (owner by default)")
 
+print("\n[NOV-18] tap 49172190: owner wording with 'öz', seller id from the page's data")
+OZ_OWNER = ["Men evin oz sahibiyem. xais edirem real almaq isteyenler narahat etsin.",
+            "öz sahibiyəm", "oz sahibiyem", "öz evim", "oz evim", "öz evimdi", "oz evimdi",
+            "Mənzilin öz sahibi mənəm", "Mən evin öz sahibiyəm"]
+bad_oz = [t for t in OZ_OWNER if m.owner_signal_score(t, "", None)[0] < m.SCORE_OWNER_AT]
+check(not bad_oz, f"{len(OZ_OWNER)} owner sentences with 'öz' (user, 11 Nov) are owner wording", str(bad_oz))
+NOT_OWNER = ["öz eviniz kimi rahat yaşayın", "ev sahibi ilə birbaşa əlaqə", "sahibkar", "Təmirli mənzil satılır"]
+bad_no = [t for t in NOT_OWNER if m.owner_signal_score(t, "", None)[0] != 0]
+check(not bad_no, "look-alikes are not owner wording ('öz eviniz kimi', 'ev sahibi ilə')", str(bad_no))
+DATA_USER = ('"currentUser":{"id":null,"legacyId":null},{"__typename":"User",'
+             '"id":"Z2lkOi8vdGFwL1VzZXIvMjM5NTk4NzU","legacyId":"23959875","name":"S"},'
+             '"adDetails:{\\"legacyId\\":\\"49172190\\"}')
+check(m._tap_seller_id("<html>" + DATA_USER + "</html>") == ("23959875", "data"),
+      "real page data of 49172190 -> seller 23959875 (base64 'gid://tap/User/23959875')")
+check(m._tap_seller_id('<a href="/elanlar?user_id=6638901">x</a>') == ("6638901", "link"),
+      "older pages: the profile link still works")
+check(m._tap_seller_id("<html>" + DATA_USER + '{"__typename":"User","id":"Z2lkOi8vdGFwL1VzZXIvMTIz",'
+                       '"legacyId":"123"}</html>') == (None, None), "two different users -> unknown")
+
+
+def tap_new_page(desc):
+    """Newer tap page: no profile link and no 'bütün elanları' text, seller only in data."""
+    return ('<html><nav>Ana səhifə / Daşınmaz əmlak</nav>'
+            f'<meta property="og:description" content="{desc}">'
+            '<meta property="og:title" content="2-otaqlı mənzil, Əhmədli m., 65 m²">'
+            f'<script>window.__DATA__={{{DATA_USER}}}</script></html>' + "x" * 3000)
+
+
+m18 = load(os.path.join(HERE, "monitor.py"), "monitor_tapdata")
+m18.TAP_PROFILE_BROWSER = True
+prof18 = {"v": 6, "asked": []}
+m18.tap_profile_count_browser = lambda uid: (prof18["asked"].append(uid), prof18["v"])[1]
+U18 = "https://tap.az/elanlar/dasinmaz-emlak/menziller/49172190"
+TXT18 = OZ_OWNER[0]
+for desc, pv, want, label in [
+        ("Təmirli mənzil, sənədləri qaydasındadır", 6, False, "neutral text + profile shows 6 -> AGENT"),
+        (TXT18, 6, False, "'evin öz sahibiyəm' + profile shows 6 -> AGENT (3 or more always wins)"),
+        (TXT18, 1, True, "'evin öz sahibiyəm' + profile shows 1 -> owner"),
+        ("Təmirli mənzil, sənədləri qaydasındadır", None, True,
+         "profile unreadable -> same as before (owner by default)")]:
+    m18._RUNTIME["state"] = {"tap_profiles": {}}
+    prof18["v"], prof18["asked"] = pv, []
+    install_tap(m18, tap_new_page(desc))
+    v18, _p, s18 = m18.tap_check_owner(U18, {}, {}, listing={"id": "49172190"})
+    check(v18 is want and s18 == "23959875" and prof18["asked"] == ["23959875"], label,
+          f"{V[v18]} seller={s18} {m18.tap_check_owner.last_reasons}")
+m18._RUNTIME["state"] = {"tap_profiles": {}}
+install_tap(m18, tap_new_page("Təmirli mənzil"))
+v18h, _p, _s = m18.tap_check_owner(U18, {"23959875": {"2r-60m", "3r-80m"}}, {}, listing={"id": "49172190"})
+check(v18h is False and "history:3-flats-seen" in m18.tap_check_owner.last_reasons,
+      "seller now known -> the bot's own history counts too (2 seen + this one = 3)")
+if old is not None and OLD_V == "2026-11-08-c":
+    old.TAP_PROFILE_BROWSER = True
+    old.tap_profile_count_browser = lambda uid: 6
+    old._RUNTIME["state"] = {"tap_profiles": {}}
+    install_tap(old, tap_new_page(TXT18))
+    vo, _p, so = old.tap_check_owner(U18, {}, {}, listing={"id": "49172190"})
+    check(vo is True and so is None, "OLD code: seller None -> sent as owner by default", f"{V[vo]} {so}")
+
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
 install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))
