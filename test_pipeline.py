@@ -1339,7 +1339,25 @@ if os.path.exists(os.path.join(HERE, "collect_bina.py")):
     live_c = [ad_c(TOP_C), ad_c(TOP_C - 500), ad_c(ID_FEB), ad_c(ID_DEC),
               ad_c(5_000_000, created_at="2026-03-05T10:00:00+04:00"),      # old number, bina's own date
               ad_c(TOP_C - 77, location='Nizami r., "Koroğlu" m.')]
-    mc.fetch_bina = lambda url: (mc._BINA_TAG_CANDS.__setitem__("items", []), list(live_c))[1]
+    kor_c = [dict(ad_c(TOP_C - 900 - i, location="Koroğlu m."), _excluded_by="Koroğlu") for i in range(4)]
+    seen_c[str(TOP_C - 900)] = {"url": "u", "first_seen": _noon.isoformat(timespec="seconds"),
+                                "source": "bina.az", "skip": "area", "tags": "Nizami r., Koroğlu m."}
+    with open(mc.STATE_FILE, "w", encoding="utf-8") as fh_:
+        json.dump({"listings": seen_c}, fh_)
+    before_c = open(mc.STATE_FILE, encoding="utf-8").read()
+    tag_reads = []
+
+
+    def tags_c(l):
+        tag_reads.append(l["id"])
+        mc.bina_location_tags.last_reason = "ok"
+        return (["Nizami r.", "Koroğlu m.", "Qara Qarayev m."] if l["id"] == str(TOP_C - 901)
+                else ["Nizami r.", "Koroğlu m."])
+
+
+    mc.bina_location_tags = tags_c
+    mc.fetch_bina = lambda url: (mc._BINA_TAG_CANDS.__setitem__("items", [dict(x) for x in kor_c]),
+                                 list(live_c))[1]
     mc._BINA_MAX_ID["v"] = TOP_C
     owner_reads = []
     mc.bina_is_owner = lambda url: (owner_reads.append(url),
@@ -1349,11 +1367,19 @@ if os.path.exists(os.path.join(HERE, "collect_bina.py")):
     os.environ["OUT"] = os.path.join(tmpc, "out.csv")
     os.environ["COLLECT_CACHE"] = os.path.join(tmpc, "cache.json")
     cb = load(os.path.join(HERE, "collect_bina.py"), "collect_bina")
+    cb.time = Clock()
     with contextlib.redirect_stdout(io.StringIO()) as buf_c:
         cb.main()
+    first_tag_reads = list(tag_reads)
     import csv as _csv
     rows_c = list(_csv.DictReader(open(os.environ["OUT"], encoding="utf-8-sig")))
     by_id = {r_["id"]: r_ for r_ in rows_c}
+    check(sorted(first_tag_reads) == sorted(str(TOP_C - 900 - i) for i in (1, 2, 3))
+          and by_id.get(str(TOP_C - 901), {}).get("location") == "Nizami r., Koroğlu m., Qara Qarayev m."
+          and str(TOP_C - 902) not in by_id and str(TOP_C - 900) not in by_id,
+          "Koroğlu ads are opened once: the one tagged Qara Qarayev is in the table, the others are not",
+          str(first_tag_reads))
+    by_id.pop(str(TOP_C - 901), None)
     check(set(by_id) == {str(TOP_C), str(TOP_C - 500), str(ID_FEB), "5000000", str(TOP_C - 77)},
           "ads since 01.01.2026 are in the table; the December 2025 one is not", str(sorted(by_id)))
     check(by_id["5000000"]["placed"] == "05.03.2026" and by_id["5000000"]["placed_how"] == "bina",
@@ -1377,13 +1403,14 @@ if os.path.exists(os.path.join(HERE, "collect_bina.py")):
         cb.main()
     rows_c = list(_csv.DictReader(open(os.environ["OUT"], encoding="utf-8-sig")))
     unknown_c = [r_["id"] for r_ in rows_c if r_["seller"] == "?"]
-    check(len(owner_reads) == 1 and len(unknown_c) == 2
+    check(len(owner_reads) == 1 and len(unknown_c) == 3
           and open(mc.STATE_FILE, encoding="utf-8").read() == before_c,
           "OWNERS=1 LIMIT=1: one page read, answer kept in the side file, seen.json untouched",
           f"{len(owner_reads)} {unknown_c}")
     with contextlib.redirect_stdout(io.StringIO()):
         cb.main()
     check(len(owner_reads) == 2 and len(set(owner_reads)) == 2, "running again continues with the next ad")
+    check(tag_reads == first_tag_reads, "tags are remembered: no Koroğlu ad is opened a second time")
     os.environ.pop("OUT", None)
     os.environ.pop("COLLECT_CACHE", None)
     sys.modules.pop("monitor", None)

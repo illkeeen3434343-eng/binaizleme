@@ -23,10 +23,13 @@ What it can and cannot know
     LIMIT pages (default 300) per run, about 1.5 s each. Answers are remembered in
     collect_bina_cache.json, so running it again continues where it stopped.
 
-Options (env): SINCE=2026-01-01  OUT=<file>  SEP=";" (if Excel shows one column)
-               OWNERS=1  LIMIT=300
-The same filter as the bot is used: BINA_SEARCH_URL and the excluded locations; ads shown
-in an excluded location are included only when the bot already found a wanted tag on them.
+Options (env): SINCE=2026-01-01 (SINCE=2000-01-01 = everything on the site now)
+               OUT=<file>  SEP=";" (if Excel shows one column)  OWNERS=1  LIMIT=300  TAGS=0
+The same filter as the bot is used: BINA_SEARCH_URL and the excluded locations. An ad that
+bina SHOWS in an excluded location (Koroğlu, Ağ şəhər, ...) is included when one of its
+tags names a wanted area (e.g. "Qara Qarayev m."). Tags are only on the ad's own page, so
+each such ad is opened once (at most LIMIT per run, remembered; run again to continue).
+TAGS=0 skips opening them.
 The scan takes about 10 minutes; run it with flock (as above) so it does not overlap a bot run.
 """
 import csv
@@ -41,6 +44,7 @@ SINCE = os.environ.get("SINCE", "2026-01-01")
 OUT = os.environ.get("OUT", f"bina_since_{SINCE}.csv")
 SEP = os.environ.get("SEP", ",")
 OWNERS = os.environ.get("OWNERS") == "1"
+TAGS = os.environ.get("TAGS", "1") != "0"
 LIMIT = int(os.environ.get("LIMIT", "300"))
 CACHE = os.environ.get("COLLECT_CACHE", "collect_bina_cache.json")
 BAKU = dt.timezone(dt.timedelta(hours=4))
@@ -103,15 +107,6 @@ def main():
     print(f"ad numbers per day: {slope:.0f} "
           + (f"(measured from {npts} checked ads)" if anchor else "(default; too little history)"))
     print("scanning bina.az with the bot's filter (about 10 minutes)...")
-    items = m.fetch_bina(m.BINA_SEARCH_URL)
-    for l in m._BINA_TAG_CANDS["items"]:                 # excluded location, wanted by tag
-        rec = seen.get(str(l["id"]))
-        if isinstance(rec, dict) and rec.get("tags_ok"):
-            l["location"] = rec.get("tags") or l.get("location")
-            items.append(l)
-    m._BINA_TAG_CANDS["items"] = []
-    now_ts = time.time()
-
     cache = {}
     if os.path.exists(CACHE):
         try:
@@ -119,6 +114,55 @@ def main():
                 cache = json.load(fh)
         except Exception:
             cache = {}
+
+    items = m.fetch_bina(m.BINA_SEARCH_URL)
+    # Ads bina SHOWS in an excluded location (Koroğlu, Ağ şəhər, ...) belong in the table
+    # when one of their page tags is a wanted area (6618907: Koroğlu + Qara Qarayev). The
+    # tags are only on the ad's own page, so each such ad is opened once; the answer is
+    # remembered (bot history or the side file), so later runs do not open it again.
+    cands, m._BINA_TAG_CANDS["items"] = m._BINA_TAG_CANDS["items"], []
+    todo, by_tag = [], 0
+    for l in cands:
+        iid = str(l["id"])
+        rec = seen.get(iid) if isinstance(seen.get(iid), dict) else {}
+        known = rec.get("tags") if (rec.get("tags_ok") or rec.get("skip") == "area") \
+            else cache.get("tags:" + iid)
+        if known is None:
+            todo.append(l)
+        elif known and m._bina_wanted_tag(known.split(", ")):
+            l["location"] = known
+            items.append(l)
+            by_tag += 1
+    if cands:
+        print(f"{len(cands)} ads are shown in an excluded location; tags already known for "
+              f"{len(cands) - len(todo)}")
+    if TAGS and todo:
+        print(f"opening {min(len(todo), LIMIT)} of {len(todo)} such ad(s) to read their tags...")
+        fails = done = 0
+        for l in todo[:LIMIT]:
+            tags = m.bina_location_tags(l)
+            m._BINA_PAGE_CACHE.pop(l["url"], None)
+            if tags is None and m.bina_location_tags.last_reason == "fetch":
+                fails += 1
+                if fails >= 5:
+                    print("   5 pages in a row unreadable - stopping the tag reads here")
+                    break
+            else:
+                fails = 0
+                done += 1
+                joined = ", ".join(tags or [])
+                cache["tags:" + str(l["id"])] = joined
+                if tags and m._bina_wanted_tag(tags):
+                    l["location"] = joined
+                    items.append(l)
+                    by_tag += 1
+            time.sleep(max(m.PAGE_DELAY, 1.0))
+        left = len(todo) - done
+        if left > 0:
+            print(f"   {left} still unread - run the script again to continue")
+    if by_tag:
+        print(f"{by_tag} ad(s) added because a tag names a wanted area")
+    now_ts = time.time()
 
     rows, dated_by = [], {"bina": 0, "estimate": 0}
     for l in items:
@@ -152,6 +196,7 @@ def main():
             if n % 50 == 0:
                 print(f"   {n}/{len(todo)}")
             time.sleep(max(m.PAGE_DELAY, 1.0))
+    if cache:
         tmp = CACHE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(cache, fh)
