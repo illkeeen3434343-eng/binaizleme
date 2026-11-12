@@ -110,7 +110,7 @@ def main():
                 last_done = ln.strip()
         mt = dt.datetime.fromtimestamp(os.path.getmtime(LOG), dt.timezone.utc)
         age = (now - mt).total_seconds() / 60
-        add("log last written", f"{age:.0f} min ago")
+        add("log last written", f"{max(0.0, age):.0f} min ago")
         if age > STALE_MIN:
             issues.append(f"no log activity for {age:.0f} min (cron stopped? run stuck?)")
     except Exception as e:

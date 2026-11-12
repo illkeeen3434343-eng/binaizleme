@@ -18,7 +18,7 @@ import time
 # tap.az profiles), and real tokens must never reach Telegram or GitHub from a test.
 def _isolate_env(here):
     keys = {"GH_TOKEN", "GH_REPO", "GITHUB_TOKEN", "SEND", "SOURCES", "TG"}
-    for fn in ("monitor.py", "recover_missed.py", "health.py"):
+    for fn in ("monitor.py", "recover_missed.py", "health.py", "collect_bina.py", "why.py"):
         try:
             src = open(os.path.join(here, fn), encoding="utf-8").read()
         except OSError:
@@ -1110,6 +1110,283 @@ if old is not None and OLD_V == "2026-11-11-a":
         bina_page(FULL19 + " Ofis haqqı 1% alınır."))
     check(old.bina_is_owner("https://bina.az/items/6058940")[0] is True,
           "OLD code: 'mülkiyyətçi' label alone -> sent as owner")
+
+print("\n[NOV-20] bina: owner label is only overruled by STRONG agency proof (12 Nov)")
+OWNER_TEXTS = ["Eksklüziv təmirli mənzil, Əhmədli metrosuna yaxın, kupça var, təcili satılır",
+               "Xahiş edirəm agentliklər zəng vurmasın. Əhmədli, 3 otaqlı, təmirli mənzil satılır",
+               "Kupça var. Agentliklərə satılmır. Əhmədli metrosu yaxınlığında 2 otaqlı mənzil",
+               "Komissiya ödəmirəm, makler haqqı vermirəm. Təmirli 3 otaqlı mənzil satılır",
+               "Agentliklər və maklerlər zəng etməsin. Təmirli 2 otaqlı mənzil, kupça var"]
+for t in OWNER_TEXTS:
+    check(bina_check(bina_page(t, og=t[:60] + "...")) is True, "stays OWNER: " + t[:48],
+          str(mb.bina_is_owner.last_text))
+AGENT_TEXTS = ["Əhmədli, 3 otaqlı təmirli mənzil satılır. Kupça var. Ofis haqqı 1%",
+               "Agentliyimiz sizə ən yaxşı mənzilləri təklif edir. Əhmədli 3 otaqlı",
+               "Təmirli mənzil satılır, komissiya 1%, baxış üçün zəng edin, Əhmədli metrosu"]
+for t in AGENT_TEXTS:
+    check(bina_check(bina_page(t, og=t[:60] + "...")) is False, "AGENT: " + t[:48],
+          str(mb.bina_is_owner.last_text))
+if old is not None and OLD_V == "2026-11-11-b":
+    old.http_get = lambda url, headers=None, params=None, timeout=30, browser=False: R(
+        bina_page(OWNER_TEXTS[1], og=OWNER_TEXTS[1][:60] + "..."))
+    check(old.bina_is_owner("https://bina.az/items/1")[0] is False,
+          "OLD code: owner who wrote 'agentliklər zəng vurmasın' was filed as AGENT")
+
+print("\n[NOV-21] bina 6618907: shown in Koroğlu, tagged Qara Qarayev -> wanted")
+
+
+def tag_links(tags, suffix="/kohne-tikili"):
+    return "<ul>" + "".join(f'<li><a class="t" href="https://bina.az/baki/{slug}/alqi-satqi/menziller{suffix}">'
+                            f"{text}</a></li>\n" for slug, text in tags) + "</ul>"
+
+
+ALL_METROS = [("koroglu", "Koroğlu m."), ("qara-qarayev", "Qara Qarayev m."), ("neftciler", "Neftçilər m."),
+              ("nizami", "Nizami m."), ("28-may", "28 May m."), ("genclik", "Gənclik m."), ("sahil", "Sahil m."),
+              ("ulduz", "Ulduz m."), ("bakmil", "Bakmil m."), ("xetai", "Xətai m.")]
+FOOTER = "<footer><h3>Populyar</h3>" + tag_links(ALL_METROS, "") + "</footer>"
+
+
+def tag_page(tags, label="mülkiyyətçi"):
+    return ('<html><nav><a href="/baki/alqi-satqi/menziller">Mənzillər</a></nav>'
+            f'<div class="owner"><div>Elvin</div><div>{label}</div></div>'
+            '<div class="desc">Təmirli mənzil</div>' + tag_links(tags) + FOOTER + "x" * 2000 + "</html>")
+
+
+T_BOTH = [("nizami", "Nizami r."), ("koroglu", "Koroğlu m."), ("qara-qarayev", "Qara Qarayev m.")]
+T_ONLY = [("nizami", "Nizami r."), ("koroglu", "Koroğlu m.")]
+mg = load(os.path.join(HERE, "monitor.py"), "monitor_tags")
+check(mg._bina_tags_from_html(tag_page(T_BOTH), "Koroğlu") == ["Nizami r.", "Koroğlu m.", "Qara Qarayev m."],
+      "tags read from the ad page (the footer list of all metros is not taken)")
+check(mg._bina_wanted_tag(["Nizami r.", "Koroğlu m.", "Qara Qarayev m."]) == "Qara Qarayev m."
+      and mg._bina_wanted_tag(["Nizami r.", "Koroğlu m."]) is None,
+      "Qara Qarayev tag = wanted; a district tag alone (Nizami r.) is not")
+check(mg._bina_tags_from_html("<html>" + FOOTER + "</html>", "Koroğlu") is None,
+      "page with only the big footer list -> tags unknown (never guessed)")
+mg.PAGE_DELAY = 0
+mg._BINA_MAX_ID["v"] = 6619000
+pages_g = {}
+fetch_g = []
+
+
+def http_g(url, headers=None, params=None, timeout=30, browser=False):
+    fetch_g.append(url)
+    return R(pages_g[url]) if url in pages_g else RH(404, "")
+
+
+mg.http_get = http_g
+sent_g = []
+mg.notify_new_owner_msg = lambda l, n, ol="": sent_g.append((l["id"], l.get("location"))) or True
+bsrc_g = {"name": "bina.az", "type": "bina", "prefix": "", "mode": "price_owner",
+          "owner_label": "Mülkiyyətçi", "url": "https://bina.az/x"}
+
+
+def bl(iid, loc="Koroğlu m."):
+    l = {"id": str(iid), "url": f"https://bina.az/items/{iid}", "price": 150000, "rooms": 2,
+         "area": 60.0, "location": loc}
+    return l
+
+
+def bina_run(st, plain, excluded):
+    """One bot run for bina: `excluded` = ads whose shown location is excluded."""
+    for l in excluded:
+        l["_excluded_by"] = "Koroğlu"
+    mg._BINA_TAG_CANDS["items"] = list(excluded)
+    seen_ = st["listings"]
+    items = list(plain) + mg.bina_rescue_by_tags(bsrc_g, seen_, st)
+    n1, deferred, decided = mg.process_new_owner_checks(items, bsrc_g, seen_, st["seeded"],
+                                                        tries_map=st.setdefault("owner_tries", {}))
+    mg.process_source(items, bsrc_g, seen_, skip_ids=deferred, owner_map=decided)
+    mg._bina_stamp_tags(items, bsrc_g, seen_)
+    mg._BINA_PAGE_CACHE.clear()
+
+
+st_g = {"listings": {"6000001": {"url": "u", "price": 1, "first_seen": iso(time.time() - 30 * day),
+                                 "source": "bina.az", "owner": False}},
+        "seeded": {"bina.az:owner_seeded": True, "bina.az:url": mg._url_fingerprint(bsrc_g["url"])}}
+pages_g.update({"https://bina.az/items/6618907": tag_page(T_BOTH),
+                "https://bina.az/items/6618800": tag_page(T_ONLY),
+                "https://bina.az/items/6618700": tag_page(T_BOTH, label="vasitəçi (agent)")})
+old_ads = [bl(6100000 + i) for i in range(40)]            # months old by id
+with contextlib.redirect_stdout(io.StringIO()):
+    bina_run(st_g, [], [bl(6618907), bl(6618800), bl(6618700)] + old_ads)
+L_g = st_g["listings"]
+check(sent_g == [("6618907", "Nizami r., Koroğlu m., Qara Qarayev m.")],
+      "first run: 6618907 is sent, with all its tags as the address", str(sent_g))
+check(L_g["6618907"].get("owner") is True and L_g["6618907"].get("tags_ok") is True,
+      "it is recorded as sent + 'wanted by tag'")
+check(L_g.get("6618800", {}).get("skip") == "area" and "owner" not in L_g["6618800"],
+      "pure Koroğlu ad (no wanted tag): not sent, never looked at again")
+check(L_g.get("6618700", {}).get("owner") is False, "wanted by tag but an agent: not sent")
+check(all(L_g.get(str(6100000 + i), {}).get("skip") == "area-old" for i in range(40))
+      and len(fetch_g) == 3, "first run: 40 old excluded ads recorded silently, no page read for them",
+      str(len(fetch_g)))
+check(fetch_g.count("https://bina.az/items/6618907") == 1,
+      "the ad's page is read once (tags and owner check share it)")
+fetch_g.clear()
+sent_g.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    bina_run(st_g, [], [dict(bl(6618907), price=140000), bl(6618800), bl(6618700)] + old_ads)
+check(sent_g == [] and fetch_g == [], "next run: nothing sent again, no page read again",
+      f"{sent_g} {fetch_g}")
+check(L_g["6618907"]["price"] == 140000, "the wanted-by-tag ad is price-tracked like any other")
+pages_g["https://bina.az/items/6618950"] = "<html>" + FOOTER + "x" * 2000 + "</html>"   # tags not found
+for _ in range(mg.OWNER_MAX_TRIES + 1):
+    with contextlib.redirect_stdout(io.StringIO()):
+        bina_run(st_g, [], [bl(6618950)])
+check(L_g.get("6618950", {}).get("skip") == "area-unknown"
+      and fetch_g.count("https://bina.az/items/6618950") == mg.OWNER_MAX_TRIES and sent_g == [],
+      f"tags unreadable: tried {mg.OWNER_MAX_TRIES} times, then left alone (as before: not sent)")
+fetch_g.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    bina_run(st_g, [], [bl(6618960)])                      # page cannot be fetched at all
+check("6618960" not in L_g, "page not fetched: nothing recorded, tried again next run")
+many = [bl(6618000 + i) for i in range(50)]
+for l_ in many:
+    pages_g[l_["url"]] = tag_page(T_ONLY)
+fetch_g.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    bina_run(st_g, [], many)
+check(len(fetch_g) <= mg.BINA_TAG_MAX_PER_RUN + mg.OWNER_FETCH_FAIL_STREAK,
+      f"at most {mg.BINA_TAG_MAX_PER_RUN} tag pages per run", str(len(fetch_g)))
+c_g = mg.bina_check("https://bina.az/x")
+check(mg.bina_passes(bl(1, "Koroğlu m."), c_g) is False and mg.bina_passes(bl(2, "Əhmədli q."), c_g) is True,
+      "bina_passes itself is unchanged (helper scripts keep working)")
+
+print("\n[NOV-22] bina search: one bad page no longer throws the whole run away")
+mf = load(os.path.join(HERE, "monitor.py"), "monitor_binafetch")
+mf.PAGE_DELAY = 0
+mf.time = Clock()
+
+
+def gql_page(ids, nxt, loc="Əhmədli q."):
+    return {"data": {"itemsConnection": {"totalCount": 4, "edges": [
+        {"node": {"id": str(i), "path": f"/items/{i}", "rooms": 2, "price": {"total": 100000},
+                  "area": {"value": 60}, "location": {"id": "1", "fullName": loc if i != 6618907 else "Koroğlu m."}}}
+        for i in ids], "pageInfo": {"hasNextPage": bool(nxt), "endCursor": nxt}}}}
+
+
+class Sess:
+    def __init__(self, script):
+        self.script, self.calls, self.closed = script, 0, False
+
+    def get(self, url, params=None, headers=None, timeout=30):
+        self.calls += 1
+        step = self.script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+
+        class Resp:
+            status_code = step[0]
+
+            def json(self_inner):
+                if step[1] is None:
+                    raise ValueError("not json")
+                return step[1]
+        return Resp()
+
+    def close(self):
+        self.closed = True
+
+
+sess = Sess([(200, gql_page([6618901, 6618902], "c1")), mf.requests.ConnectionError("reset"),
+             (502, None), (200, gql_page([6618907, 6618903], None))])
+mf.requests.Session = lambda: sess
+got_f = mf.fetch_bina("https://bina.az/baki/alqi-satqi/menziller?location_ids%5B%5D=51")
+check([x["id"] for x in got_f] == ["6618901", "6618902", "6618903"] and sess.calls == 4 and sess.closed,
+      "network error + HTTP 502 on page 2 are retried; the scan finishes", str(sess.calls))
+check([x["id"] for x in mf._BINA_TAG_CANDS["items"]] == ["6618907"],
+      "the Koroğlu ad is not in the normal list; it waits for the tag check")
+sess = Sess([(200, gql_page([1], "c1"))] + [(503, None)] * 3)
+try:
+    mf.fetch_bina("https://bina.az/baki/alqi-satqi/menziller")
+    failed_f = False
+except RuntimeError as e_:
+    failed_f = "HTTP 503" in str(e_)
+check(failed_f and sess.calls == 4, "a page that keeps failing still stops the run with a clear reason")
+
+print("\n[NOV-23] collect_bina.py: table of ads placed since 01.01.2026 (read-only)")
+if os.path.exists(os.path.join(HERE, "collect_bina.py")):
+    mc = load(os.path.join(HERE, "monitor.py"), "monitor")
+    sys.modules["monitor"] = mc
+    tmpc = tempfile.mkdtemp()
+    mc.STATE_FILE = os.path.join(tmpc, "seen.json")
+    mc.USE_API = False
+    mc.PAGE_DELAY = 0
+    _noon = _dt.datetime.now(_dt.timezone.utc).replace(hour=8, minute=0, second=0, microsecond=0)
+    seen_c, TOP_C = {}, 6_620_000
+    for d in range(80):                                # 80 days of bot history, 2800 ids a day
+        for j in range(4):
+            iid = TOP_C - d * 2800 - j * 500
+            seen_c[str(iid)] = {"url": f"https://bina.az/items/{iid}", "price": 1, "source": "bina.az",
+                                "first_seen": (_noon - _dt.timedelta(days=d)).isoformat(timespec="seconds"),
+                                "owner": (j == 0)}
+    with open(mc.STATE_FILE, "w", encoding="utf-8") as fh_:
+        json.dump({"listings": seen_c}, fh_)
+    before_c = open(mc.STATE_FILE, encoding="utf-8").read()
+    days_to_jan1 = (_noon - _dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc)).days
+
+
+    def ad_c(iid, **kw):
+        base = {"id": str(iid), "url": f"https://bina.az/items/{iid}", "price": 150000, "currency": "AZN",
+                "rooms": 3, "area": 80.0, "floor": 4, "floors": 9, "location": "Əhmədli q.",
+                "has_bill_of_sale": True, "has_mortgage": False, "has_repair": True}
+        base.update(kw)
+        return base
+
+
+    ID_DEC = TOP_C - (days_to_jan1 + 20) * 2800           # ~20 days before 1 Jan 2026
+    ID_FEB = TOP_C - (days_to_jan1 - 40) * 2800           # ~10 Feb 2026
+    live_c = [ad_c(TOP_C), ad_c(TOP_C - 500), ad_c(ID_FEB), ad_c(ID_DEC),
+              ad_c(5_000_000, created_at="2026-03-05T10:00:00+04:00"),      # old number, bina's own date
+              ad_c(TOP_C - 77, location='Nizami r., "Koroğlu" m.')]
+    mc.fetch_bina = lambda url: (mc._BINA_TAG_CANDS.__setitem__("items", []), list(live_c))[1]
+    mc._BINA_MAX_ID["v"] = TOP_C
+    owner_reads = []
+    mc.bina_is_owner = lambda url: (owner_reads.append(url),
+                                    setattr(mc.bina_is_owner, "last_reason", "ok"), (True, None))[2]
+    sent_c = []
+    mc.tg_send_message = lambda text: sent_c.append(text) or True
+    os.environ["OUT"] = os.path.join(tmpc, "out.csv")
+    os.environ["COLLECT_CACHE"] = os.path.join(tmpc, "cache.json")
+    cb = load(os.path.join(HERE, "collect_bina.py"), "collect_bina")
+    with contextlib.redirect_stdout(io.StringIO()) as buf_c:
+        cb.main()
+    import csv as _csv
+    rows_c = list(_csv.DictReader(open(os.environ["OUT"], encoding="utf-8-sig")))
+    by_id = {r_["id"]: r_ for r_ in rows_c}
+    check(set(by_id) == {str(TOP_C), str(TOP_C - 500), str(ID_FEB), "5000000", str(TOP_C - 77)},
+          "ads since 01.01.2026 are in the table; the December 2025 one is not", str(sorted(by_id)))
+    check(by_id["5000000"]["placed"] == "05.03.2026" and by_id["5000000"]["placed_how"] == "bina",
+          "bina's own date is used when the search gives one")
+    est_c = _dt.datetime.strptime(by_id[str(ID_FEB)]["placed"], "%d.%m.%Y")
+    want_c = (_noon - _dt.timedelta(days=days_to_jan1 - 40)).replace(tzinfo=None)
+    check(abs((est_c - want_c).days) <= 2 and by_id[str(ID_FEB)]["placed_how"] == "estimate",
+          "otherwise the date is worked out from the ad number (within 2 days here)",
+          f"{by_id[str(ID_FEB)]['placed']} vs {want_c:%d.%m.%Y}")
+    check(by_id[str(TOP_C)]["seller"] == "owner" and by_id[str(TOP_C - 500)]["seller"] == "agent"
+          and by_id[str(ID_FEB)]["seller"] == "?", "seller column comes from the bot's history")
+    check(by_id[str(TOP_C)]["link"] == f"https://bina.az/items/{TOP_C}" and by_id[str(TOP_C)]["floor"] == "4/9"
+          and by_id[str(TOP_C)]["cixaris"] == "var" and by_id[str(TOP_C - 77)]["location"] == 'Nizami r., "Koroğlu" m.',
+          "link, floor, çıxarış and a location with commas/quotes are written correctly")
+    check(rows_c[0]["id"] == str(TOP_C) and owner_reads == [] and sent_c == []
+          and open(mc.STATE_FILE, encoding="utf-8").read() == before_c,
+          "newest first; no page read, nothing sent, seen.json untouched")
+    cb.OWNERS, cb.LIMIT = True, 1
+    cb.time = Clock()
+    with contextlib.redirect_stdout(io.StringIO()):
+        cb.main()
+    rows_c = list(_csv.DictReader(open(os.environ["OUT"], encoding="utf-8-sig")))
+    unknown_c = [r_["id"] for r_ in rows_c if r_["seller"] == "?"]
+    check(len(owner_reads) == 1 and len(unknown_c) == 2
+          and open(mc.STATE_FILE, encoding="utf-8").read() == before_c,
+          "OWNERS=1 LIMIT=1: one page read, answer kept in the side file, seen.json untouched",
+          f"{len(owner_reads)} {unknown_c}")
+    with contextlib.redirect_stdout(io.StringIO()):
+        cb.main()
+    check(len(owner_reads) == 2 and len(set(owner_reads)) == 2, "running again continues with the next ad")
+    os.environ.pop("OUT", None)
+    os.environ.pop("COLLECT_CACHE", None)
+    sys.modules.pop("monitor", None)
 
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")

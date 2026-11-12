@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-11-11-b"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-12-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -254,6 +254,17 @@ BINA_EXCLUDE_LOCATIONS = [x.strip() for x in os.environ.get(
     "BINA_EXCLUDE_LOCATIONS",
     "Koroğlu,Ağ şəhər,Şah İsmayıl Xətai"
 ).split(",") if x.strip()]
+# bina shows ONE location per ad in the search ("Koroğlu m."), but the ad's page can
+# carry several tags ("Nizami r., Koroğlu m., Qara Qarayev m."). An ad whose shown
+# location is excluded above is still wanted when one of its tags is in this list
+# (6439400, 6618907: Koroğlu + Qara Qarayev). District tags ("Nizami r.") are not
+# listed on purpose - every Koroğlu ad has one. Set BINA_RESCUE_TAGS="" to turn off.
+BINA_RESCUE_TAGS = [x.strip() for x in os.environ.get(
+    "BINA_RESCUE_TAGS",
+    "Qara Qarayev,Neftçilər,Xalqlar Dostluğu,Əhmədli,Həzi Aslanov,8-ci kilometr,Köhnə Günəşli"
+).split(",") if x.strip()]
+BINA_TAG_MAX_PER_RUN = int(os.environ.get("BINA_TAG_MAX_PER_RUN", "30"))   # tag pages per run
+BINA_FETCH_RETRIES = int(os.environ.get("BINA_FETCH_RETRIES", "3"))       # per search page
 # Reject absurd price jumps (parse glitches), but allow any realistic change.
 PRICE_GLITCH_LOW = float(os.environ.get("PRICE_GLITCH_LOW", "0.2"))    # new < 20% of old
 PRICE_GLITCH_HIGH = float(os.environ.get("PRICE_GLITCH_HIGH", "5.0"))  # new > 5x old
@@ -496,9 +507,21 @@ def bina_passes(l, c):
     #
     # The remaining guards only fire on a genuine contradiction (value present AND out of
     # range); a missing value is trusted, never dropped.
-    loc = l.get("location") or ""
-    if BINA_EXCLUDE_LOCATIONS and any(x in loc for x in BINA_EXCLUDE_LOCATIONS):
+    if _bina_excluded_by(l):
         return False
+    return _bina_passes_rest(l, c)
+
+
+def _bina_excluded_by(l):
+    """The BINA_EXCLUDE_LOCATIONS entry that matches the ad's shown location, or None."""
+    loc = l.get("location") or ""
+    for x in BINA_EXCLUDE_LOCATIONS:
+        if x in loc:
+            return x
+    return None
+
+
+def _bina_passes_rest(l, c):
     if MAX_LISTING_AGE_DAYS > 0 and _listing_age_days(l) is not None \
             and _listing_age_days(l) > MAX_LISTING_AGE_DAYS:
         return False
@@ -511,6 +534,35 @@ def bina_passes(l, c):
     return True
 
 
+_BINA_TAG_CANDS = {"items": []}     # excluded-location ads of the last scan (tag check)
+
+
+def _bina_page_json(session, fv, cursor):
+    """One search page. A single bad answer out of ~830 pages used to throw away the
+    whole bina run (nothing checked for 15 minutes), so a page is retried a few times
+    on network errors, HTTP 5xx/429 and non-JSON answers before giving up."""
+    last = "no answer"
+    for attempt in range(max(1, BINA_FETCH_RETRIES)):
+        if attempt:
+            time.sleep(2.0 * attempt)
+        try:
+            r = session.get(GRAPHQL_URL, params=_bina_params(fv, cursor),
+                            headers=API_HEADERS, timeout=30)
+        except requests.RequestException as e:
+            last = f"network error: {e.__class__.__name__}"
+            continue
+        if r.status_code != 200:
+            last = f"HTTP {r.status_code}"
+            if r.status_code in (429, 500, 502, 503, 504):
+                continue
+            break
+        try:
+            return r.json()
+        except ValueError:
+            last = "response was not JSON"
+    raise RuntimeError(last)
+
+
 def fetch_bina(url):
     fv = bina_filter_vars(url)
     check = bina_check(url)
@@ -518,14 +570,10 @@ def fetch_bina(url):
     total_count = None
     pages = 0
     hit_cap = False
+    cands = _BINA_TAG_CANDS["items"] = []
+    session = requests.Session()      # one connection for the whole scan (was one per page)
     for i in range(SCAN_PAGES):
-        r = requests.get(GRAPHQL_URL, params=_bina_params(fv, cursor), headers=API_HEADERS, timeout=30)
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}")
-        try:
-            payload = r.json()
-        except ValueError:
-            raise RuntimeError("response was not JSON")
+        payload = _bina_page_json(session, fv, cursor)
         if payload.get("errors"):
             msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
             if "PersistedQueryNotFound" in msg or "PERSISTED_QUERY_NOT_FOUND" in msg:
@@ -543,8 +591,13 @@ def fetch_bina(url):
                     l = _bina_node(node)
                     if str(l["id"]).isdigit():       # calibrate "now" for age estimates
                         _BINA_MAX_ID["v"] = max(_BINA_MAX_ID["v"], int(l["id"]))
-                    if bina_passes(l, check):
-                        out.append(l)
+                    hit = _bina_excluded_by(l)
+                    if hit is None:
+                        if _bina_passes_rest(l, check):
+                            out.append(l)
+                    elif BINA_RESCUE_TAGS and _bina_passes_rest(l, check):
+                        l["_excluded_by"] = hit
+                        cands.append(l)       # wanted only if a page tag says so
                 except Exception as e:
                     log("skip bina node:", e)
         pages += 1
@@ -556,8 +609,13 @@ def fetch_bina(url):
             hit_cap = True
         if PAGE_DELAY:
             time.sleep(PAGE_DELAY)
+    try:
+        session.close()
+    except Exception:
+        pass
     log(f"bina: scanned {pages} pages, {len(out)} matching listings"
-        + (f" of ~{total_count} total" if total_count is not None else ""))
+        + (f" of ~{total_count} total" if total_count is not None else "")
+        + (f"; {len(cands)} in excluded locations (tags decide)" if cands else ""))
     # surface a coverage gap so you know if changes on deep listings are being missed
     if hit_cap and total_count and total_count > len(out):
         _coverage_warn(len(out), total_count)
@@ -1326,9 +1384,18 @@ _OWNER_PATTERNS = [
 ]
 # --- explicit rejection of maklers/agents (equally strong) ---------------- #
 _ANTI_AGENT_PATTERNS = [
+    # widest first, so "agentliklər və maklerlər zəng etməsin" is taken as ONE request
+    r"\b(makler|vasiteci|agent|rieltor|emlakci)\w*(\s+\w+){0,4}?\s+(yazmasin|narahat\s+etmesin|"
+    r"zeng\s+etmesin|zeng\s+vurmasin|elaqe\s+saxlamasin|muraciet\s+etmesin)\w*",
     r"\b(men\s+)?makler\w*\s+deyil\w*",
     r"\b(makler|vasiteci|agent|rieltor)\w*\s+(yazmasin|narahat\s+etmesin|"
     r"zeng\s+etmesin|elaqe\s+saxlamasin|qebul\s+etmirem)\b",
+    # 12 Nov 2026: the same request in other words used to count as AGENT wording
+    # ("agentliklər zəng vurmasın", "agentliklərdən xahiş edirəm narahat etməsinlər",
+    # "agentliklərə satılmır") - only an owner tells agencies to stay away.
+    r"\b(makler|vasiteci|agent|rieltor)\w*\s+(satilmir|verilmir|satmiram|vermirem)\b",
+    r"\b(makler|agentlik|rieltor|vasiteci)\w*\s+xidmet\w*\s+(lazim\s+deyil|ehtiyac\s+yoxdur)\b",
+    r"\b(makler|agentlik|rieltor|vasiteci)\w*\s+ehtiyac\s+yoxdur\b",
     r"\b(makler|vasiteci|agent|rieltor)\w*\s+islemirem\b",
     r"\b(makler|vasiteci|agent|rieltor)\w*\s+lazim\s+deyil\b",
 ]
@@ -1338,7 +1405,8 @@ _ANTI_AGENT_PATTERNS = [
 # for neither side. (11 Nov 2026, before bina descriptions were checked too.)
 _NO_FEE_PATTERNS = [
     r"\b(ofis|xidmet|komissiya|komisyon|vasitecilik|agentlik|makler)\w*\s+(haqq\w*\s+)?"
-    r"(yoxdur|yox|alinmir|alinmayacaq|odenilmir|teleb\s+olunmur|olmayacaq)\b",
+    r"(yoxdur|yoxdu|yox|alinmir|alinmayacaq|odenilmir|odenmir|teleb\s+olunmur|olmayacaq|"
+    r"vermirem|odemirem|verilmir|tutulmur|istenilmir)\b",
     r"\b(komissiya|komisyon)\w*(siz|suz)\b",
     r"\b(ofis|xidmet|vasitecilik|komissiya)\s+haqq\w*(siz|suz)\b",
     r"\b(ofis|xidmet|vasitecilik|komissiya)\s+haqq\w*\s+(olmadan|odemeden)\b",
@@ -1352,6 +1420,7 @@ _AGENCY_PATTERNS = [
     r"\bofis\s+xidmet\w*",
     r"\bhaqq\w*\s+\d+\s*(faiz|%)",          # "haqqi 1 faiz" / "haqqi 1 %"
     r"\b\d+\s*(faiz|%)\s*(ofis|xidmet|komissiya)\w*",
+    r"\b(komissiya|komisyon)\w*\s+\d+\s*(faiz|%)",   # "komissiya 1%"
     r"\bkomissiya\w*", r"\bkomisyon\w*",
     r"\bagentliy\w*", r"\bagentlik\w*", r"\bekskluziv\w*",
     r"\bbazamizda\b", r"\bmusterilerimiz\w*", r"\bportfel\w*",
@@ -1364,6 +1433,17 @@ _BUSINESS_PATTERNS = [
     r"\bconsulting\w*", r"\bdevelopment\w*", r"\bemlak\s+(evi|merkezi|servis)\w*",
     r"\bmakler\w*", r"\brieltor\w*", r"\brealtor\w*", r"\bbroker\w*",
 ]
+
+# Reasons that are proof of a paid intermediary on their own: a fee ("... haqqı",
+# "N faiz/%"), or an agency speaking about itself. Single words that owners also use
+# ("eksklüziv təmir", "komissiya", "agentlik", "portfel") are NOT in this group.
+_STRONG_AGENCY_REASON = re.compile(
+    r"^agency:.*(haqq|\bfaiz\b|%|ofis\s+xidmet|agentliyimiz|bazamizda|musterilerimiz)")
+
+
+def _has_strong_agency(reasons):
+    return any(_STRONG_AGENCY_REASON.search(r) for r in reasons)
+
 
 OWNER_SCORE_STRONG = 4
 SCORE_OWNER_AT = int(os.environ.get("TAP_SCORE_OWNER_AT", "3"))
@@ -2142,6 +2222,152 @@ def _bina_label_verdict(raw):
     return None
 
 
+_BINA_TAG_LINK = re.compile(
+    r'<a\b[^>]*href="(?:https?://(?:www\.)?bina\.az)?/baki/([a-z0-9-]+)/alqi-satqi/menziller'
+    r'([^"]*)"[^>]*>(.*?)</a>', re.S)
+_BINA_PAGE_CACHE = {}      # url -> page html read for the tags (reused by the owner check)
+
+
+def _bina_tags_from_html(raw, must_contain):
+    """Location tags of a bina ad page, e.g. ["Nizami r.", "Koroğlu m.", "Qara Qarayev m."].
+    The tags are links that stand directly next to each other:
+      /baki/nizami/alqi-satqi/menziller/..., /baki/koroglu/..., /baki/qara-qarayev/...
+    Only a small group (at most 8 links, nothing but markup between them) that contains
+    the ad's own shown location (`must_contain`, e.g. "Koroğlu") is accepted, so menus
+    and "popular searches" lists are never taken for the ad's tags. None = not found."""
+    want = az_normalize(must_contain or "").strip()
+    groups, cur, prev_end = [], [], None
+    for mm in _BINA_TAG_LINK.finditer(raw or ""):
+        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", mm.group(3)))).strip()
+        if prev_end is not None:
+            gap = raw[prev_end:mm.start()]
+            joined = len(gap) < 400 and not re.sub(r"<[^>]+>|[\s,;·|/]+|&nbsp;", "", gap)
+            if not joined:
+                groups.append(cur)
+                cur = []
+        if text:
+            cur.append(text)
+        prev_end = mm.end()
+    groups.append(cur)
+    for g in groups:
+        g = list(dict.fromkeys(g))
+        if 1 <= len(g) <= 8 and want and any(want in az_normalize(t) for t in g):
+            return g
+    return None
+
+
+def _bina_wanted_tag(tags):
+    keys = [az_normalize(k).strip() for k in BINA_RESCUE_TAGS]
+    for t in tags or []:
+        nt = az_normalize(t)
+        if any(k and k in nt for k in keys):
+            return t
+    return None
+
+
+def bina_location_tags(l):
+    """Read the ad's page and return its location tags (None = unknown).
+    bina_location_tags.last_reason: "fetch" (page not read) or "notags" / "ok"."""
+    bina_location_tags.last_reason = "fetch"
+    try:
+        r = http_get(l["url"], headers=HTML_HEADERS, timeout=30, browser=True)
+        if getattr(r, "status_code", 0) != 200 or len(r.text or "") < 1500:
+            return None
+        raw = r.text
+    except Exception:
+        return None
+    _BINA_PAGE_CACHE[l["url"]] = raw
+    tags = _bina_tags_from_html(raw, l.get("_excluded_by") or l.get("location") or "")
+    bina_location_tags.last_reason = "ok" if tags else "notags"
+    return tags
+
+
+bina_location_tags.last_reason = ""
+
+
+def bina_rescue_by_tags(source, seen, state):
+    """Ads whose SHOWN location is excluded (Koroğlu, Ağ şəhər, ...) but whose page
+    tags include a wanted area. Returns the listings to treat like any other bina ad.
+      * decided once per ad: wanted -> record gets tags_ok (kept from then on);
+        not wanted -> recorded with skip="area" and never looked at again
+      * the first run records every such ad that is not new silently (no backlog)
+      * at most BINA_TAG_MAX_PER_RUN pages per run; unreadable pages are retried"""
+    cands, _BINA_TAG_CANDS["items"] = _BINA_TAG_CANDS["items"], []
+    if not cands or not BINA_RESCUE_TAGS:
+        return []
+    name, prefix = source["name"], source["prefix"]
+    flags = state.setdefault("seeded", {})
+    first = not flags.get(name + ":tags")
+    tries = state.setdefault("tag_tries", {})
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    out, used, quiet, kept, dropped, fails = [], 0, 0, 0, 0, 0
+    for l in cands:
+        iid = str(l["id"])
+        key = prefix + iid
+        rec = seen.get(key)
+        if rec is not None:
+            if rec.get("tags_ok"):
+                if rec.get("tags"):
+                    l["location"] = rec["tags"]
+                out.append(l)
+            continue
+        if first:
+            age = _listing_age_days(l)
+            if age is None or age > NEW_MAX_AGE_DAYS:
+                seen[key] = {"url": l["url"], "first_seen": now, "source": name,
+                             "skip": "area-old"}
+                quiet += 1
+                continue
+        if used >= BINA_TAG_MAX_PER_RUN or fails >= OWNER_FETCH_FAIL_STREAK:
+            continue                          # next run
+        used += 1
+        tags = bina_location_tags(l)
+        if PAGE_DELAY:
+            time.sleep(PAGE_DELAY)
+        if tags is None:
+            if bina_location_tags.last_reason == "fetch":
+                fails += 1                    # page not read: no try used
+                continue
+            fails = 0
+            n = tries.get(iid, 0) + 1
+            if n >= OWNER_MAX_TRIES:
+                tries.pop(iid, None)
+                seen[key] = {"url": l["url"], "first_seen": now, "source": name,
+                             "skip": "area-unknown"}
+            else:
+                tries[iid] = n
+            continue
+        fails = 0
+        tries.pop(iid, None)
+        joined = ", ".join(tags)
+        if _bina_wanted_tag(tags):
+            l["location"] = joined
+            l["_tags"] = joined
+            out.append(l)
+            kept += 1
+            log(f"{name}: {l['url']} shown in {l.get('_excluded_by')}, tags [{joined}] -> wanted")
+        else:
+            seen[key] = {"url": l["url"], "first_seen": now, "source": name,
+                         "skip": "area", "tags": joined}
+            dropped += 1
+    flags[name + ":tags"] = True
+    for k in [k for k in tries if (prefix + k) in seen]:
+        tries.pop(k, None)
+    if used or quiet:
+        log(f"{name}: excluded-location ads: read {used} page(s), {kept} wanted by tag, "
+            f"{dropped} not wanted" + (f", {quiet} older ones recorded silently" if quiet else ""))
+    return out
+
+
+def _bina_stamp_tags(items, source, seen):
+    """Remember the decision on the record, so the page is never read again for it."""
+    for l in items:
+        if l.get("_tags"):
+            rec = seen.get(source["prefix"] + str(l["id"]))
+            if rec is not None:
+                rec["tags_ok"], rec["tags"] = True, l["_tags"]
+
+
 def _bina_description(raw):
     """(text, source) of a bina ad's OWN description. og:description is cut after
     ~150 characters (6058940: "... 3 otaqlı, tam yeni..."), and fee wording often
@@ -2186,13 +2412,15 @@ def bina_is_owner(url):
     None = undetermined. bina_is_owner.last_reason: "fetch" (page not read) or
     "nolabel" (read, but no seller label found)."""
     bina_is_owner.last_reason = "fetch"
-    try:
-        r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
-        if getattr(r, "status_code", 0) != 200:
+    raw = _BINA_PAGE_CACHE.pop(url, None)      # already read this run for its tags
+    if raw is None:
+        try:
+            r = http_get(url, headers=HTML_HEADERS, timeout=30, browser=True)
+            if getattr(r, "status_code", 0) != 200:
+                return None, None
+            raw = r.text or ""
+        except Exception:
             return None, None
-        raw = r.text or ""
-    except Exception:
-        return None, None
     if len(raw) < 1500:
         return None, None
     photo = None
@@ -2224,7 +2452,12 @@ def bina_is_owner(url):
         tscore, treasons = owner_signal_score(desc or "", "", None)
         bina_is_owner.last_text = {"source": dsrc, "chars": len(desc or ""),
                                    "score": tscore, "reasons": treasons}
-        if tscore <= SCORE_AGENT_AT:
+        # 2026-11-12-a: bina's own label is only overruled by STRONG proof (a fee or an
+        # agency talking about itself); owner wording in the same text still counts for
+        # the owner through the score.
+        # 11-11-b flipped on any single agency-looking word ("eksklüziv təmir",
+        # "agentliklər zəng vurmasın"), which could file a real owner as an agent.
+        if tscore <= SCORE_AGENT_AT and _has_strong_agency(treasons):
             log(f"bina.az: {url} labelled mülkiyyətçi, but the text is agency wording "
                 f"{treasons} -> AGENT")
             verdict, src = False, "text-agency"
@@ -3020,6 +3253,8 @@ def main():
         if source.get("mode") == "owner_new":
             total_notified += process_owner_new(items, source, seen, seeded_flags)
         elif source.get("mode") == "price_owner":
+            if source.get("type") == "bina":
+                items = items + bina_rescue_by_tags(source, seen, state)
             # owner check must run BEFORE process_source seeds the new listings
             n_new, deferred, decided = process_new_owner_checks(
                 items, source, seen, seeded_flags,
@@ -3027,6 +3262,9 @@ def main():
             total_notified += n_new
             total_notified += process_source(items, source, seen, skip_ids=deferred,
                                              owner_map=decided)
+            if source.get("type") == "bina":
+                _bina_stamp_tags(items, source, seen)
+                _BINA_PAGE_CACHE.clear()
         else:
             total_notified += process_source(items, source, seen)
 

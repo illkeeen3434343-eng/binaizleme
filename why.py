@@ -5,6 +5,8 @@
   .venv/bin/python why.py 48629527 https://bina.az/items/6463748 168545
 
 Accepts plain ids or full links from tap.az, bina.az, lalafo.az, yeniemlak.az.
+LIVE=1 also reads a bina ad's page now (seller label, text check, Çıxarış, location tags):
+  set -a && . ./.env && set +a && LIVE=1 .venv/bin/python why.py https://bina.az/items/6616971
 """
 import json
 import os
@@ -43,6 +45,14 @@ def explain(rec):
         t = rec.get("tries", rec.get("owner_tries", 0))
         return (f"UNDECIDED after {t} read(s) - the page had no clear seller signal"
                 + ("; retried up to 4 reads" if t < 4 else "; gave up"))
+    if str(rec.get("skip", "")).startswith("area"):
+        how = {"area": f"its tags [{rec.get('tags', '')}] have no wanted area",
+               "area-old": "it was already old when the tag check was added (2026-11-12-a)",
+               "area-unknown": "its tags could not be read after 4 tries"}.get(rec["skip"], "")
+        return f"NOT SENT - bina shows it in an excluded location (Koroğlu, Ağ şəhər, ...): {how}"
+    if rec.get("tags_ok"):
+        return (f"KEPT although bina shows it in an excluded location: tags [{rec.get('tags', '')}] "
+                "include a wanted area; no owner verdict stored yet")
     if str(rec.get("skip", "")).startswith("old"):
         return ("HIDDEN by 2026-10-18-a as 'not new' (that rule was wrong). From 2026-11-07-a "
                 "it is checked and, if an owner ad, sent once - marked old - the next time "
@@ -53,6 +63,42 @@ def explain(rec):
     if rec.get("price_history") is not None:
         base += "; bina also tracks its price"
     return base
+
+
+def live_bina(url):
+    """LIVE=1: read the bina ad's page now and show what decides it (read-only)."""
+    import html as H
+    import monitor as m
+    try:
+        r = m.http_get(url, headers=m.HTML_HEADERS, timeout=30, browser=True)
+    except Exception as e:
+        print(f"  live: page not read ({e})")
+        return
+    raw = r.text or ""
+    print(f"  live: HTTP {r.status_code}, {len(raw)} bytes")
+    if r.status_code != 200:
+        return
+    text = re.sub(r"\s+", " ", H.unescape(re.sub(r"<[^>]+>", " ", raw)))
+    for label in ("Çıxarış", "Təmir", "İpoteka", "Kateqoriya", "Mərtəbə", "Sahə", "Otaq sayı"):
+        mm = re.search(re.escape(label) + r"\s*:?\s*(.{0,28})", text)
+        if mm:
+            print(f"  live: {label}: {mm.group(1).strip()!r}")
+    title = m._meta_tags(raw).get("og:title")
+    print(f"  live: title: {title}")
+    m._BINA_PAGE_CACHE[url] = raw
+    v, _p = m.bina_is_owner(url)
+    print(f"  live: seller verdict: {v} (True=owner, False=agent) | text check: {m.bina_is_owner.last_text}")
+    groups = []
+    for x in m.BINA_EXCLUDE_LOCATIONS + [title or ""]:
+        t = m._bina_tags_from_html(raw, x)
+        if t and t not in groups:
+            groups.append(t)
+    print(f"  live: location tags: {groups or 'not found'}")
+    for t in groups:
+        print(f"  live: wanted tag: {m._bina_wanted_tag(t)} | excluded words in tags: "
+              f"{[x for x in m.BINA_EXCLUDE_LOCATIONS if any(x in y for y in t)]}")
+    print("  live: the search asks for: Çıxarış var (has_bill_of_sale) and the areas in "
+          "BINA_SEARCH_URL; an ad without Çıxarış, or outside those areas, never reaches the bot")
 
 
 def main():
@@ -92,6 +138,8 @@ def main():
             print("  log:")
             for h in hits:
                 print("    " + h[:220])
+        if os.environ.get("LIVE") == "1" and "bina.az" in arg:
+            live_bina(arg.strip())
 
 
 if __name__ == "__main__":
