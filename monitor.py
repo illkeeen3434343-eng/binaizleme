@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-11-12-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-15-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -127,9 +127,22 @@ YENIEMLAK_SEARCH_URL = os.environ.get("YENIEMLAK_SEARCH_URL", (
 TAP_SEARCH_URL = os.environ.get("TAP_SEARCH_URL", (
     "https://tap.az/elanlar/dasinmaz-emlak/menziller?keywords_source=typewritten&p%5B740%5D=3722&q%5Bregion_id%5D=420&q%5Bis_shop%5D=false"
 ))
-LALAFO_SEARCH_URL = os.environ.get("LALAFO_SEARCH_URL", (
-    "https://lalafo.az/baku/kvartiry/prodazha-kvartir/owner/nizaminskij/hatainskij/gara-garaev/neftchiler/halglar-dostlugu/ahmedly/azi-aslanov/fresh-renovation/kupchaya/8-oy-kilometr/ahmedlyi/staryiy-gyunyashli/pos-azi-aslanov"
-))
+# lalafo joins filters of DIFFERENT kinds with AND: the old single link (districts +
+# metros + settlements + owner + fresh-renovation) only returned ads that had a wanted
+# district AND a wanted metro AND a wanted settlement - about 70 ads. Ad 118119487
+# (m. Həzi Aslanov, Xətai r., no settlement chosen) was never in it (checked 15 Nov
+# 2026: found with districts only / metros only, not with settlements added).
+# So the areas are read as THREE searches (districts | metros | settlements) and merged.
+# Also dropped (user, 15 Nov 2026): "fresh-renovation" (ads with "Orta təmir" are
+# wanted) and "owner" (lalafo also has the seller type "Maklerlər narahat etməsin",
+# and some sellers choose none) - agents are filtered by the bot from "Təklifin növü".
+# Several links are separated by "|".
+_LALAFO_BASE = "https://lalafo.az/baku/kvartiry/prodazha-kvartir"
+LALAFO_SEARCH_URL = os.environ.get("LALAFO_SEARCH_URL", " | ".join([
+    _LALAFO_BASE + "/nizaminskij/hatainskij/kupchaya",
+    _LALAFO_BASE + "/gara-garaev/neftchiler/halglar-dostlugu/ahmedly/azi-aslanov/kupchaya",
+    _LALAFO_BASE + "/8-oy-kilometr/ahmedlyi/staryiy-gyunyashli/pos-azi-aslanov/kupchaya",
+]))
 
 # Sources this bot tracks. ORDER MATTERS: tap.az only ever serves its first results
 # page (it ignores ?page=N), so it must be read as soon as a run starts. bina's full
@@ -883,7 +896,8 @@ def fetch_for_source(source):
     if source["type"] == "tap":
         return fetch_tap(source["url"])
     if source["type"] == "lalafo":
-        return fetch_lalafo(source["url"])
+        actionable, _why = _ye_crawl_plan(source)
+        return fetch_lalafo(source["url"], actionable=actionable)
     raise RuntimeError(f"unknown source type {source['type']}")
 
 
@@ -998,7 +1012,9 @@ _LALAFO_FREETEXT = ("description", "text", "body", "content", "title", "seo",
                     "meta", "url", "slug", "comment")
 _LALAFO_AGENT_VALUES = {"vasiteci", "makler", "agent", "rieltor", "agentlik",
                         "vasitecilik", "emlak agentliyi"}
-_LALAFO_OWNER_VALUES = {"sahibi", "mulkiyyetci", "ev sahibi", "emlak sahibi", "sahib"}
+_LALAFO_OWNER_VALUES = {"sahibi", "mulkiyyetci", "ev sahibi", "emlak sahibi", "sahib",
+                        # a real lalafo "Təklifin növü" option (ad 118119487)
+                        "maklerler narahat etmesin"}
 
 
 def _lalafo_values(obj, key=""):
@@ -1021,7 +1037,7 @@ def _lalafo_seller_type(it):
     try:
         for _k, v in _lalafo_values(it):
             n = az_normalize(v).strip()
-            if not n or len(n) > 24:
+            if not n or len(n) > 32:
                 continue
             if n in _LALAFO_AGENT_VALUES:
                 return "agent"
@@ -1145,31 +1161,69 @@ def _fetch_lalafo_html(purl, tries=4):
     return last, (getattr(last, "text", "") or "")
 
 
-def fetch_lalafo(url):
+# The three searches hold ~120 pages together. A normal run reads each search only until
+# LALAFO_QUIET_PAGES pages in a row held nothing to look at (every ad already known and
+# none placed or updated in the last LALAFO_RECENT_HOURS). Everything is read in full
+# every YE_FULL_CRAWL_HOURS, on the first run and after the links change.
+LALAFO_QUIET_PAGES = int(os.environ.get("LALAFO_QUIET_PAGES", "3"))
+LALAFO_RECENT_HOURS = float(os.environ.get("LALAFO_RECENT_HOURS", "24"))
+# After the links change, ads PLACED within this many days are checked like new ones
+# (lalafo gives the exact creation date); older ones are recorded silently as before.
+LALAFO_CATCHUP_DAYS = float(os.environ.get("LALAFO_CATCHUP_DAYS", "7"))
+
+
+def _lalafo_urls(url):
+    return [u.strip() for u in str(url or "").split("|") if u.strip()]
+
+
+def fetch_lalafo(url, actionable=None):
+    """Read every lalafo search in `url` ("|"-separated) and merge by ad id.
+    actionable: None = read all pages; otherwise function(listing) -> bool and each
+    search stops after LALAFO_QUIET_PAGES quiet pages in a row."""
     all_out, seen_ids = [], set()
-    for page in range(1, LALAFO_MAX_PAGES + 1):
-        purl = _with_page(url, page)
-        r, body = _fetch_lalafo_html(purl)
-        if getattr(r, "status_code", 0) != 200 or "__NEXT_DATA__" not in body:
-            if page == 1:
-                raise RuntimeError("lalafo blocked (Cloudflare) after retries")
-            break
-        listings, has_next = _parse_lalafo_page(body)
-        # Only cry "structure changed" when the page clearly HAS listings we failed
-        # to parse; a genuinely empty owner feed (no owner posts) stays silent.
-        if page == 1 and not listings and len(re.findall(r"-id-\d+", body)) > 3:
-            raise RuntimeError("lalafo parsed 0 (structure changed?)")
-        new = [l for l in listings if l["id"] not in seen_ids]
-        for l in new:
-            seen_ids.add(l["id"])
-            all_out.append(l)
-        if not has_next:            # server says this is the last real page -> stop
-            break                   # (prevents drifting into out-of-area filler ads)
-        if not new:                 # safety: nothing new yet still "next" -> stop
-            break
-        if PAGE_DELAY:
-            time.sleep(PAGE_DELAY)
-    log(f"lalafo.az: {len(all_out)} listings")
+    now_ts = time.time()
+    pages_read = 0
+    for n_url, one in enumerate(_lalafo_urls(url), 1):
+        quiet = 0
+        own_ids = set()             # ids of THIS search (the other searches overlap)
+        for page in range(1, LALAFO_MAX_PAGES + 1):
+            purl = _with_page(one, page)
+            r, body = _fetch_lalafo_html(purl)
+            if getattr(r, "status_code", 0) != 200 or "__NEXT_DATA__" not in body:
+                if page == 1:
+                    raise RuntimeError("lalafo blocked (Cloudflare) after retries")
+                log(f"lalafo.az: search {n_url} page {page} not readable; stopped there")
+                break
+            pages_read += 1
+            listings, has_next = _parse_lalafo_page(body)
+            # Only cry "structure changed" when the page clearly HAS listings we failed
+            # to parse; a genuinely empty feed stays silent.
+            if page == 1 and not listings and len(re.findall(r"-id-\d+", body)) > 3:
+                raise RuntimeError("lalafo parsed 0 (structure changed?)")
+            new = [l for l in listings if l["id"] not in seen_ids]
+            for l in new:
+                seen_ids.add(l["id"])
+                all_out.append(l)
+            if not has_next:        # server says this is the last real page -> stop
+                break               # (prevents drifting into out-of-area filler ads)
+            fresh = [l for l in listings if l["id"] not in own_ids]
+            own_ids.update(l["id"] for l in listings)
+            if not fresh:           # safety: page repeats yet still "next" -> stop
+                break
+            if actionable is not None:
+                busy = False
+                for l in listings:
+                    t = max(l.get("created_ts") or 0, l.get("updated_ts") or 0)
+                    if (not t or now_ts - t < LALAFO_RECENT_HOURS * 3600) or actionable(l):
+                        busy = True
+                        break
+                quiet = 0 if busy else quiet + 1
+                if quiet >= LALAFO_QUIET_PAGES:
+                    break
+            if PAGE_DELAY:
+                time.sleep(PAGE_DELAY)
+    log(f"lalafo.az: {len(all_out)} listings ({pages_read} page(s), "
+        f"{'full read' if actionable is None else 'newest pages'})")
     return all_out
 
 
@@ -2946,16 +3000,27 @@ def process_owner_new(items, source, seen, seeded_flags):
     first_run = not seeded_flags.get(name) or (bool(prefix) and not has_recorded)
     changed = _url_changed(seeded_flags, name, source.get("url"))
     if first_run or changed:
-        n = 0
+        # lalafo gives each ad's exact creation date, so after a link change the ads
+        # PLACED in the last LALAFO_CATCHUP_DAYS are checked like new ones (the widened
+        # links of 15 Nov 2026 exist to catch ads like 118119487, placed days earlier).
+        catchup = (stype == "lalafo" and changed and not first_run and LALAFO_CATCHUP_DAYS > 0)
+        n = kept = 0
         for l in items:
             k = prefix + str(l["id"])
             if k not in seen:
+                c = l.get("created_ts")
+                if catchup and c and now_ts - c <= LALAFO_CATCHUP_DAYS * 86400:
+                    kept += 1
+                    continue
                 seen[k] = {"url": l["url"], "first_seen": now, "source": name}
                 n += 1
         seeded_flags[name] = True
         why = "first run" if first_run else "search URL changed"
-        log(f"{name}: {why} - recorded {n} current listings silently (no announcements)")
-        return 0
+        log(f"{name}: {why} - recorded {n} current listings silently (no announcements)"
+            + (f"; {kept} placed in the last {LALAFO_CATCHUP_DAYS:g} days are checked now"
+               if kept else ""))
+        if not kept:
+            return 0
 
     prefiltered = source.get("prefiltered_owner", False)  # URL already asks for owner posts
     seller_apts = _seller_apartments(seen) if stype == "tap" else {}

@@ -1415,6 +1415,121 @@ if os.path.exists(os.path.join(HERE, "collect_bina.py")):
     os.environ.pop("COLLECT_CACHE", None)
     sys.modules.pop("monitor", None)
 
+print("\n[NOV-24] lalafo 118119487: three searches merged, 'Orta təmir' and no-owner-filter ads kept")
+ml = load(os.path.join(HERE, "monitor.py"), "monitor_lalafo")
+ml.PAGE_DELAY = 0
+ml.time = Clock(time.time())
+urls24 = ml._lalafo_urls(ml.LALAFO_SEARCH_URL)
+check(len(urls24) == 3 and all("/owner" not in u and "fresh-renovation" not in u and u.endswith("/kupchaya")
+                               for u in urls24)
+      and "hatainskij" in urls24[0] and "azi-aslanov" in urls24[1] and "pos-azi-aslanov" in urls24[2]
+      and "azi-aslanov/kupchaya" in urls24[1] and "hatainskij" not in urls24[1],
+      "default: districts | metros | settlements, each with Kupça only", str(urls24))
+
+
+def la_item(iid, slug="hmdli-2-otaqli", ttype="Mülkiyyətçi", created=None, title=None, repair="Orta təmir"):
+    c = int(ml.time.t - 10 * day) if created is None else int(created)
+    params = [{"name": "Təmir", "value": repair, "id": 352}, {"name": "Sənədlər", "value": "Kupça (Çıxarış)", "id": 888}]
+    if ttype:
+        params.append({"name": "Təklifin növü", "value": ttype, "id": 256})
+    return {"id": int(iid), "price": 150000, "symbol": "AZN", "url": f"/baku/ads/baki-{slug}-id-{iid}",
+            "title": title or "Bakı, 2 otaqlı, Köhnə tikili, m. Əhmədli, 60 kv. m", "description": "Təmirli mənzil",
+            "created_time": c, "updated_time": c, "params": params, "images": []}
+
+
+def la_page(items_, cur, pages):
+    nd = {"props": {"initialState": {"listing": {"listingFeed": {
+        "items": items_, "_meta": {"currentPage": cur, "pageCount": pages, "totalCount": 40 * pages},
+        "_links": ({"next": {"href": "x"}} if cur < pages else {})}}}}}
+    return ('<html><script id="__NEXT_DATA__" type="application/json">' + json.dumps(nd) + "</script>"
+            + "x" * 60000 + "</html>")
+
+
+AD24 = la_item(118119487, slug="3-otaqli-kohn-tikili-m-hzi-aslanov-61-kv-m", ttype="Maklerlər narahat etməsin",
+               created=ml.time.t - 3.6 * day, title="Bakı, 3 otaqlı, Köhnə tikili, m. Həzi Aslanov, 61 kv. m")
+site24 = {0: [[la_item(1001), AD24], [la_item(1002)]],                 # districts
+          1: [[AD24, la_item(1003)]],                                  # metros
+          2: [[la_item(1004)]]}                                        # settlements
+la_reads = []
+
+
+def la_get(purl, tries=4):
+    idx = next(i for i, u in enumerate(urls24) if purl.split("?")[0] == u)
+    n = int(ml.parse_qs(ml.urlparse(purl).query).get("page", ["1"])[0])
+    la_reads.append((idx, n))
+    pages_ = site24[idx]
+    body = la_page(pages_[n - 1] if n <= len(pages_) else [], n, len(pages_))
+    return RH(200, body), body
+
+
+ml._fetch_lalafo_html = la_get
+got24 = ml.fetch_lalafo(ml.LALAFO_SEARCH_URL)
+check(sorted(x["id"] for x in got24) == ["1001", "1002", "1003", "1004", "118119487"]
+      and la_reads == [(0, 1), (0, 2), (1, 1), (2, 1)],
+      "all three searches are read and merged; the ad in two of them appears once", str(la_reads))
+ad24 = next(x for x in got24 if x["id"] == "118119487")
+check(ml.lalafo_ok(ad24) and ad24["_agent"] is False
+      and ml._lalafo_seller_type(AD24) == "owner" and ml._lalafo_seller_type(la_item(5, ttype="Vasitəçi")) == "agent"
+      and ml._lalafo_seller_type(la_item(6, ttype=None)) is None,
+      "'Maklerlər narahat etməsin' = owner type; 'Vasitəçi' = agent; none chosen = unknown")
+lsrc24 = {"name": "lalafo.az", "type": "lalafo", "prefix": "lala:", "mode": "owner_new",
+          "owner_label": "Mülkiyyətçi", "prefiltered_owner": True, "url": ml.LALAFO_SEARCH_URL}
+OLD_LINK = "https://lalafo.az/baku/kvartiry/prodazha-kvartir/owner/nizaminskij"
+seen24 = {"lala:1": {"url": "u", "first_seen": iso(ml.time.t - 60 * day), "source": "lalafo.az", "owner": True}}
+flags24 = {"lalafo.az": True, "lalafo.az:url": ml._url_fingerprint(OLD_LINK)}
+sent24 = []
+ml.notify_new_owner_msg = lambda l, n, ol="": sent24.append((l["id"], bool(l.get("_age_days")))) or True
+feed24 = [dict(x) for x in got24]
+feed24.append(ml._parse_lalafo_page(la_page([la_item(2001, ttype="Vasitəçi", created=ml.time.t - day)], 1, 1))[0][0])
+feed24.append(ml._parse_lalafo_page(la_page([la_item(2002, ttype=None, created=ml.time.t - 3600)], 1, 1))[0][0])
+with contextlib.redirect_stdout(io.StringIO()):
+    ml.process_owner_new([dict(x) for x in feed24], lsrc24, seen24, flags24)
+check(sorted(sent24) == [("118119487", True), ("2002", False)],
+      "links changed: the ad placed 3.6 days ago is sent (marked old), the 1-hour-old one as new", str(sent24))
+check(all("owner" not in seen24[f"lala:{i}"] for i in (1001, 1002, 1003, 1004)),
+      "the 10-day-old ads are recorded silently (no flood)")
+check(seen24["lala:2001"].get("owner") is False and seen24["lala:2001"].get("skip") == "agent",
+      "'Vasitəçi' ad in the wider search is filed as agent, not sent")
+sent24.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    ml.process_owner_new([dict(x) for x in feed24], lsrc24, seen24, flags24)
+check(sent24 == [], "next run: nothing is sent twice")
+
+big24 = [[la_item(3000 + p * 40 + i, created=ml.time.t - 20 * day) for i in range(40)] for p in range(10)]
+site24.update({0: big24, 1: [[la_item(3000)]], 2: [[la_item(3001)]]})
+known24 = {f"lala:{it_['id']}": {"url": "u", "first_seen": "x", "source": "lalafo.az", "owner": False}
+           for pg in big24 for it_ in pg}
+act24 = (lambda l: ml._candidate_kind("lalafo", l, known24.get("lala:" + str(l["id"])), ml.time.t) is not None)
+la_reads.clear()
+ml.fetch_lalafo(ml.LALAFO_SEARCH_URL, actionable=act24)
+check([n for i, n in la_reads if i == 0] == [1, 2, 3],
+      f"normal run: stops after {ml.LALAFO_QUIET_PAGES} pages with nothing new", str(la_reads))
+known24.pop("lala:%d" % (3000 + 4 * 40 + 7))                           # unknown ad on page 5
+big24[1][3]["updated_time"] = int(ml.time.t - 3600)                    # pushed up an hour ago, page 2
+la_reads.clear()
+got_b = ml.fetch_lalafo(ml.LALAFO_SEARCH_URL, actionable=act24)
+check([n for i, n in la_reads if i == 0] == [1, 2, 3, 4, 5, 6, 7, 8],
+      "a recently updated ad and an unknown ad keep it reading", str(la_reads))
+la_reads.clear()
+ml.fetch_lalafo(ml.LALAFO_SEARCH_URL)
+check(len([1 for i, n in la_reads if i == 0]) == 10, "full read: every page")
+site24[0] = [[la_item(4001)], [la_item(4001)], [la_item(4001)]]
+
+
+def la_get_loop(purl, tries=4):
+    la_reads.append(purl)
+    body = la_page([la_item(4001)], 1, 99)                             # site ignores ?page
+    return RH(200, body), body
+
+
+ml._fetch_lalafo_html = la_get_loop
+la_reads.clear()
+ml.fetch_lalafo(urls24[0])
+check(len(la_reads) == 2, "a site that repeats the same page does not loop forever", str(len(la_reads)))
+if old is not None and OLD_V == "2026-11-12-a":
+    check("/owner/" in old.LALAFO_SEARCH_URL and "fresh-renovation" in old.LALAFO_SEARCH_URL
+          and "|" not in old.LALAFO_SEARCH_URL, "OLD code: one link with every filter joined by AND")
+
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
 install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))
