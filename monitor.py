@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-11-15-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-17-a"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -798,6 +798,10 @@ def _parse_yeniemlak_page(raw):
 YE_RECENT_DAYS = float(os.environ.get("YE_RECENT_DAYS", "1"))     # today + N days back
 YE_QUIET_PAGES = int(os.environ.get("YE_QUIET_PAGES", "2"))
 YE_FULL_CRAWL_HOURS = float(os.environ.get("YE_FULL_CRAWL_HOURS", "3"))
+YE_FETCH_TRIES = int(os.environ.get("YE_FETCH_TRIES", "3"))
+# A site that fails ONE run (a timeout, a short outage) is simply read again 15 minutes
+# later. The "could not be read" alert is sent only after this many failed runs in a row.
+SOURCE_ALERT_AFTER = int(os.environ.get("SOURCE_ALERT_AFTER", "3"))
 
 
 def _ye_recent(l, now_ts):
@@ -820,7 +824,24 @@ def fetch_yeniemlak(url, actionable=None):
     now_ts = time.time()
     for page in range(1, YE_MAX_PAGES + 1):
         purl = _with_page(url, page)
-        r = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True)
+        # yeniemlak sometimes does not answer within 30 s (17 Nov 2026: one such timeout
+        # on page 1 lost the whole yeniemlak run and sent an alert). Each page is tried
+        # up to YE_FETCH_TRIES times; if a LATER page still fails, the pages already read
+        # are kept instead of being thrown away.
+        r, err = None, None
+        for attempt in range(max(1, YE_FETCH_TRIES)):
+            if attempt:
+                time.sleep(5.0 * attempt)
+            try:
+                r, err = http_get(purl, headers=HTML_HEADERS, timeout=30, browser=True), None
+                break
+            except Exception as e:
+                r, err = None, str(e)[:200]
+        if r is None:
+            if page == 1:
+                raise RuntimeError(err or "no answer")
+            stop = f"no answer on page {page} ({(err or '')[:60]})"
+            break
         if r.status_code != 200:
             if page == 1:
                 raise RuntimeError(f"HTTP {r.status_code}")
@@ -3291,6 +3312,8 @@ def main():
     total_notified = 0
     status = state.setdefault("source_status", {})   # source name -> last error ("" = healthy)
     seeded_flags = state.setdefault("seeded", {})     # owner_new sources -> initial seed done
+    fails = state.setdefault("source_fails", {})      # source name -> failed runs in a row
+    alerted = state.setdefault("source_alerted", {})  # source name -> alert sent for this outage
     for source in SOURCES:
         name = source["name"]
         try:
@@ -3305,15 +3328,25 @@ def main():
             continue
         except Exception as e:
             err = str(e)[:200]
-            if status.get(name) != err:   # alert only when the error is new/changed (no spam)
-                tg_send_message(f"⚠️ <b>{html.escape(name)}</b> could not be read this run.\n"
+            fails[name] = int(fails.get(name) or 0) + 1
+            log(f"{name}: could not be read this run ({fails[name]} in a row): {err}")
+            if fails[name] >= SOURCE_ALERT_AFTER and not alerted.get(name):
+                # one alert per outage (the old check compared the error text, and a
+                # timeout's text changes every time: "30002 milliseconds", "30007 ...")
+                tg_send_message(f"⚠️ <b>{html.escape(name)}</b> could not be read "
+                                f"{fails[name]} runs in a row.\n"
                                 f"Reason: {html.escape(err)}\n"
                                 "Other sources keep running; I'll tell you when it recovers.")
-                status[name] = err
+                alerted[name] = True
+            status[name] = err
             continue
-        # success — announce recovery if it was previously broken
-        if status.get(name):
+        # success — announce recovery only if an alert was sent for this outage
+        # (a non-empty status without a fail count was written - and alerted - by an
+        # older version)
+        if alerted.get(name) or (status.get(name) and not fails.get(name)):
             tg_send_message(f"✅ <b>{html.escape(name)}</b> is working again.")
+        alerted.pop(name, None)
+        fails.pop(name, None)
         status[name] = ""
         if source.get("mode") == "owner_new":
             total_notified += process_owner_new(items, source, seen, seeded_flags)

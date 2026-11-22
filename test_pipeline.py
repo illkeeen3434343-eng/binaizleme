@@ -1530,6 +1530,93 @@ if old is not None and OLD_V == "2026-11-12-a":
     check("/owner/" in old.LALAFO_SEARCH_URL and "fresh-renovation" in old.LALAFO_SEARCH_URL
           and "|" not in old.LALAFO_SEARCH_URL, "OLD code: one link with every filter joined by AND")
 
+print("\n[NOV-25] yeniemlak timeout (17 Nov): retried; one failed run sends no alert")
+my = load(os.path.join(HERE, "monitor.py"), "monitor_yetimeout")
+my.PAGE_DELAY = 0
+my.time = Clock(time.time())
+TODAY_Y = baku_date(my.time.t)
+ye_script, ye_calls = [], []
+
+
+def ye_get(url, headers=None, params=None, timeout=30, browser=False):
+    ye_calls.append(url)
+    step = ye_script.pop(0) if ye_script else "empty"
+    if step == "timeout":
+        raise RuntimeError("Failed to perform, curl: (28) Operation timed out after 30007 milliseconds")
+    if step == "empty":
+        return RH(200, "<html>Nəticə: 2</html>")
+    return RH(200, ye_page(step))
+
+
+my.http_get = ye_get
+ye_script[:] = ["timeout", "timeout", [(240001, TODAY_Y, XETAI)], [(240002, TODAY_Y, XETAI)], "empty"]
+got_y = my.fetch_yeniemlak("https://yeniemlak.az/x")
+check([x["id"] for x in got_y] == ["240001", "240002"], "page 1 timed out twice, third try worked: nothing lost",
+      str(len(ye_calls)))
+ye_calls.clear()
+ye_script[:] = [[(240001, TODAY_Y, XETAI)], "timeout", "timeout", "timeout"]
+got_y = my.fetch_yeniemlak("https://yeniemlak.az/x")
+check([x["id"] for x in got_y] == ["240001"] and len(ye_calls) == 4,
+      "page 2 never answers: the ads already read are kept (not thrown away)")
+ye_script[:] = ["timeout"] * 3
+try:
+    my.fetch_yeniemlak("https://yeniemlak.az/x")
+    raised_y = False
+except RuntimeError as e_:
+    raised_y = "timed out" in str(e_)
+check(raised_y, "page 1 never answers: the run reports it")
+
+ma = load(os.path.join(HERE, "monitor.py"), "monitor_alerts")
+tmpa = tempfile.mkdtemp()
+ma.STATE_FILE = os.path.join(tmpa, "seen.json")
+ma.USE_API = False
+ma.SOURCES = [dict(s_) for s_ in ma.SOURCES if s_["name"] == "yeniemlak.az"]
+tg_a = []
+ma.tg_send_message = lambda text: tg_a.append(text) or True
+mode_a = {"fail": True, "n": 0}
+
+
+def fetch_a(src):
+    mode_a["n"] += 1
+    if mode_a["fail"]:
+        raise RuntimeError(f"Failed to perform, curl: (28) Operation timed out after {30000 + mode_a['n']} milliseconds")
+    return []
+
+
+ma.fetch_for_source = fetch_a
+
+
+def run_a():
+    with contextlib.redirect_stdout(io.StringIO()):
+        ma.main()
+    return len(tg_a)
+
+
+check(run_a() == 0 and run_a() == 0, "1st and 2nd failed run: no message")
+check(run_a() == 1 and "3 runs in a row" in tg_a[-1], "3rd failed run in a row: one alert", str(tg_a[-1:])[:90])
+check(run_a() == 1 and run_a() == 1, "still failing (different timeout numbers): no repeated alerts")
+mode_a["fail"] = False
+check(run_a() == 2 and "working again" in tg_a[-1], "back again: one 'working again' message")
+mode_a["fail"] = True
+run_a()
+mode_a["fail"] = False
+check(run_a() == 2, "a single failed run later: no alert and no 'working again'")
+st_a = json.load(open(ma.STATE_FILE, encoding="utf-8"))
+st_a["source_status"]["yeniemlak.az"] = "old error text"          # state written by an older version
+st_a.pop("source_fails", None)
+json.dump(st_a, open(ma.STATE_FILE, "w", encoding="utf-8"))
+check(run_a() == 3 and "working again" in tg_a[-1], "outage alerted by the old version still gets its 'working again'")
+if old is not None and OLD_V == "2026-11-15-a":
+    old.http_get = ye_get
+    old.PAGE_DELAY = 0
+    ye_script[:] = ["timeout", [(240001, TODAY_Y, XETAI)], "empty"]
+    try:
+        old.fetch_yeniemlak("https://yeniemlak.az/x")
+        old_ok = True
+    except Exception:
+        old_ok = False
+    check(not old_ok, "OLD code: one timeout on page 1 lost the whole yeniemlak run")
+
 print("\n[NOV-10] re-checking a recorded tap ad does not count it twice")
 mt2 = load(os.path.join(HERE, "monitor.py"), "monitor_tapcount")
 install_tap(mt2, tap_ad("Təmirli mənzil, sənədləri qaydasındadır", seller="Aynur", uid="777"))
