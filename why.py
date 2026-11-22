@@ -36,7 +36,9 @@ def explain(rec):
     if rec.get("recovered"):
         return f"SENT by recover_missed.py on {rec['recovered'][:10]} (was wrongly filed earlier)"
     if rec.get("owner") is True:
-        return "SENT as an owner post (never sent twice)"
+        return ("SENT as an owner post (never sent twice). If it never arrived in Telegram, "
+                "look for 'Telegram' / 'sendPhoto' failures in the log lines below; from "
+                "2026-11-23-a an undelivered message waits in the outbox and is sent again")
     if rec.get("owner") is False:
         why = rec.get("skip") or "judged an agent (see the log line below for the reasons)"
         extra = "; re-checked by recover_missed.py" if rec.get("rechecked") else ""
@@ -65,9 +67,23 @@ def explain(rec):
     return base
 
 
+def bina_facts(raw, iid):
+    """What bina's own page data says about THIS ad (Çıxarış, Təmir, seller type...)."""
+    out = {}
+    head = r'"id"\s*:\s*"' + re.escape(iid) + r'"(?:[^{}]|\{[^{}]*\})*?'
+    for key in ("hasBillOfSale", "hasRepair", "hasMortgage", "contactTypeName",
+                "updatedAt", "createdAt"):
+        mm = re.search(head + r'"' + key + r'"\s*:\s*("[^"]*"|true|false|null)', raw)
+        if mm:
+            out[key] = json.loads(mm.group(1))
+    mm = re.search(head + r'"location"\s*:\s*\{[^{}]*"fullName"\s*:\s*"([^"]*)"', raw)
+    if mm:
+        out["location"] = mm.group(1)
+    return out
+
+
 def live_bina(url):
     """LIVE=1: read the bina ad's page now and show what decides it (read-only)."""
-    import html as H
     import monitor as m
     try:
         r = m.http_get(url, headers=m.HTML_HEADERS, timeout=30, browser=True)
@@ -78,18 +94,15 @@ def live_bina(url):
     print(f"  live: HTTP {r.status_code}, {len(raw)} bytes")
     if r.status_code != 200:
         return
-    text = re.sub(r"\s+", " ", H.unescape(re.sub(r"<[^>]+>", " ", raw)))
-    for label in ("Çıxarış", "Təmir", "İpoteka", "Kateqoriya", "Mərtəbə", "Sahə", "Otaq sayı"):
-        mm = re.search(re.escape(label) + r"\s*:?\s*(.{0,28})", text)
-        if mm:
-            print(f"  live: {label}: {mm.group(1).strip()!r}")
+    iid = (re.findall(r"(\d+)", url) or [""])[-1]
+    facts = bina_facts(raw, iid)
     title = m._meta_tags(raw).get("og:title")
     print(f"  live: title: {title}")
     m._BINA_PAGE_CACHE[url] = raw
     v, _p = m.bina_is_owner(url)
     print(f"  live: seller verdict: {v} (True=owner, False=agent) | text check: {m.bina_is_owner.last_text}")
     groups = []
-    for x in m.BINA_EXCLUDE_LOCATIONS + [title or ""]:
+    for x in m.BINA_EXCLUDE_LOCATIONS + [facts.get("location") or title or ""]:
         t = m._bina_tags_from_html(raw, x)
         if t and t not in groups:
             groups.append(t)
@@ -97,8 +110,22 @@ def live_bina(url):
     for t in groups:
         print(f"  live: wanted tag: {m._bina_wanted_tag(t)} | excluded words in tags: "
               f"{[x for x in m.BINA_EXCLUDE_LOCATIONS if any(x in y for y in t)]}")
-    print("  live: the search asks for: Çıxarış var (has_bill_of_sale) and the areas in "
-          "BINA_SEARCH_URL; an ad without Çıxarış, or outside those areas, never reaches the bot")
+    print(f"  live: page data of this ad: {facts or 'not found'}")
+    from urllib.parse import parse_qs, urlparse
+    q = parse_qs(urlparse(m.BINA_SEARCH_URL).query)
+    need = {"has_bill_of_sale": ("hasBillOfSale", "Çıxarış"), "has_repair": ("hasRepair", "Təmir"),
+            "has_mortgage": ("hasMortgage", "İpoteka")}
+    for qk, (fk, label) in need.items():
+        want = (q.get(qk) or [None])[0]
+        if want is None or fk not in facts:
+            continue
+        want_b = str(want).lower() in ("1", "true", "yes", "on")
+        if bool(facts[fk]) != want_b:
+            print(f"  live: >>> {label} on bina = {'yes' if facts[fk] else 'no'}, but the search "
+                  f"(BINA_SEARCH_URL {qk}={want}) asks for {'yes' if want_b else 'no'}: "
+                  "bina never gives this ad to the bot")
+    print("  live: the search asks for the ticks and areas in BINA_SEARCH_URL; an ad without "
+          "them, or outside those areas, never reaches the bot")
 
 
 def main():
@@ -112,6 +139,10 @@ def main():
     if os.path.exists(LOG):
         with open(LOG, encoding="utf-8", errors="replace") as fh:
             log_lines = fh.readlines()
+    box = st.get("outbox") or []
+    if box:
+        print(f"Telegram outbox: {len(box)} message(s) waiting to be sent again: "
+              + ", ".join(str(e.get("key")) for e in box[:10]))
     for arg in sys.argv[1:]:
         print("=" * 64)
         print(arg)
@@ -128,11 +159,17 @@ def main():
             if num in tries:
                 print(f"  => PENDING (bina): seller label unread {tries[num]} time(s); retried next run")
             else:
-                print("  => NEVER RECORDED: the bot did not receive it from the search. "
-                      "Usual causes: outside the search URL's area, tap heading without a "
-                      "wanted place name, tap ad pushed off page 1 between runs (tap only "
-                      "serves page 1), bina excluded area (Koroğlu / Ağ şəhər / Şah İsmayıl "
-                      "Xətai), or still waiting in the per-run check budget.")
+                pend = st.get("tap_pending", {})
+                if num in pend and "bina.az" not in arg:
+                    print(f"  => PENDING (tap): seen on page 1 at {pend[num].get('_since')}, "
+                          "not decided yet; checked again next run")
+                else:
+                    print("  => NEVER RECORDED: the bot did not receive it from the search. "
+                          "Usual causes: bina ad without the Çıxarış/Təmir tick the search asks "
+                          "for (LIVE=1 shows it), outside the search URL's area, tap heading "
+                          "without a wanted place name, tap ad pushed off page 1 between runs "
+                          "(tap only serves page 1), bina excluded area (Koroğlu / Ağ şəhər / "
+                          "Şah İsmayıl Xətai), or the run has not saved yet.")
         hits = [ln.rstrip() for ln in log_lines if num and num in ln][-8:]
         if hits:
             print("  log:")
