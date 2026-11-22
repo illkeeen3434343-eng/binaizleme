@@ -1,0 +1,516 @@
+diff --git a/monitor.py b/monitor.py
+index ab513b0..dfee465 100644
+--- a/monitor.py
++++ b/monitor.py
+@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+ 
+ import requests
+ 
+-VERSION = "2026-11-17-a"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-23-a"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -327,14 +327,53 @@ class PersistedQueryError(Exception):
+ # --------------------------------------------------------------------------- #
+ # Telegram
+ # --------------------------------------------------------------------------- #
++TG_MAX_WAIT = float(os.environ.get("TG_MAX_WAIT", "60"))          # longest 429 wait
++OUTBOX_MAX_DAYS = float(os.environ.get("OUTBOX_MAX_DAYS", "7"))
++OUTBOX_PER_RUN = int(os.environ.get("OUTBOX_PER_RUN", "30"))
++_TG_UNSURE = {"v": False}     # a send timed out after it was handed over: may have arrived
++
++
++def _tg_post(method, **kw):
++    """POST to the Telegram Bot API. On HTTP 429 ("Too Many Requests" - Telegram allows
++    about 20 messages a minute in a group) wait the retry_after Telegram asks for, at
++    most TG_MAX_WAIT seconds, and try once more. A timeout AFTER the request was sent
++    is remembered in _TG_UNSURE: the message may have arrived, so it is not repeated."""
++    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
++    r = None
++    for attempt in (1, 2):
++        try:
++            r = requests.post(url, **kw)
++        except requests.exceptions.ReadTimeout:
++            _TG_UNSURE["v"] = True
++            raise
++        if r.status_code != 429 or attempt == 2:
++            return r
++        try:
++            ra = float(((r.json() or {}).get("parameters") or {}).get("retry_after") or 5)
++        except Exception:
++            ra = 5.0
++        if ra > TG_MAX_WAIT:
++            return r
++        log(f"Telegram: too many messages (HTTP 429); waiting {ra:.0f}s, then one retry")
++        time.sleep(ra + 0.5)
++    return r
++
++
+ def tg_send_message(text):
+     try:
+-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+-                          json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+-                                "disable_web_page_preview": False}, timeout=30)
++        r = _tg_post("sendMessage", json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
++                                          "disable_web_page_preview": False}, timeout=30)
+         if r.status_code == 200:
+             return True
+         log("Telegram sendMessage failed:", r.status_code, r.text[:200])
++        if r.status_code == 400 and "parse" in (r.text or "").lower():
++            # the HTML could not be read: send the same text without formatting
++            plain = html.unescape(re.sub(r"<[^>]+>", "", text))
++            r = _tg_post("sendMessage", json={"chat_id": CHAT_ID, "text": plain,
++                                              "disable_web_page_preview": False}, timeout=30)
++            if r.status_code == 200:
++                return True
++            log("Telegram sendMessage (plain) failed:", r.status_code, r.text[:200])
+         return False
+     except requests.RequestException as e:
+         log("Telegram error:", e)
+@@ -370,28 +409,96 @@ def tg_send_photo(photo_url, caption):
+     img = _download_image(photo_url)
+     if img:
+         try:
+-            r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+-                              data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+-                              files={"photo": ("photo.jpg", img, "image/jpeg")}, timeout=60)
++            r = _tg_post("sendPhoto",
++                         data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
++                         files={"photo": ("photo.jpg", img, "image/jpeg")}, timeout=60)
+             if r.status_code == 200:
+                 return True
+             log("sendPhoto upload failed:", r.status_code, r.text[:200])
+         except requests.RequestException as e:
+             log("sendPhoto upload error:", e)
++            if _TG_UNSURE["v"]:
++                return False          # may have arrived: do not send a second copy
+     # 2) Fallback: let Telegram fetch the URL (works for fast HTTPS CDNs like bina).
+     try:
+-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+-                          json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
+-                                "parse_mode": "HTML"}, timeout=30)
++        r = _tg_post("sendPhoto", json={"chat_id": CHAT_ID, "photo": photo_url,
++                                        "caption": caption, "parse_mode": "HTML"}, timeout=30)
+         if r.status_code == 200:
+             return True
+         log("sendPhoto by-url failed:", r.status_code, r.text[:160])
+     except requests.RequestException as e:
+         log("sendPhoto by-url error:", e)
++        if _TG_UNSURE["v"]:
++            return False
+     # 3) Last resort: text so the alert still arrives.
+     return tg_send_message(caption)
+ 
+ 
++def _outbox():
++    st = _RUNTIME.get("state")
++    return st.setdefault("outbox", []) if isinstance(st, dict) else None
++
++
++def _deliver(text, photo=None, key=""):
++    """Send one alert. If Telegram did not take it (down, refusing, still 429 after the
++    wait), the message is kept in the outbox - saved with the state - and sent again
++    at the start of the next runs. The listing itself stays decided, so it is never
++    judged again and never sent twice. (Before 2026-11-23-a an undelivered message
++    was simply lost: the record already said "sent".)"""
++    _TG_UNSURE["v"] = False
++    photo = photo if SEND_PHOTOS else None
++    ok = tg_send_photo(photo, text) if photo else tg_send_message(text)
++    if ok:
++        return True
++    box = _outbox()
++    if _TG_UNSURE["v"]:
++        log(f"Telegram: {key or 'message'} timed out after sending; it may have arrived, "
++            "so it is not repeated")
++    elif box is not None:
++        box.append({"text": text, "photo": photo, "key": key, "n": 1,
++                    "t": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
++        log(f"Telegram: {key or 'message'} NOT delivered; kept in the outbox, "
++            "sent again next run")
++    return False
++
++
++def flush_outbox(run_started=None):
++    """Send the messages Telegram did not take on EARLIER runs (oldest first). Called
++    right before the state is saved, so a delivered message leaves the outbox in the
++    same save. Messages that failed during this run wait for the next one."""
++    box = _outbox()
++    if not box:
++        return 0
++    now_ts, keep, sent, tried = time.time(), [], 0, 0
++    for e in list(box):
++        t = _to_epoch(e.get("t"))
++        if run_started is not None and t is not None and t >= run_started:
++            keep.append(e)                 # failed in this run: next run
++            continue
++        if t is not None and now_ts - t > OUTBOX_MAX_DAYS * 86400:
++            log(f"Telegram outbox: gave up on {e.get('key')} (not deliverable for "
++                f"{OUTBOX_MAX_DAYS:g} days)")
++            continue
++        if tried >= OUTBOX_PER_RUN:
++            keep.append(e)
++            continue
++        tried += 1
++        _TG_UNSURE["v"] = False
++        ok = (tg_send_photo(e["photo"], e.get("text", "")) if e.get("photo")
++              else tg_send_message(e.get("text", "")))
++        if ok:
++            sent += 1
++        elif _TG_UNSURE["v"]:
++            log(f"Telegram outbox: {e.get('key')} timed out after sending; not repeated")
++        else:
++            e["n"] = int(e.get("n") or 1) + 1
++            keep.append(e)
++    box[:] = keep
++    log(f"Telegram outbox: delivered {sent} message(s) from earlier runs"
++        + (f"; {len(keep)} still waiting" if keep else ""))
++    return sent
++
++
+ # --------------------------------------------------------------------------- #
+ # Source 1: bina.az GraphQL
+ # --------------------------------------------------------------------------- #
+@@ -1252,6 +1359,16 @@ def fetch_lalafo(url, actionable=None):
+ # tap.az  (server-rendered HTML; paginated via ?page=N)
+ # --------------------------------------------------------------------------- #
+ TAP_MAX_PAGES = int(os.environ.get("TAP_MAX_PAGES", "1000"))
++# tap serves only its first results page, so an ad must be decided while it is there.
++# An ad seen on page 1 that could not be decided in that run (page not loaded, check
++# budget, rate limit) is remembered and checked in the next runs even after it has
++# dropped off page 1 - for TAP_PENDING_DAYS. (2026-11-23-a)
++TAP_PENDING_DAYS = float(os.environ.get("TAP_PENDING_DAYS", "2"))
++TAP_PENDING_MAX = int(os.environ.get("TAP_PENDING_MAX", "80"))
++# Page 1 is also read a second time at the END of a run (after bina's long scan), so
++# the gap between two looks at tap's page 1 is a few minutes, not a whole cron period.
++TAP_SECOND_READ = os.environ.get("TAP_SECOND_READ", "1").strip() != "0"
++TAP_SECOND_READ_AFTER = float(os.environ.get("TAP_SECOND_READ_AFTER", "240"))   # seconds
+ # Only track tap.az posts whose heading names one of these places. tap headings use
+ # FULL names ("Qara Qarayev m.", "8-ci kilometr qəs.") - the old list had only
+ # "Q.Qarayev" and "8-ci km", so those two areas were silently dropped. Matched after
+@@ -1432,6 +1549,16 @@ def az_normalize(text):
+     return " " + re.sub(r"\s+", " ", t).strip() + " "
+ 
+ 
++# "vasitəçi" as people really type it (after az_normalize): vasiteci, vaisteci,
++# vasteci, vasitci, vasitechi, vasitaci. Ad 49259520 (tap, 20 Nov 2026) ended with
++# "Vaisteciler narahat etmesinler!" and scored 0 because only "vasiteci" was known.
++_VAS = r"va(?:si|is|s)t[ae]?(?:c|ch)i"
++_WHO = r"(?:makler|maklyor|" + _VAS + r"|agent|rieltor|rielter|realtor|emlakci)"
++# "... narahat etməsin(lər) / eləməsin / etməyin", "zəng etməyin", "yazmayın"
++_STAY_AWAY = (r"(?:yazmasin|yazmayin|narahat\s+(?:etmesin|elemesin|etmeyin|elemeyin)|"
++              r"zeng\s+(?:etmesin|etmeyin|vurmasin|vurmayin)|elaqe\s+saxlamasin|"
++              r"muraciet\s+etmesin)")
++
+ # --- explicit ownership statements ---------------------------------------- #
+ _OWNER_PATTERNS = [
+     r"\b(menzil|ev|obyekt)\w*\s+(ozume|ozumun|mene|menim)\s+mexsus\w*",
+@@ -1453,26 +1580,25 @@ _OWNER_PATTERNS = [
+     r"\bbirbasa\s+(ozum|sahib|mulkiyyet)\w*",
+     r"\bsahibinden\s+(satilir|satiram)\b",
+     r"\bozum\s+(satiram|terefinden\s+satilir)\b",
+-    r"\bvasitecisiz\b",
+-    r"\bvasiteci\s+yoxdur\b",
+-    r"\bvasiteci\w*\s+olmadan\b",                   # "vasitəçi olmadan"
++    r"\b" + _VAS + r"siz\b",                       # "vasitəçisiz"
++    r"\b" + _VAS + r"\s+yoxdur\b",
++    r"\b" + _VAS + r"\w*\s+olmadan\b",               # "vasitəçi olmadan"
+ ]
+ # --- explicit rejection of maklers/agents (equally strong) ---------------- #
+ _ANTI_AGENT_PATTERNS = [
+     # widest first, so "agentliklər və maklerlər zəng etməsin" is taken as ONE request
+-    r"\b(makler|vasiteci|agent|rieltor|emlakci)\w*(\s+\w+){0,4}?\s+(yazmasin|narahat\s+etmesin|"
+-    r"zeng\s+etmesin|zeng\s+vurmasin|elaqe\s+saxlamasin|muraciet\s+etmesin)\w*",
++    r"\b" + _WHO + r"\w*(\s+\w+){0,4}?\s+" + _STAY_AWAY + r"\w*",
+     r"\b(men\s+)?makler\w*\s+deyil\w*",
+-    r"\b(makler|vasiteci|agent|rieltor)\w*\s+(yazmasin|narahat\s+etmesin|"
++    r"\b" + _WHO + r"\w*\s+(yazmasin|narahat\s+etmesin|"
+     r"zeng\s+etmesin|elaqe\s+saxlamasin|qebul\s+etmirem)\b",
+     # 12 Nov 2026: the same request in other words used to count as AGENT wording
+     # ("agentliklər zəng vurmasın", "agentliklərdən xahiş edirəm narahat etməsinlər",
+     # "agentliklərə satılmır") - only an owner tells agencies to stay away.
+-    r"\b(makler|vasiteci|agent|rieltor)\w*\s+(satilmir|verilmir|satmiram|vermirem)\b",
+-    r"\b(makler|agentlik|rieltor|vasiteci)\w*\s+xidmet\w*\s+(lazim\s+deyil|ehtiyac\s+yoxdur)\b",
+-    r"\b(makler|agentlik|rieltor|vasiteci)\w*\s+ehtiyac\s+yoxdur\b",
+-    r"\b(makler|vasiteci|agent|rieltor)\w*\s+islemirem\b",
+-    r"\b(makler|vasiteci|agent|rieltor)\w*\s+lazim\s+deyil\b",
++    r"\b" + _WHO + r"\w*\s+(satilmir|verilmir|satmiram|vermirem)\b",
++    r"\b(?:makler|agentlik|rieltor|" + _VAS + r")\w*\s+xidmet\w*\s+(lazim\s+deyil|ehtiyac\s+yoxdur)\b",
++    r"\b(?:makler|agentlik|rieltor|" + _VAS + r")\w*\s+ehtiyac\s+yoxdur\b",
++    r"\b" + _WHO + r"\w*\s+islemirem\b",
++    r"\b" + _WHO + r"\w*\s+lazim\s+deyil\b",
+ ]
+ # --- "no fee" statements: NOT agency wording (masked, worth 0) -------------- #
+ # "Komissiyasız", "Vasitəçilik haqqı yoxdur", "Ofis haqqı alınmır" used to score as
+@@ -1797,6 +1923,9 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
+     except Exception as e:
+         log("tap detail fetch error:", e)
+         return None, None, None
++    if getattr(r, "status_code", 0) in (404, 410):
++        tap_check_owner.last_reason = "gone"          # deleted ad
++        return None, None, None
+     if getattr(r, "status_code", 0) != 200 or _tap_blocked(raw) or len(raw) < 2000:
+         return None, None, None
+     tap_check_owner.last_reason = "undecided"
+@@ -1837,15 +1966,25 @@ def tap_check_owner(url, seller_counts=None, profile_cache=None, listing=None):
+     else:
+         hist = 1
+     count = None
++    page_total = None
+     if seller and hist >= TAP_MAX_APARTMENTS:
+         count = hist                   # we have SEEN them sell 3+ different flats
+     elif seller and has_multi:
+-        prof = tap_apartment_count(seller, profile_cache if profile_cache is not None else {})
+-        count = max(prof, hist) if prof is not None else None    # None = unknown
++        # The ad page itself states how many ads the seller has published in ALL of
++        # tap ("publishedAdsCount"). Below the limit, they cannot have 3+ flats, so
++        # the profile does not need to be opened (49259520: seller 14203798 has 1 ad).
++        page_total = _tap_seller_ads_total(raw, seller)
++        if page_total is not None and page_total < TAP_MAX_APARTMENTS:
++            count = max(page_total, hist)
++        else:
++            prof = tap_apartment_count(seller, profile_cache if profile_cache is not None else {})
++            count = max(prof, hist) if prof is not None else None    # None = unknown
+     elif seller:
+         count = 1                      # no multi-listing marker => this is their only ad
+ 
+     score, reasons = owner_signal_score(desc or "", block, count)
++    if page_total is not None:
++        reasons.append(f"seller-ads-total:{page_total}")
+     if seller and hist >= TAP_MAX_APARTMENTS:
+         reasons.append(f"history:{hist}-flats-seen")
+ 
+@@ -1879,6 +2018,21 @@ tap_check_owner.last_details = {}
+ tap_check_owner.last_seller_how = None
+ 
+ 
++def _tap_seller_ads_total(raw, seller):
++    """Number of ads the seller has published on tap (all categories), as the ad's own
++    page data states it: {"__typename":"User",...,"legacyId":"14203798",
++    "publishedAdsCount":1,...}. Only the User object of THIS seller is read. None if
++    the page does not say."""
++    if not seller:
++        return None
++    pat = r'\{[^{}]*"legacyId"\s*:\s*"?' + re.escape(str(seller)) + r'"?[,}][^{}]*\}?'
++    for mm in re.finditer(pat, raw or ""):
++        c = re.search(r'"publishedAdsCount"\s*:\s*(\d+)', mm.group(0))
++        if c:
++            return int(c.group(1))
++    return None
++
++
+ _TAP_USER_GID = re.compile(r"Z2lkOi8vdGFwL1VzZXIv([A-Za-z0-9+/]+=*)")   # base64 "gid://tap/User/"
+ 
+ 
+@@ -1970,6 +2124,8 @@ def _fetch_tap_html(purl, tries=4):
+         body = getattr(r, "text", "") or ""
+         if getattr(r, "status_code", 0) == 200 and not _tap_blocked(body):
+             return r, body
++        if getattr(r, "status_code", 0) in (404, 410):
++            return r, body                # the ad is gone: nothing to retry
+         time.sleep(3 * (attempt + 1))     # 3s, 6s, 9s before each retry
+     return last, (getattr(last, "text", "") or "")
+ 
+@@ -2193,9 +2349,7 @@ def format_change(l, source_name, kind, old_price, new_price, n_changes):
+ 
+ def notify_change(l, source_name, kind, old_price, new_price, n_changes):
+     text = format_change(l, source_name, kind, old_price, new_price, n_changes)
+-    if SEND_PHOTOS and l.get("photo"):
+-        return tg_send_photo(l["photo"], text)
+-    return tg_send_message(text)
++    return _deliver(text, l.get("photo"), l.get("url", ""))
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -2269,6 +2423,26 @@ def _bina_owner_from_nextdata(raw):
+     return None
+ 
+ 
++def _bina_contact_type(raw, iid):
++    """bina's own seller type of THIS ad, from the page data (checked on 6637490 and
++    6639973, 22 Nov 2026):
++      "Item:6637490":{"__typename":"Item","id":"6637490",...,"contactTypeName":"mülkiyyətçi"
++    Only the object whose id is this ad's id is read (similar ads on the page carry
++    their own values). True = owner, False = agent, None = not stated / unclear."""
++    if not iid:
++        return None
++    found = set()
++    pat = (r'"id"\s*:\s*"' + re.escape(str(iid)) + r'"(?:[^{}]|\{[^{}]*\})*?'
++           r'"contactTypeName"\s*:\s*"([^"]*)"')
++    for mm in re.finditer(pat, raw or ""):
++        n = az_normalize(mm.group(1))
++        if " mulkiyyetci" in n:
++            found.add(True)
++        elif " vasiteci" in n or " agent" in n:
++            found.add(False)
++    return found.pop() if len(found) == 1 else None
++
++
+ _BINA_DBG = {"done": False}
+ _BINA_OWNER_LABELS = {"mulkiyyetci"}
+ _BINA_AGENT_LABELS = {"vasiteci", "vasiteci agent"}
+@@ -2502,7 +2676,11 @@ def bina_is_owner(url):
+     mo = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', raw)
+     if mo:
+         photo = mo.group(1)
++    mid = re.search(r"/items/(\d+)", url or "")
++    iid = mid.group(1) if mid else ""
+     verdict, src = _bina_owner_from_ldjson(raw), "ldjson"
++    if verdict is None:
++        verdict, src = _bina_contact_type(raw, iid), "contacttype"
+     if verdict is None:
+         verdict, src = _bina_owner_from_nextdata(raw), "nextdata"
+     if verdict is None:
+@@ -2536,7 +2714,14 @@ def bina_is_owner(url):
+             log(f"bina.az: {url} labelled mülkiyyətçi, but the text is agency wording "
+                 f"{treasons} -> AGENT")
+             verdict, src = False, "text-agency"
+-    bina_is_owner.last_reason = "ok" if verdict is not None else "nolabel"
++    if verdict is not None:
++        bina_is_owner.last_reason = "ok"
++    elif iid and iid not in raw:
++        # not this ad's page (an error or "please wait" page, a redirect): counts as not
++        # read - retried next run without using up one of the OWNER_MAX_TRIES reads
++        bina_is_owner.last_reason = "fetch"
++    else:
++        bina_is_owner.last_reason = "nolabel"
+     if not _BINA_DBG["done"]:
+         _BINA_DBG["done"] = True
+         log(f"bina owner-detect: {url} -> {verdict} (via {src if verdict is not None else 'none'})")
+@@ -3007,6 +3192,57 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
+     return notified, deferred, decided
+ 
+ 
++def _tap_pending():
++    st = _RUNTIME.get("state")
++    if TAP_PENDING_DAYS <= 0 or not isinstance(st, dict):
++        return None
++    return st.setdefault("tap_pending", {})
++
++
++def _with_pending(items, pend, prefix, seen, stype, now_ts):
++    """This run's page-1 ads, then the remembered undecided ones that are no longer on
++    page 1 (at the END, so a dead old page can never hold up a fresh ad)."""
++    have = {str(l["id"]) for l in items}
++    extra = []
++    for iid, pl in list(pend.items()):
++        if not isinstance(pl, dict):
++            pend.pop(iid, None)
++    for iid, pl in sorted(pend.items(), key=lambda kv: str(kv[1].get("_since", ""))):
++        t = _to_epoch(pl.get("_since"))
++        if t is not None and now_ts - t > TAP_PENDING_DAYS * 86400:
++            pend.pop(iid, None)
++            continue
++        l = {k: v for k, v in pl.items() if not k.startswith("_")}
++        if _candidate_kind(stype, l, seen.get(prefix + iid), now_ts) is None:
++            pend.pop(iid, None)            # decided meanwhile
++            continue
++        if iid not in have:
++            extra.append(l)
++    if extra:
++        log(f"tap.az: {len(extra)} ad(s) seen on page 1 earlier but not decided yet; "
++            "checking them now")
++    return list(items) + extra
++
++
++def _remember_pending(items, pend, prefix, seen, stype, now_ts, name):
++    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
++    for l in items:
++        iid = str(l["id"])
++        if l.get("_gone") or _candidate_kind(stype, l, seen.get(prefix + iid), now_ts) is None:
++            pend.pop(iid, None)
++        elif iid not in pend:
++            d = {k: v for k, v in l.items() if not str(k).startswith("_")
++                 and (v is None or isinstance(v, (str, int, float)))}
++            d["_since"] = now_iso
++            pend[iid] = d
++    if len(pend) > TAP_PENDING_MAX:
++        for iid, _pl in sorted(pend.items(), key=lambda kv: str(kv[1].get("_since", "")))[
++                :len(pend) - TAP_PENDING_MAX]:
++            pend.pop(iid, None)
++    if pend:
++        log(f"{name}: {len(pend)} ad(s) not decided yet; remembered for the next run")
++
++
+ def process_owner_new(items, source, seen, seeded_flags):
+     prefix, name = source["prefix"], source["name"]
+     owner_label = source.get("owner_label", "Əmlak sahibi")
+@@ -3043,6 +3279,10 @@ def process_owner_new(items, source, seen, seeded_flags):
+         if not kept:
+             return 0
+ 
++    pend = _tap_pending() if stype == "tap" else None
++    if pend is not None:
++        items = _with_pending(items, pend, prefix, seen, stype, now_ts)
++
+     prefiltered = source.get("prefiltered_owner", False)  # URL already asks for owner posts
+     seller_apts = _seller_apartments(seen) if stype == "tap" else {}
+     tap_profile_cache = {}
+@@ -3126,6 +3366,10 @@ def process_owner_new(items, source, seen, seeded_flags):
+         if PAGE_DELAY:
+             time.sleep(PAGE_DELAY)
+         if owner is None:
++            if reason == "gone":
++                l["_gone"] = True          # deleted: not remembered as pending either
++                log(f"{name}: {l['url']} no longer exists (deleted)")
++                continue
+             if reason == "ratelimit":
+                 checks -= 1                # refused, not checked (keeps the log honest)
+                 log(f"{name}: site is rate-limiting us (HTTP 429); the rest is checked "
+@@ -3161,6 +3405,8 @@ def process_owner_new(items, source, seen, seeded_flags):
+                     l[k_] = v_
+         if owner and notify_new_owner_msg(l, name, owner_label):
+             notified += 1
++    if pend is not None:
++        _remember_pending(items, pend, prefix, seen, stype, now_ts, name)
+     if quiet_old:
+         log(f"{name}: recorded {quiet_old} old listing(s) silently (dated before the bot "
+             f"first read {name}; never came back to the top)")
+@@ -3169,10 +3415,7 @@ def process_owner_new(items, source, seen, seeded_flags):
+ 
+ 
+ def notify_new_owner_msg(l, name, owner_label="Əmlak sahibi"):
+-    text = format_new_owner(l, name, owner_label)
+-    if SEND_PHOTOS and l.get("photo"):
+-        return tg_send_photo(l["photo"], text)
+-    return tg_send_message(text)
++    return _deliver(format_new_owner(l, name, owner_label), l.get("photo"), l.get("url", ""))
+ 
+ 
+ def normalize_price(v):
+@@ -3314,9 +3557,12 @@ def main():
+     seeded_flags = state.setdefault("seeded", {})     # owner_new sources -> initial seed done
+     fails = state.setdefault("source_fails", {})      # source name -> failed runs in a row
+     alerted = state.setdefault("source_alerted", {})  # source name -> alert sent for this outage
++    tap_read_at = {}
+     for source in SOURCES:
+         name = source["name"]
+         try:
++            if source.get("type") == "tap":
++                tap_read_at[name] = time.time()
+             items = fetch_for_source(source)
+         except PersistedQueryError:
+             err = ("signature expired (persisted query). Re-capture it from the browser "
+@@ -3366,6 +3612,22 @@ def main():
+         else:
+             total_notified += process_source(items, source, seen)
+ 
++    # tap serves page 1 only: look at it once more at the end of a long run
++    for source in SOURCES:
++        name = source["name"]
++        if (source.get("type") != "tap" or not TAP_SECOND_READ or name not in tap_read_at
++                or status.get(name) or time.time() - tap_read_at[name] < TAP_SECOND_READ_AFTER):
++            continue
++        try:
++            items = fetch_for_source(source)
++        except Exception as e:
++            log(f"{name}: second read of page 1 failed (next run reads it again): {str(e)[:160]}")
++            continue
++        log(f"{name}: second read of page 1 ({int(time.time() - tap_read_at[name])}s after the first)")
++        total_notified += process_owner_new(items, source, seen, seeded_flags)
++
++    total_notified += flush_outbox(run_started=t0)   # alerts Telegram refused on earlier runs
++
+     # HARD SAFETY INVARIANT: a run must never shrink the historical dataset.
+     # We only ever add to `seen`, so this can only trip on a bug/partial read.
+     if len(seen) < loaded_count:

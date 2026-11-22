@@ -1807,5 +1807,242 @@ st = json.load(open(mm.STATE_FILE, encoding="utf-8"))
 check(st["seeded"].get("tap.az:url") and st["seeded"].get("bina.az:url"),
       "URL fingerprints saved in state")
 
+# --------------------------------------------------------------------------- #
+print("\n[NOV-26] not announced: tap 49259520, bina 6637490, bina 6639973")
+mn = load(os.path.join(HERE, "monitor.py"), "monitor_nov23")
+TXT23 = ("Təcili satış! Real alıcı ilə qiymətdə razılaşmaq mümkündür.\nVaisteciler narahat etmesinler!")
+sc23, rs23 = mn.owner_signal_score(TXT23, "", None)
+check(sc23 >= mn.SCORE_OWNER_AT, "49259520 'Vaisteciler narahat etmesinler!' is owner wording",
+      f"{sc23} {rs23}")
+VARIANTS23 = ["Vasitəçilər narahat etməsin", "Vasteciler narahat elemesin", "Vasitçilər zəng etməsin",
+              "Maklerlər narahat etməyin", "Vasitechiler yazmasin", "vasitəçisiz satılır",
+              "Vasitçi yoxdur", "Agentliklər zəng vurmasın"]
+bad23 = [t for t in VARIANTS23 if mn.owner_signal_score(t, "", None)[0] < mn.SCORE_OWNER_AT]
+check(not bad23, "how people really spell 'vasitəçilər narahat etməsin' - all owner wording", str(bad23))
+check(mn.owner_signal_score("Ofis haqqı 1%", "", None)[0] <= mn.SCORE_AGENT_AT
+      and mn.owner_signal_score("Vasitəçilik haqqı yoxdur", "", None)[0] == 0
+      and mn.owner_signal_score("metroya vasitə ilə 5 dəqiqə", "", None)[0] == 0,
+      "fees are still agent wording; 'haqqı yoxdur' and 'vasitə' alone count for nobody")
+
+# tap: the ad page says how many ads the seller has in total (real 49259520 data)
+USER23 = ('"User:{\\"id\\":\\"Z2lkOi8vdGFwL1VzZXIvMTQyMDM3OTg\\"}":{"__typename":"User",'
+          '"id":"Z2lkOi8vdGFwL1VzZXIvMTQyMDM3OTg","legacyId":"14203798","publishedAdsCount":%d,'
+          '"isBlockedMe":false,"isBlockedByMe":false}')
+
+
+def tap23(desc, total):
+    return ('<html><nav>Ana səhifə / Daşınmaz əmlak</nav>'
+            f'<meta property="og:description" content="{html_mod.escape(desc)}">'
+            '<meta property="og:title" content="2-otaqlı mənzil, Xalqlar Dostluğu m., 46.7 m²">'
+            '<script id="__NEXT_DATA__">{' + (USER23 % total) + '}</script></html>' + "x" * 3000)
+
+
+check(mn._tap_seller_ads_total(tap23("x", 1), "14203798") == 1
+      and mn._tap_seller_ads_total(tap23("x", 1), "1420379") is None,
+      "seller's ad total read from THIS seller's data only")
+mn.TAP_PROFILE_BROWSER = True
+asked23 = []
+mn.tap_profile_count_browser = lambda uid: (asked23.append(uid), 6)[1]
+U23 = "https://tap.az/elanlar/dasinmaz-emlak/menziller/49259520"
+for desc, total, want, opened, label in [
+        ("Təmirli mənzil, kupçalı", 1, True, False,
+         "seller has 1 ad in total -> owner, profile not even opened"),
+        (TXT23, 1, True, False, "the real 49259520 text + 1 ad -> owner"),
+        ("Təmirli mənzil, kupçalı", 7, False, True,
+         "seller has 7 ads -> profile opened as before (6 flats -> agent)")]:
+    mn._RUNTIME["state"] = {"tap_profiles": {}}
+    asked23.clear()
+    install_tap(mn, tap23(desc, total))
+    v23, _p, s23 = mn.tap_check_owner(U23, {}, {}, listing={"id": "49259520"})
+    check(v23 is want and s23 == "14203798" and bool(asked23) == opened, label,
+          f"{V[v23]} opened={asked23} {mn.tap_check_owner.last_reasons}")
+
+# bina: seller type straight from the page data of THIS ad (real 6637490 layout)
+
+
+def bina23(iid, ctype=None, og="Təcili satılır! Nefçilər və Xalqlar dostluğuna piyada məsafə",
+           other=None, with_id=True):
+    item = {"__typename": "Item", "id": iid, "additionalParameters": [],
+            "address": "Cəmşid Naxçıvanski küç. 38", "buildingTypeName": None,
+            "price": {"__typename": "Price", "currency": "AZN", "total": 149000}}
+    if ctype is not None:
+        item["contactTypeName"] = ctype
+    data = {"props": {"apolloState": {f"Item:{iid}": item}}}
+    if other:
+        data["props"]["apolloState"]["Item:6600001"] = {"__typename": "Item", "id": "6600001",
+                                                        "contactTypeName": other}
+    body = json.dumps(data, ensure_ascii=False)
+    if not with_id:
+        body = '{"props":{}}'
+    canon = f'<link href="https://bina.az/items/{iid}" rel="canonical">' if with_id else ""
+    return ("<html><head>" + canon + f'<meta property="og:description" content="{html_mod.escape(og)}">'
+            + '</head><script id="__NEXT_DATA__" type="application/json">' + body
+            + "</script></html>" + "x" * 2000)
+
+
+def bina23_check(page, iid="6637490"):
+    mn.http_get = lambda url, headers=None, params=None, timeout=30, browser=False: R(page)
+    return mn.bina_is_owner(f"https://bina.az/items/{iid}")[0], mn.bina_is_owner.last_reason
+
+
+check(bina23_check(bina23("6637490", "mülkiyyətçi")) == (True, "ok"),
+      "6637490: page data 'contactTypeName: mülkiyyətçi' -> owner (no visible label needed)")
+check(bina23_check(bina23("6637490", "vasitəçi (agent)")) == (False, "ok"),
+      "page data 'vasitəçi (agent)' -> agent")
+check(bina23_check(bina23("6637490", None, other="mülkiyyətçi")) == (None, "nolabel"),
+      "another ad's seller type on the same page is never used")
+check(bina23_check(bina23("6637490", "mülkiyyətçi", with_id=False)) == (None, "fetch"),
+      "a page that is not this ad (error / wait page) counts as NOT READ - no try used up")
+check(bina23_check(bina23("6637490", "mülkiyyətçi", og="Təmirli mənzil, ofis haqqı 1% alınır"))[0] is False,
+      "owner by page data + 'ofis haqqı 1%' in the text -> still agent")
+
+# Telegram: wait out 429, keep undelivered messages, send them next run
+mt23 = load(os.path.join(HERE, "monitor.py"), "monitor_tg23")
+
+
+class TR:
+    def __init__(self, code, js=None):
+        self.status_code, self._js = code, (js or {})
+        self.text = json.dumps(self._js)
+
+    def json(self):
+        return self._js
+
+
+import requests as _rq
+_orig_post, _orig_sleep = _rq.post, time.sleep
+posted23, slept23, script23 = [], [], []
+
+
+def _fake_post(url, **kw):
+    posted23.append((url.rsplit("/", 1)[-1], kw.get("json") or kw.get("data")))
+    nxt = script23.pop(0) if script23 else TR(200, {"ok": True})
+    if isinstance(nxt, Exception):
+        raise nxt
+    return nxt
+
+
+_rq.post = _fake_post
+time.sleep = lambda s_: slept23.append(s_)
+try:
+    script23[:] = [TR(429, {"ok": False, "parameters": {"retry_after": 3}}), TR(200, {"ok": True})]
+    ok23 = mt23.tg_send_message("x")
+    check(ok23 and len(posted23) == 2 and slept23 == [3.5],
+          "Telegram 429 'retry after 3' -> waits 3 s, sends again, delivered", f"{posted23} {slept23}")
+    posted23.clear(); slept23.clear()
+    script23[:] = [TR(429, {"ok": False, "parameters": {"retry_after": 999}})]
+    check(mt23.tg_send_message("x") is False and len(posted23) == 1 and not slept23,
+          "an absurd wait (999 s) is not waited out")
+    posted23.clear()
+    script23[:] = [TR(400, {"ok": False, "description": "Bad Request: can't parse entities"}),
+                   TR(200, {"ok": True})]
+    check(mt23.tg_send_message("<b>a & b</b>") is True and "parse_mode" not in posted23[-1][1],
+          "HTML Telegram cannot read -> the same text is sent without formatting")
+    st23 = {"listings": {}}
+    mt23._RUNTIME["state"] = st23
+    l23 = {"id": "6637490", "url": "https://bina.az/items/6637490", "price": 149000, "rooms": 3,
+           "area": 61, "location": "Xalqlar Dostluğu m."}
+    script23[:] = [TR(500)] * 3
+    check(mt23.notify_new_owner_msg(l23, "bina.az", "Mülkiyyətçi") is False
+          and len(st23.get("outbox", [])) == 1 and st23["outbox"][0]["key"] == l23["url"],
+          "Telegram refused the alert -> kept in the outbox (was: lost, record said 'sent')")
+    posted23.clear()
+    script23[:] = [TR(200, {"ok": True})]
+    with contextlib.redirect_stdout(io.StringIO()):
+        n23 = mt23.flush_outbox()
+    check(n23 == 1 and st23["outbox"] == [] and "6637490" in json.dumps(posted23, ensure_ascii=False),
+          "next run: the waiting alert is delivered and leaves the outbox")
+    script23[:] = [_rq.exceptions.ReadTimeout("slow")]
+    with contextlib.redirect_stdout(io.StringIO()):
+        mt23.notify_new_owner_msg(l23, "bina.az", "Mülkiyyətçi")
+    check(st23["outbox"] == [], "a timeout AFTER sending may have arrived -> not repeated (never twice)")
+    st23["outbox"] = [{"text": "old", "photo": None, "key": "k", "n": 9,
+                       "t": iso(time.time() - 8 * 86400)}]
+    posted23.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        mt23.flush_outbox()
+    check(st23["outbox"] == [] and not posted23, "alerts older than OUTBOX_MAX_DAYS are dropped (logged)")
+    st23["outbox"] = [{"text": "now", "photo": None, "key": "k2", "n": 1, "t": iso(time.time())}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        mt23.flush_outbox(run_started=time.time() - 60)
+    check(len(st23["outbox"]) == 1 and not posted23,
+          "an alert that failed during THIS run waits for the next run (no hammering)")
+finally:
+    _rq.post, time.sleep = _orig_post, _orig_sleep
+
+# tap: an ad seen on page 1 but not decided is checked next run, even off page 1
+mpd = load(os.path.join(HERE, "monitor.py"), "monitor_pend23")
+mpd.PAGE_DELAY = 0
+st_p = {"listings": {}}
+mpd._RUNTIME["state"] = st_p
+src_p = {"name": "tap.az", "type": "tap", "url": "https://tap.az/x", "prefix": "tap:",
+         "mode": "owner_new", "owner_label": "Sahibindən"}
+flags_p = {"tap.az": True, "tap.az:url": mpd._url_fingerprint(src_p["url"])}
+seen_p = {"tap:48000001": {"url": TAPU + "48000001", "first_seen": iso(time.time() - 3600),
+                           "source": "tap.az", "owner": True}}
+beh = {"reason": "fetch", "calls": []}
+
+
+def fake_tco(url, seller_counts=None, profile_cache=None, listing=None):
+    beh["calls"].append(url)
+    mpd.tap_check_owner.last_reason = beh["reason"]
+    mpd.tap_check_owner.last_details = {"price": 167000, "rooms": 2, "area": 46.7,
+                                        "location": "Xalqlar Dostluğu m."}
+    if beh["reason"] == "ok":
+        return True, None, "14203798"
+    return None, None, None
+
+
+mpd.tap_check_owner = fake_tco
+sent_p = []
+mpd.notify_new_owner_msg = lambda l, n, ol="": sent_p.append(l["id"]) or True
+A23 = {"id": "49259520", "url": TAPU + "49259520", "rooms": 2, "area": 46.7, "price": 167000,
+       "location": "Xalqlar Dostluğu m."}
+with contextlib.redirect_stdout(io.StringIO()):
+    mpd.process_owner_new([dict(A23)], src_p, seen_p, flags_p)     # page did not load
+check("tap:49259520" not in seen_p and "49259520" in st_p.get("tap_pending", {}),
+      "run 1: page 1 had the ad, its page did not load -> remembered as pending")
+beh["reason"] = "ok"
+with contextlib.redirect_stdout(io.StringIO()):
+    mpd.process_owner_new([], src_p, seen_p, flags_p)              # ad is off page 1 now
+check(sent_p == ["49259520"] and seen_p["tap:49259520"]["owner"] is True
+      and st_p["tap_pending"] == {},
+      "run 2: no longer on page 1, still checked and announced once", f"sent={sent_p}")
+with contextlib.redirect_stdout(io.StringIO()):
+    mpd.process_owner_new([dict(A23)], src_p, seen_p, flags_p)
+check(sent_p == ["49259520"], "run 3: never sent twice")
+st_p["tap_pending"] = {"49000001": {"id": "49000001", "url": TAPU + "49000001",
+                                    "_since": iso(time.time() - 3 * 86400)},
+                       "49000002": {"id": "49000002", "url": TAPU + "49000002",
+                                    "_since": iso(time.time() - 3600)}}
+beh["reason"], beh["calls"] = "gone", []
+with contextlib.redirect_stdout(io.StringIO()):
+    mpd.process_owner_new([], src_p, seen_p, flags_p)
+check(beh["calls"] == [TAPU + "49000002"] and st_p["tap_pending"] == {}
+      and "tap:49000002" not in seen_p,
+      "pending older than TAP_PENDING_DAYS dropped unread; a deleted ad is dropped, not recorded")
+
+# main(): tap page 1 is read again at the end of a long run
+m2r = load(os.path.join(HERE, "monitor.py"), "monitor_second23")
+tmp2 = tempfile.mkdtemp()
+m2r.STATE_FILE = os.path.join(tmp2, "seen.json")
+m2r.USE_API = False
+m2r.PAGE_DELAY = 0
+m2r.SOURCES = [dict(s_) for s_ in m2r.SOURCES]
+m2r.tg_send_message = lambda text: True
+m2r.tg_send_photo = lambda photo, cap: True
+reads23 = []
+m2r.fetch_for_source = lambda src: reads23.append(src["name"]) or []
+m2r.TAP_SECOND_READ_AFTER = 0
+with contextlib.redirect_stdout(io.StringIO()):
+    m2r.main()
+check(reads23.count("tap.az") == 2 and reads23[-1] == "tap.az" and reads23.count("bina.az") == 1,
+      "tap page 1 is read at the start AND at the end of a run", str(reads23))
+reads23.clear()
+m2r.TAP_SECOND_READ_AFTER = 10 ** 6
+with contextlib.redirect_stdout(io.StringIO()):
+    m2r.main()
+check(reads23.count("tap.az") == 1, "short run -> no second read")
+
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 sys.exit(1 if FAILS else 0)
