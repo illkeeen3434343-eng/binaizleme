@@ -18,7 +18,8 @@ import time
 # tap.az profiles), and real tokens must never reach Telegram or GitHub from a test.
 def _isolate_env(here):
     keys = {"GH_TOKEN", "GH_REPO", "GITHUB_TOKEN", "SEND", "SOURCES", "TG"}
-    for fn in ("monitor.py", "recover_missed.py", "health.py", "collect_bina.py", "why.py"):
+    for fn in ("monitor.py", "recover_missed.py", "health.py", "collect_bina.py", "why.py",
+               "lost_alerts.py"):
         try:
             src = open(os.path.join(here, fn), encoding="utf-8").read()
         except OSError:
@@ -1953,9 +1954,25 @@ try:
     check(n23 == 1 and st23["outbox"] == [] and "6637490" in json.dumps(posted23, ensure_ascii=False),
           "next run: the waiting alert is delivered and leaves the outbox")
     script23[:] = [_rq.exceptions.ReadTimeout("slow")]
+    posted23.clear()
     with contextlib.redirect_stdout(io.StringIO()):
         mt23.notify_new_owner_msg(l23, "bina.az", "Mülkiyyətçi")
-    check(st23["outbox"] == [], "a timeout AFTER sending may have arrived -> not repeated (never twice)")
+    check(len(st23["outbox"]) == 1 and len(posted23) == 1,
+          "Telegram timed out (log line 100830, 19 Nov) -> no more tries this run, kept for "
+          "the next run (was: lost)", f"posts={len(posted23)}")
+    mt23.TG_RESEND_ON_TIMEOUT = False
+    st23["outbox"] = []
+    script23[:] = [_rq.exceptions.ReadTimeout("slow")]
+    with contextlib.redirect_stdout(io.StringIO()):
+        mt23.notify_new_owner_msg(l23, "bina.az", "Mülkiyyətçi")
+    check(st23["outbox"] == [], "TG_RESEND_ON_TIMEOUT=0 -> a timed-out message is never repeated")
+    mt23.TG_RESEND_ON_TIMEOUT = True
+    st23["outbox"] = [{"text": "x", "photo": None, "key": "k3", "n": mt23.OUTBOX_MAX_TRIES + 1,
+                       "t": iso(time.time() - 3600)}]
+    posted23.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        mt23.flush_outbox()
+    check(st23["outbox"] == [] and not posted23, "a message that failed OUTBOX_MAX_TRIES times is dropped (logged)")
     st23["outbox"] = [{"text": "old", "photo": None, "key": "k", "n": 9,
                        "t": iso(time.time() - 8 * 86400)}]
     posted23.clear()
@@ -2043,6 +2060,115 @@ m2r.TAP_SECOND_READ_AFTER = 10 ** 6
 with contextlib.redirect_stdout(io.StringIO()):
     m2r.main()
 check(reads23.count("tap.az") == 1, "short run -> no second read")
+
+# --------------------------------------------------------------------------- #
+print("\n[NOV-27] lost_alerts.py: alerts Telegram did not deliver (18-19 Nov) are found and re-sent")
+la_ = load(os.path.join(HERE, "lost_alerts.py"), "lost_alerts_t")
+B502 = '{"ok":false,"error_code":502,"description":"Bad Gateway"}'
+T0 = time.time() - 4 * 86400
+LOG27 = "\n".join([
+    f"monitor.py 2026-11-17-a starting {iso(T0)}",
+    "tap.az: 30 listings",
+    f"tap.az: {TAPU}49259520 score=1 -> OWNER ['count:1-apartment(s)-ok']",
+    f"sendPhoto upload failed: 502 {B502}", f"sendPhoto by-url failed: 502 {B502}",
+    f"Telegram sendMessage failed: 502 {B502}",
+    f"tap.az: {TAPU}49259521 score=4 -> OWNER ['owner:oz evimdi']",
+    "tap.az: checked 2 new, announced 1 owner posts",
+    "lalafo.az: 5 listings (1 page(s), newest pages)",
+    "yeniemlak: read 2 page(s) [newest; stopped: nothing new], kept 3 of 3 parsed",
+    "bina: scanned 70 pages, 1100 matching listings of ~1100 total",
+    "sendPhoto upload error: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out.",
+    "sendPhoto by-url error: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out.",
+    "Telegram error: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out.",
+    "bina.az: owner-checked 2 new, announced 1, deferred 0",
+    "price change 6600009: 120000 -> 110000 (-10000)",
+    "Done. notified=2 saved=True(local) records_before=1 records_after=6 elapsed=400s status={}",
+    f"monitor.py 2026-11-17-a starting {iso(T0 + 900)}",
+    "tap.az: 30 listings", "bina: scanned 70 pages, 1100 matching listings",
+    f"Telegram sendMessage failed: 502 {B502}",
+    "Done. notified=0 saved=True(local) records_before=6 records_after=7 elapsed=390s status={}",
+    f"monitor.py 2026-11-17-a starting {iso(T0 + 1800)}",
+    "Done. notified=0 saved=True(local) records_before=7 records_after=7 elapsed=380s status={}",
+]) + "\n"
+L27 = {"tap:49259520": {"url": TAPU + "49259520", "first_seen": iso(T0 + 4), "source": "tap.az",
+                        "owner": True, "seller": "14203798", "rooms": 2, "area": 46.7},
+       "tap:49259521": {"url": TAPU + "49259521", "first_seen": iso(T0 + 5), "source": "tap.az", "owner": True},
+       "6637490": {"url": "https://bina.az/items/6637490", "price": 167000, "first_seen": iso(T0 + 380),
+                   "source": "bina.az", "owner": True},
+       "6637491": {"url": "https://bina.az/items/6637491", "price": 150000, "first_seen": iso(T0 + 380),
+                   "source": "bina.az", "owner": True},
+       "6600009": {"url": "https://bina.az/items/6600009", "price": 110000, "first_seen": iso(T0 - 9e5),
+                   "source": "bina.az"},
+       "6637600": {"url": "https://bina.az/items/6637600", "price": 99000, "first_seen": iso(T0 + 1250),
+                   "source": "bina.az", "owner": True},
+       "6637700": {"url": "https://bina.az/items/6637700", "price": 99000, "first_seen": iso(T0 + 2000),
+                   "source": "bina.az", "owner": True}}
+tmp27 = tempfile.mkdtemp()
+la_.LOG = os.path.join(tmp27, "run.log")
+with open(la_.LOG, "w", encoding="utf-8") as fh_:
+    fh_.write(LOG27)
+buf27 = io.StringIO()
+with contextlib.redirect_stdout(buf27):
+    out27 = la_.list_lost({"listings": L27})
+txt27 = buf27.getvalue()
+v27 = {i["key"]: i["verdict"] for i in out27}
+check(v27.get("tap:49259520") == "LOST", "tap 49259520: Telegram failed right after its check -> LOST",
+      str(v27))
+check("tap:49259521" not in v27, "the next tap ad (no failure after it) counts as delivered")
+check(v27.get("6637490", "").startswith("maybe") and v27.get("6637491", "").startswith("maybe"),
+      "bina: 1 failure, 2 owner ads in that run -> both 'maybe' (Telegram does not say which)")
+check(v27.get("6637600") == "LOST" and "6637700" not in v27,
+      "bina: 1 failure, 1 owner ad in that run -> LOST; a run without failures is not listed")
+check("6600009" not in v27 and "price change 120000 -> 110000" in txt27,
+      "price-change alerts are shown but not offered for re-sending (only owner ads)")
+check("Owner ads whose alert was lost: 49259520 6637600" in txt27, "summary line with ids to re-send",
+      txt27.strip().splitlines()[-3] if txt27.strip() else "")
+
+# RESEND puts the messages into the outbox; the page fills price / rooms / address
+mr27 = load(os.path.join(HERE, "monitor.py"), "monitor")
+mr27.STATE_FILE = os.path.join(tmp27, "seen.json")
+mr27.USE_API = False
+with open(mr27.STATE_FILE, "w", encoding="utf-8") as fh_:
+    json.dump({"listings": json.loads(json.dumps(L27))}, fh_)
+BINA27 = ('<html><head><link href="https://bina.az/items/6637490" rel="canonical">'
+          '<meta property="og:image" content="https://bina.azstatic.com/x.jpg">'
+          '<script type="application/ld+json">' + json.dumps(
+              {"@type": "Product", "offers": {"price": "149000", "priceCurrency": "AZN", "itemOffered": {
+                  "numberOfRooms": 3, "floorSize": {"value": 61}}}}) + '</script></head>'
+          '<script>{"Item:6637490":{"__typename":"Item","id":"6637490","floor":1,"floors":9,'
+          '"location":{"__typename":"Location","fullName":"Xalqlar Dostluğu m.","path":"/baki/x"}}}'
+          '</script></html>')
+TAP27 = tap23(TXT23, 1).replace("<html>", '<html><meta content="167000.00" property="product:price:amount">'
+                                 '<meta property="product:price:currency" content="AZN">', 1)
+mr27.http_get = lambda url, headers=None, params=None, timeout=30, browser=False: R(BINA27)
+mr27._fetch_tap_html = lambda url, tries=4: (R(TAP27), TAP27)
+sys.modules["monitor"] = mr27
+os.environ["RESEND"] = "49259520 https://bina.az/items/6637490 6600009 999"
+buf27 = io.StringIO()
+with contextlib.redirect_stdout(buf27):
+    la_.main()
+st27 = json.load(open(mr27.STATE_FILE, encoding="utf-8"))
+box27 = st27.get("outbox", [])
+tb = next((e["text"] for e in box27 if "6637490" in e["key"]), "")
+tt = next((e["text"] for e in box27 if "49259520" in e["key"]), "")
+check(len(box27) == 2 and st27["listings"]["6637490"].get("resent") and st27["listings"]["tap:49259520"].get("resent"),
+      "RESEND: the 2 owner ads are queued in the outbox and stamped 'resent'", str([e["key"] for e in box27]))
+check("♻️" in tb and "149 000 AZN" in tb and "Otaq sayı:</b> 3" in tb and "Sahə:</b> 61 m²" in tb
+      and "1/9" in tb and "Xalqlar Dostluğu m." in tb
+      and next(e["photo"] for e in box27 if "6637490" in e["key"]) == "https://bina.azstatic.com/x.jpg",
+      "bina message: ♻️ (4 days old), today's price, rooms, area, floor, address, photo",
+      " | ".join(tb.splitlines()[:8]))
+check("167 000 AZN" in tt and "Otaq sayı:</b> 2" in tt and "Xalqlar Dostluğu m." in tt,
+      "tap message: price / rooms / address from the ad's page", " | ".join(tt.splitlines()[:8]))
+check("6600009: the bot did not judge it an owner ad" in buf27.getvalue()
+      and "999: not in the bot's records" in buf27.getvalue(),
+      "non-owner and unknown ids are refused")
+with contextlib.redirect_stdout(io.StringIO()):
+    la_.main()
+check(len(json.load(open(mr27.STATE_FILE, encoding="utf-8"))["outbox"]) == 2,
+      "running RESEND again queues nothing twice")
+os.environ.pop("RESEND", None)
+sys.modules.pop("monitor", None)
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 sys.exit(1 if FAILS else 0)

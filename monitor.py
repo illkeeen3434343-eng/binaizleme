@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
-VERSION = "2026-11-23-a"   # bump this when you deploy; printed at start of every run
+VERSION = "2026-11-23-b"   # bump this when you deploy; printed at start of every run
 
 try:
     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
@@ -330,6 +330,12 @@ class PersistedQueryError(Exception):
 TG_MAX_WAIT = float(os.environ.get("TG_MAX_WAIT", "60"))          # longest 429 wait
 OUTBOX_MAX_DAYS = float(os.environ.get("OUTBOX_MAX_DAYS", "7"))
 OUTBOX_PER_RUN = int(os.environ.get("OUTBOX_PER_RUN", "30"))
+OUTBOX_MAX_TRIES = int(os.environ.get("OUTBOX_MAX_TRIES", "8"))
+# A send that TIMED OUT (Telegram took the request but did not answer in time) is
+# also sent again on the next run. On 18-19 Nov 2026 such timeouts lost alerts for
+# good; a rare double message is better than a missed owner ad. TG_RESEND_ON_TIMEOUT=0
+# = never repeat a timed-out message (no doubles, but it can be lost).
+TG_RESEND_ON_TIMEOUT = os.environ.get("TG_RESEND_ON_TIMEOUT", "1").strip() != "0"
 _TG_UNSURE = {"v": False}     # a send timed out after it was handed over: may have arrived
 
 
@@ -337,7 +343,8 @@ def _tg_post(method, **kw):
     """POST to the Telegram Bot API. On HTTP 429 ("Too Many Requests" - Telegram allows
     about 20 messages a minute in a group) wait the retry_after Telegram asks for, at
     most TG_MAX_WAIT seconds, and try once more. A timeout AFTER the request was sent
-    is remembered in _TG_UNSURE: the message may have arrived, so it is not repeated."""
+    is remembered in _TG_UNSURE (the message may have arrived): the other ways of
+    sending are not tried in this run (Telegram is struggling), see _deliver."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     r = None
     for attempt in (1, 2):
@@ -418,7 +425,7 @@ def tg_send_photo(photo_url, caption):
         except requests.RequestException as e:
             log("sendPhoto upload error:", e)
             if _TG_UNSURE["v"]:
-                return False          # may have arrived: do not send a second copy
+                return False          # Telegram is not answering: next run (outbox)
     # 2) Fallback: let Telegram fetch the URL (works for fast HTTPS CDNs like bina).
     try:
         r = _tg_post("sendPhoto", json={"chat_id": CHAT_ID, "photo": photo_url,
@@ -451,14 +458,15 @@ def _deliver(text, photo=None, key=""):
     if ok:
         return True
     box = _outbox()
-    if _TG_UNSURE["v"]:
+    if _TG_UNSURE["v"] and not TG_RESEND_ON_TIMEOUT:
         log(f"Telegram: {key or 'message'} timed out after sending; it may have arrived, "
-            "so it is not repeated")
+            "so it is not repeated (TG_RESEND_ON_TIMEOUT=0)")
     elif box is not None:
         box.append({"text": text, "photo": photo, "key": key, "n": 1,
                     "t": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
-        log(f"Telegram: {key or 'message'} NOT delivered; kept in the outbox, "
-            "sent again next run")
+        log(f"Telegram: {key or 'message'} NOT delivered"
+            + (" (timed out; it may have arrived)" if _TG_UNSURE["v"] else "")
+            + "; kept in the outbox, sent again next run")
     return False
 
 
@@ -475,9 +483,10 @@ def flush_outbox(run_started=None):
         if run_started is not None and t is not None and t >= run_started:
             keep.append(e)                 # failed in this run: next run
             continue
-        if t is not None and now_ts - t > OUTBOX_MAX_DAYS * 86400:
-            log(f"Telegram outbox: gave up on {e.get('key')} (not deliverable for "
-                f"{OUTBOX_MAX_DAYS:g} days)")
+        if ((t is not None and now_ts - t > OUTBOX_MAX_DAYS * 86400)
+                or int(e.get("n") or 1) > OUTBOX_MAX_TRIES):
+            log(f"Telegram outbox: GAVE UP on {e.get('key')} (not delivered in "
+                f"{int(e.get('n') or 1)} tries / {OUTBOX_MAX_DAYS:g} days)")
             continue
         if tried >= OUTBOX_PER_RUN:
             keep.append(e)
@@ -488,7 +497,7 @@ def flush_outbox(run_started=None):
               else tg_send_message(e.get("text", "")))
         if ok:
             sent += 1
-        elif _TG_UNSURE["v"]:
+        elif _TG_UNSURE["v"] and not TG_RESEND_ON_TIMEOUT:
             log(f"Telegram outbox: {e.get('key')} timed out after sending; not repeated")
         else:
             e["n"] = int(e.get("n") or 1) + 1
