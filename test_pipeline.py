@@ -1994,8 +1994,75 @@ try:
         mt23.flush_outbox(run_started=time.time() - 60)
     check(len(st23["outbox"]) == 1 and not posted23,
           "an alert that failed during THIS run waits for the next run (no hammering)")
+    # a burst of price changes: at most TG_PRICE_PER_RUN go out now, the rest wait
+    st23 = {"listings": {}}
+    mt23._RUNTIME["state"] = st23
+    mt23.TG_PRICE_PER_RUN = 2
+    mt23._TG_RUN["price"] = 0
+    posted23.clear(); script23[:] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        r_pc = [mt23.notify_change(dict(l23, id=f"66{_i}", url=f"https://bina.az/items/66{_i}"),
+                                   "bina.az", "drop", 150000, 140000, 2) for _i in range(3)]
+        r_ow = mt23.notify_new_owner_msg(l23, "bina.az", "Mülkiyyətçi")
+    check(r_pc == [True, True, False] and r_ow is True and len(posted23) == 3
+          and [e.get("kind") for e in st23["outbox"]] == ["price"],
+          "price-change burst: 2 sent, the 3rd waits in the outbox; owner alerts are never held back",
+          f"{r_pc} {r_ow} posts={len(posted23)} box={st23.get('outbox')}")
+    st23["outbox"] = [{"text": "PRICE", "photo": None, "key": "p", "n": 0, "kind": "price",
+                       "t": iso(time.time() - 7200)},
+                      {"text": "OWNER", "photo": None, "key": "o", "n": 1, "kind": "owner",
+                       "t": iso(time.time() - 3600)}]
+    posted23.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        mt23.flush_outbox()
+    check([p_[1]["text"] for p_ in posted23] == ["OWNER", "PRICE"] and st23["outbox"] == [],
+          "outbox: waiting owner-ad alerts go out before waiting price changes", str(posted23))
 finally:
     _rq.post, time.sleep = _orig_post, _orig_sleep
+
+# the 23 Oct 17:00 burst replayed against a Telegram that allows 20 messages a minute
+_orig_time = time.time
+clock = {"t": 1_000_000.0}
+accepted, refused = [], []
+
+
+def _tg_limited(url, **kw):
+    now_ = clock["t"]
+    recent = [x for x in accepted if now_ - x < 60]
+    if len(recent) >= 20:
+        refused.append(now_)
+        return TR(429, {"ok": False, "parameters": {"retry_after": int(60 - (now_ - recent[0])) + 1}})
+    accepted.append(now_)
+    clock["t"] += 0.4                       # Telegram answers in 0.4 s
+    return TR(200, {"ok": True})
+
+
+def _vsleep(sec):
+    clock["t"] += sec
+
+
+_rq.post, time.sleep, time.time = _tg_limited, _vsleep, lambda: clock["t"]
+try:
+    for gap, label in [(3.1, "with 3.1 s spacing"), (0, "spacing turned off (the 429 wait does the work)")]:
+        mt23.TG_MIN_GAP, mt23.TG_PRICE_PER_RUN = gap, 40
+        mt23._TG_RUN["price"] = 0
+        mt23._TG_LAST["t"] = 0.0
+        st23 = {"listings": {}}
+        mt23._RUNTIME["state"] = st23
+        accepted.clear(); refused.clear()
+        t_start = clock["t"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = [mt23.notify_change(dict(l23, id=f"65{_i}", url=f"https://bina.az/items/65{_i}"),
+                                      "bina.az", "drop", 205000, 195000, 2) for _i in range(56)]
+        waiting = len(st23.get("outbox", []))
+        check(sum(res) + waiting == 56 and sum(res) == 40 and waiting == 16
+              and (gap == 0 or not refused),
+              f"23 Oct burst of 56 price changes {label}: 40 delivered, 16 wait for the next run, "
+              f"0 lost (was 25 lost)",
+              f"sent={sum(res)} waiting={waiting} 429s={len(refused)} took={clock['t'] - t_start:.0f}s")
+finally:
+    _rq.post, time.sleep, time.time = _orig_post, _orig_sleep, _orig_time
+    mt23.TG_MIN_GAP = 0
 
 # tap: an ad seen on page 1 but not decided is checked next run, even off page 1
 mpd = load(os.path.join(HERE, "monitor.py"), "monitor_pend23")

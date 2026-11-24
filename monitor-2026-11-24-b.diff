@@ -1,0 +1,89 @@
+diff --git a/monitor.py b/monitor.py
+index 31f0871..19676e5 100644
+--- a/monitor.py
++++ b/monitor.py
+@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+ 
+ import requests
+ 
+-VERSION = "2026-11-24-a"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-24-b"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -342,6 +342,12 @@ _TG_UNSURE = {"v": False}     # a send timed out after it was handed over: may h
+ # lost 25 / 7 / 5 alerts. Keeping TG_MIN_GAP seconds between two messages stays under it.
+ TG_MIN_GAP = float(os.environ.get("TG_MIN_GAP", "3.1"))
+ _TG_LAST = {"t": 0.0}
++# A run sends at most TG_PRICE_PER_RUN price-change alerts; the rest wait in the outbox
++# and go out on the next runs. With the 3.1 s spacing a burst of 56 price changes (as on
++# 23 Oct) would otherwise add ~3 min to one run; 200 after an outage would push the run
++# past the 15-minute cron slot. Owner-ad alerts are never held back by this.
++TG_PRICE_PER_RUN = int(os.environ.get("TG_PRICE_PER_RUN", "40"))
++_TG_RUN = {"price": 0}
+ 
+ 
+ def _tg_post(method, **kw):
+@@ -456,7 +462,7 @@ def _outbox():
+     return st.setdefault("outbox", []) if isinstance(st, dict) else None
+ 
+ 
+-def _deliver(text, photo=None, key=""):
++def _deliver(text, photo=None, key="", kind="owner"):
+     """Send one alert. If Telegram did not take it (down, refusing, still 429 after the
+     wait), the message is kept in the outbox - saved with the state - and sent again
+     at the start of the next runs. The listing itself stays decided, so it is never
+@@ -464,15 +470,24 @@ def _deliver(text, photo=None, key=""):
+     was simply lost: the record already said "sent".)"""
+     _TG_UNSURE["v"] = False
+     photo = photo if SEND_PHOTOS else None
++    box = _outbox()
++    if kind == "price" and box is not None and TG_PRICE_PER_RUN > 0:
++        _TG_RUN["price"] += 1
++        if _TG_RUN["price"] > TG_PRICE_PER_RUN:
++            box.append({"text": text, "photo": photo, "key": key, "n": 0, "kind": kind,
++                        "t": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
++            if _TG_RUN["price"] == TG_PRICE_PER_RUN + 1:
++                log(f"Telegram: {TG_PRICE_PER_RUN} price-change alerts sent this run; the rest "
++                    "wait in the outbox for the next runs (Telegram allows ~20 a minute)")
++            return False
+     ok = tg_send_photo(photo, text) if photo else tg_send_message(text)
+     if ok:
+         return True
+-    box = _outbox()
+     if _TG_UNSURE["v"] and not TG_RESEND_ON_TIMEOUT:
+         log(f"Telegram: {key or 'message'} timed out after sending; it may have arrived, "
+             "so it is not repeated (TG_RESEND_ON_TIMEOUT=0)")
+     elif box is not None:
+-        box.append({"text": text, "photo": photo, "key": key, "n": 1,
++        box.append({"text": text, "photo": photo, "key": key, "n": 1, "kind": kind,
+                     "t": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
+         log(f"Telegram: {key or 'message'} NOT delivered"
+             + (" (timed out; it may have arrived)" if _TG_UNSURE["v"] else "")
+@@ -488,7 +503,8 @@ def flush_outbox(run_started=None):
+     if not box:
+         return 0
+     now_ts, keep, sent, tried = time.time(), [], 0, 0
+-    for e in list(box):
++    # owner-ad alerts first, then price changes; oldest first within each
++    for e in sorted(box, key=lambda e: (e.get("kind") == "price", str(e.get("t", "")))):
+         t = _to_epoch(e.get("t"))
+         if run_started is not None and t is not None and t >= run_started:
+             keep.append(e)                 # failed in this run: next run
+@@ -2368,7 +2384,7 @@ def format_change(l, source_name, kind, old_price, new_price, n_changes):
+ 
+ def notify_change(l, source_name, kind, old_price, new_price, n_changes):
+     text = format_change(l, source_name, kind, old_price, new_price, n_changes)
+-    return _deliver(text, l.get("photo"), l.get("url", ""))
++    return _deliver(text, l.get("photo"), l.get("url", ""), kind="price")
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -3566,6 +3582,7 @@ def main():
+     seen = state["listings"]
+     loaded_count = len(seen)          # invariant: we must never save fewer than this
+     _RUNTIME["state"] = state         # small caches (tap profile counts) live in state
++    _TG_RUN["price"] = 0
+ 
+     if IN_ACTIONS and not USE_API:
+         tg_send_message("⚠️ Memory storage not configured (GH_TOKEN/GH_REPO missing); listings "
