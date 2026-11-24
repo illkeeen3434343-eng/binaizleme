@@ -42,6 +42,8 @@ def load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    if hasattr(mod, "BINA_KUPCA_TEXT"):
+        mod.BINA_KUPCA_TEXT = False   # no live bina reads in tests; [NOV-28] turns it on
     return mod
 
 
@@ -2251,6 +2253,160 @@ check(len(json.load(open(mr27.STATE_FILE, encoding="utf-8"))["outbox"]) == 2,
       "running RESEND again queues nothing twice")
 os.environ.pop("RESEND", None)
 sys.modules.pop("monitor", None)
+
+# --------------------------------------------------------------------------- #
+print("\n[NOV-28] bina ads without the Çıxarış tick whose text says kupça (6639973)")
+mk = load(os.path.join(HERE, "monitor.py"), "monitor_kupca")
+YES28 = ["Tecili satılır: qanuni 2 otaqlı ... Sened (kupça). Qiymet: 167.000 azn", "Kupçalı mənzil",
+         "Kupçası var, təmirli", "Çıxarış var", "Sənəd: çıxarış (reyestr)", "Купча есть, срочно"]
+NO28 = ["Kupçası yoxdur, müqavilə ilə", "Kupçasız mənzil", "Kupça hazırlanır", "kupçaya düşür",
+        "Kupça hələ yoxdur", "kupça yerinə bələdiyyə müqaviləsi", "Без купчей", "Təmirli mənzil, 2 otaq", ""]
+check(all(mk.kupca_in_text(t) for t in YES28), "kupça / çıxarış in the text -> yes (incl. 6639973's 'Sened (kupça)')",
+      str([t for t in YES28 if not mk.kupca_in_text(t)]))
+check(not any(mk.kupca_in_text(t) for t in NO28), "'kupçası yoxdur', 'kupçasız', 'hazırlanır', 'kupçaya düşür'... -> no",
+      str([t for t in NO28 if mk.kupca_in_text(t)]))
+
+SRC28 = next(dict(s_) for s_ in mk.SOURCES if s_["type"] == "bina")
+SRC28["url"] = ("https://bina.az/baki/alqi-satqi/menziller?has_bill_of_sale=true&has_repair=true"
+                "&location_ids%5B%5D=51&location_ids%5B%5D=54")
+
+
+def node28(iid, days, loc="Xətai r.", bill=False, price=167000):  # noqa
+    return {"id": str(iid), "rooms": 2, "area": {"value": 60, "units": "m²"}, "floor": 2, "floors": 9,
+            "price": {"total": price, "currency": "AZN"}, "location": {"id": 10, "fullName": loc},
+            "path": f"/items/{iid}", "hasBillOfSale": bill, "createdAt": iso(time.time() - days * 86400)}
+
+
+NODES28 = [node28(6639973, 5), node28(6640001, 1, bill=True), node28(6640002, 1),
+           node28(6640003, 1), node28(6640004, 1, loc="Koroğlu m."), node28(6640005, 2),
+           node28(6000000, 30)]
+PAGE28 = 3
+fv_seen28, reads28 = [], []
+
+
+def fake_page28(session, fv, cursor):
+    fv_seen28.append(dict(fv))
+    i = int(cursor or 0)
+    reads28.append(i)
+    chunk = NODES28[i:i + PAGE28]
+    more = i + PAGE28 < len(NODES28)
+    return {"data": {"itemsConnection": {"totalCount": len(NODES28),
+            "edges": [{"node": n_} for n_ in chunk],
+            "pageInfo": {"hasNextPage": more, "endCursor": str(i + PAGE28) if more else None}}}}
+
+
+PAGES28 = {"6639973": (True, "Tecili satılır:qanuni 2 otaqlı ... Sened (kupça).Qiymet:167.000 azn"),
+           "6640002": (True, "Təmirli mənzil, 2 otaq, metroya yaxın"),
+           "6640003": (False, "Ofis haqqı 1%"),
+           "6640005": (None, "")}
+fetch_ok28 = {"6640005": False}
+asked28 = []
+
+
+def fake_owner28(url):
+    iid = url.rsplit("/", 1)[-1]
+    asked28.append(iid)
+    v, d = PAGES28.get(iid, (None, ""))
+    if iid == "6640005":
+        if not fetch_ok28["6640005"]:
+            mk.bina_is_owner.last_reason, mk.bina_is_owner.last_desc = "fetch", None
+            return None, None
+        v, d = True, "Təcili! Kupçalı, təmirli"
+    mk.bina_is_owner.last_reason = "ok" if v is not None else "nolabel"
+    mk.bina_is_owner.last_desc = d if v else None
+    return v, "https://bina.azstatic.com/p.jpg"
+
+
+fake_owner28.last_reason, fake_owner28.last_desc = "", None
+mk._bina_page_json = fake_page28
+mk.bina_is_owner = fake_owner28
+mk.PAGE_DELAY = 0
+sent28 = []
+mk.notify_new_owner_msg = lambda l, n, ol="": sent28.append((l["id"], round(l.get("_age_days") or 0))) or True
+st28, seen28 = {"seeded": {}}, {}
+with contextlib.redirect_stdout(io.StringIO()) as log28:
+    n28 = mk.bina_kupca_text_pass(SRC28, seen28, st28, main_ids={"6640001"})
+check(all("hasBillOfSale" not in f_ for f_ in fv_seen28) and fv_seen28[0].get("locationIds") == ["51", "54"],
+      "second read = the same search without the Çıxarış filter (areas and other filters kept)")
+check(sent28 == [("6639973", 5)] and n28 == 1,
+      "6639973 (owner, 'Sened (kupça)', 5 days old) is announced, marked ♻️ with its age", str(sent28))
+check(seen28.get("6639973", {}).get("owner") is True and seen28["6639973"].get("kupca_text") is True,
+      "it is recorded as sent (never twice)")
+check(seen28.get("6640002", {}).get("skip") == "no-kupca" and "owner" not in seen28["6640002"],
+      "owner but no kupça in the text -> recorded, not sent, no verdict stored")
+check(seen28.get("6640003", {}).get("owner") is False, "agent -> recorded as agent")
+check("6640004" not in seen28 and "6640001" not in seen28 and "6640004" not in asked28,
+      "excluded location (Koroğlu) and ads the normal search already has are left alone")
+check(seen28.get("6000000", {}).get("skip") == "kupca-old" and "6000000" not in asked28,
+      "first run: ads older than 7 days recorded silently, their pages not opened")
+check("6640005" not in seen28 and st28.get("kupca_full_next") is True
+      and st28["seeded"].get("bina.az:kupca_text") is None,
+      "page not loaded -> not recorded; next run reads everything again (catch-up not done yet)")
+fetch_ok28["6640005"] = True
+reads28.clear(); asked28.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    mk.bina_kupca_text_pass(SRC28, seen28, st28, main_ids={"6640001"})
+check(sent28 == [("6639973", 5), ("6640005", 0)] and asked28 == ["6640005"]
+      and st28["seeded"].get("bina.az:kupca_text") and not st28.get("kupca_full_next"),
+      "run 2: the deferred ad is announced; nothing else re-opened or re-sent; catch-up done", str(sent28))
+reads28.clear(); asked28.clear()
+NODES28.insert(0, node28(6641000, 0))
+PAGES28["6641000"] = (True, "Kupçası var")
+with contextlib.redirect_stdout(io.StringIO()):
+    mk.bina_kupca_text_pass(SRC28, seen28, st28, main_ids={"6640001"})
+check(sent28[-1] == ("6641000", 0) and asked28 == ["6641000"] and reads28 == [0, 3, 6],
+      "normal run: newest pages only (stops after 3 pages with nothing new); the new ad is announced",
+      f"reads={reads28} asked={asked28}")
+
+# 6640002 (no kupça in its text) later gets the Çıxarış tick -> the normal search checks it
+PAGES28["6640002"] = (True, "Təmirli mənzil, kupçalı")
+asked28.clear()
+items28 = [mk._bina_node(node28(6640002, 1, bill=True))]
+flags28 = {"bina.az:owner_seeded": True, "bina.az:url": mk._url_fingerprint(SRC28["url"])}
+with contextlib.redirect_stdout(io.StringIO()):
+    nn28, dd28, dec28 = mk.process_new_owner_checks(items28, SRC28, seen28, flags28, tries_map={})
+    mk.process_source(items28, SRC28, seen28, skip_ids=dd28, owner_map=dec28)
+check(asked28 == ["6640002"] and sent28[-1][0] == "6640002" and seen28["6640002"].get("owner") is True
+      and "skip" not in seen28["6640002"],
+      "an ad first seen without Çıxarış that later gets the tick is checked by the normal search and sent once",
+      f"asked={asked28} rec={seen28['6640002']}")
+asked28.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    mk.process_new_owner_checks(items28, SRC28, seen28, flags28, tries_map={})
+check(asked28 == [] and [x for x, _ in sent28].count("6640002") == 1, "...and never again")
+
+# a search without the Çıxarış filter: nothing to add
+fv_seen28.clear()
+SRC28b = dict(SRC28, url=SRC28["url"].replace("has_bill_of_sale=true&", ""))
+check(mk.bina_kupca_text_pass(SRC28b, {}, {"seeded": {}}, set()) == 0 and not fv_seen28,
+      "search without Çıxarış = yes -> the extra read is skipped")
+
+# main(): the extra read runs after the normal bina work; its failure never stops a run
+m3k = load(os.path.join(HERE, "monitor.py"), "monitor_kupca_main")
+tmp3k = tempfile.mkdtemp()
+m3k.STATE_FILE = os.path.join(tmp3k, "seen.json")
+m3k.USE_API = False
+m3k.PAGE_DELAY = 0
+m3k.SOURCES = [dict(s_) for s_ in m3k.SOURCES if s_["type"] == "bina"]
+m3k.tg_send_message = lambda text: True
+m3k.tg_send_photo = lambda photo, cap: True
+m3k.fetch_for_source = lambda src: [m3k._bina_node(node28(6640001, 1, bill=True))]
+m3k.BINA_KUPCA_TEXT = True
+calls3k = []
+
+
+def _boom(session, fv, cursor):
+    calls3k.append(dict(fv))
+    raise RuntimeError("HTTP 502")
+
+
+m3k._bina_page_json = _boom
+with contextlib.redirect_stdout(io.StringIO()) as out3k:
+    m3k.main()
+st3k = json.load(open(m3k.STATE_FILE, encoding="utf-8"))
+check(calls3k and "hasBillOfSale" not in calls3k[0] and "6640001" in st3k["listings"]
+      and "kupca-in-text search failed this run" in out3k.getvalue(),
+      "main(): the kupça read runs after the normal bina scan; if bina refuses it, the run still saves")
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 sys.exit(1 if FAILS else 0)

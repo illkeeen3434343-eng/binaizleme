@@ -1,0 +1,293 @@
+diff --git a/monitor.py b/monitor.py
+index 19676e5..232ccb4 100644
+--- a/monitor.py
++++ b/monitor.py
+@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+ 
+ import requests
+ 
+-VERSION = "2026-11-24-b"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-24-c"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -277,6 +277,22 @@ BINA_RESCUE_TAGS = [x.strip() for x in os.environ.get(
+     "Qara Qarayev,Neftçilər,Xalqlar Dostluğu,Əhmədli,Həzi Aslanov,8-ci kilometr,Köhnə Günəşli"
+ ).split(",") if x.strip()]
+ BINA_TAG_MAX_PER_RUN = int(os.environ.get("BINA_TAG_MAX_PER_RUN", "30"))   # tag pages per run
++# bina ads WITHOUT the Çıxarış tick whose own text says kupça / çıxarış (user, 24 Nov
++# 2026: 6639973 "Sened (kupça)" was never seen because the search asks bina for
++# Çıxarış = yes). A second, lighter read of the same search WITHOUT the Çıxarış filter:
++# newest pages only (stops after BINA_KUPCA_QUIET_PAGES pages with nothing new), a full
++# read on the first run, after a link change and every BINA_KUPCA_FULL_HOURS. Each new
++# no-Çıxarış ad's page is opened once; owner + kupça in the text -> announced like any
++# owner ad. First run: ads placed in the last BINA_KUPCA_CATCHUP_DAYS are checked, older
++# ones recorded silently. BINA_KUPCA_TEXT=0 turns it off.
++BINA_KUPCA_TEXT = os.environ.get("BINA_KUPCA_TEXT", "1").strip() != "0"
++BINA_KUPCA_QUIET_PAGES = int(os.environ.get("BINA_KUPCA_QUIET_PAGES", "3"))
++BINA_KUPCA_MAX_CHECKS = int(os.environ.get("BINA_KUPCA_MAX_CHECKS", "40"))   # pages per run
++BINA_KUPCA_CATCHUP_DAYS = float(os.environ.get("BINA_KUPCA_CATCHUP_DAYS", "7"))
++BINA_KUPCA_FULL_HOURS = float(os.environ.get("BINA_KUPCA_FULL_HOURS", "6"))
++# records of that pass that carry no owner verdict yet: if the ad later gets the
++# Çıxarış tick it is checked by the normal flow like a brand-new ad
++_KUPCA_UNJUDGED = ("no-kupca", "kupca-old", "kupca-nolabel")
+ BINA_FETCH_RETRIES = int(os.environ.get("BINA_FETCH_RETRIES", "3"))       # per search page
+ # Reject absurd price jumps (parse glitches), but allow any realistic change.
+ PRICE_GLITCH_LOW = float(os.environ.get("PRICE_GLITCH_LOW", "0.2"))    # new < 20% of old
+@@ -2732,11 +2748,13 @@ def bina_is_owner(url):
+         elif agent_sub and not owner_sub:
+             verdict, src = False, "text"
+     bina_is_owner.last_text = None
++    bina_is_owner.last_desc = None
+     if verdict is True:
+         # bina says "mülkiyyətçi" (owner), but an agent can register as a private owner.
+         # The ad's own text decides against it only on clear agency wording (ofis haqqı,
+         # komissiya, agentlik...; Azerbaijani wording only, user 11 Nov 2026).
+         desc, dsrc = _bina_description(raw)
++        bina_is_owner.last_desc = desc or ""
+         tscore, treasons = owner_signal_score(desc or "", "", None)
+         bina_is_owner.last_text = {"source": dsrc, "chars": len(desc or ""),
+                                    "score": tscore, "reasons": treasons}
+@@ -2765,6 +2783,7 @@ def bina_is_owner(url):
+ 
+ bina_is_owner.last_reason = ""
+ bina_is_owner.last_text = None
++bina_is_owner.last_desc = None
+ 
+ 
+ OWNER_MAX_TRIES = int(os.environ.get("OWNER_MAX_TRIES", "4"))
+@@ -3083,6 +3102,179 @@ def _is_retryable(rec):
+             and rec.get("tries", 0) < OWNER_MAX_TRIES)
+ 
+ 
++def _kupca_unjudged(rec):
++    return isinstance(rec, dict) and rec.get("skip") in _KUPCA_UNJUDGED and "owner" not in rec
++
++
++_KUPCA_YES = re.compile(r"\b(?:kupca|kupcha|kubca|cixaris)\w*")
++_KUPCA_NO = re.compile(
++    r"\b(?:kupca|kupcha|kubca|cixaris)\w*?siz\b"                     # kupçasız
++    r"|\b(?:kupca|kupcha|kubca|cixaris)\w*\s+(?:hele\s+|hazirda\s+|hele\s+ki\s+|halhazirda\s+)?"
++    r"(?:yox\w*|olmayan|olmur|deyil|hazirlan\w*|alin\w*|cixarilir|cixarilma\w*|proses\w*|"
++    r"merhele\w*|gozlenil\w*|olacaq|yerine|evezine)\b"
++    r"|\bkupcaya\s+(?:dus\w*|verilib|verilecek|salin\w*|muraciet\w*)")
++
++
++def kupca_in_text(text):
++    """True when the ad's own text says it HAS a kupça / çıxarış ("Sened (kupça)",
++    "kupçalı", "çıxarış var"). Not when it says the opposite or "not yet":
++    "kupçası yoxdur", "kupçasız", "kupça hazırlanır", "kupçaya düşür"."""
++    if not text:
++        return False
++    low = str(text).lower()
++    if re.search(r"без\s+купч", low):
++        return False
++    n = az_normalize(text)
++    if _KUPCA_NO.search(n):
++        return False
++    return bool(_KUPCA_YES.search(n) or "купч" in low)
++
++
++def bina_kupca_text_pass(source, seen, state, main_ids):
++    """The second, lighter bina read: same search WITHOUT the Çıxarış filter. New ads
++    that the normal search did not return (= no Çıxarış tick) are opened once; owner +
++    kupça in the ad's own text -> announced. Returns the number announced."""
++    url = source.get("url") or ""
++    fv = dict(bina_filter_vars(url))
++    if not fv.get("hasBillOfSale"):
++        return 0                      # the search does not ask for Çıxarış: nothing to add
++    fv.pop("hasBillOfSale", None)
++    name, prefix = source["name"], source["prefix"]
++    owner_label = source.get("owner_label", "Mülkiyyətçi")
++    flags = state.setdefault("seeded", {})
++    flag = name + ":kupca_text"
++    fp = _url_fingerprint(url)
++    first = flags.get(flag) != fp
++    now_ts = time.time()
++    last_full = _to_epoch(state.get("kupca_full_at"))
++    full = (first or bool(state.get("kupca_full_next"))
++            or last_full is None or now_ts - last_full >= BINA_KUPCA_FULL_HOURS * 3600)
++    check = bina_check(url)
++    log(f"bina.az: kupca-in-text search ({'full read' if full else 'newest pages'}"
++        f"{', first run' if first else ''})")
++    session = requests.Session()
++    cursor, pages, quiet, cands, have = None, 0, 0, [], set()
++    try:
++        while pages < SCAN_PAGES:
++            payload = _bina_page_json(session, fv, cursor)
++            if payload.get("errors"):
++                msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
++                if "PersistedQueryNotFound" in msg or "PERSISTED_QUERY_NOT_FOUND" in msg:
++                    raise PersistedQueryError(msg)
++                raise RuntimeError(f"GraphQL error: {msg}")
++            conn = (payload.get("data") or {}).get("itemsConnection")
++            if not conn:
++                raise RuntimeError("no itemsConnection")
++            fresh = 0
++            for edge in conn.get("edges", []):
++                node = edge.get("node") or {}
++                if node.get("id") is None:
++                    continue
++                l = _bina_node(node)
++                iid = str(l["id"])
++                if iid in main_ids or iid in have or l.get("has_bill_of_sale") is True:
++                    continue          # the normal search has it (Çıxarış ticked)
++                if _bina_excluded_by(l) or not _bina_passes_rest(l, check):
++                    continue
++                if prefix + iid in seen:
++                    continue          # seen before (checked, or recorded silently)
++                have.add(iid)
++                cands.append(l)
++                fresh += 1
++            pages += 1
++            quiet = 0 if fresh else quiet + 1
++            info = conn.get("pageInfo") or {}
++            if not full and quiet >= BINA_KUPCA_QUIET_PAGES:
++                break
++            if not info.get("hasNextPage") or not info.get("endCursor"):
++                break
++            cursor = info["endCursor"]
++            if PAGE_DELAY:
++                time.sleep(PAGE_DELAY)
++    finally:
++        try:
++            session.close()
++        except Exception:
++            pass
++
++    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
++    tries = state.setdefault("kupca_tries", {})
++    checks = notified = quiet_old = no_kupca = agents = 0
++    fail_streak, deferred = 0, 0
++
++    def record(l, **extra):
++        cur = normalize_price(l.get("price"))
++        rec = {"url": l["url"], "price": cur, "first_seen": now, "last_seen": now,
++               "source": name, "price_history": ([{"price": cur, "date": now}] if cur else [])}
++        rec.update(extra)
++        seen[prefix + str(l["id"])] = rec
++
++    for l in cands:
++        iid = str(l["id"])
++        if first:
++            age = _listing_age_days(l)
++            if age is None or age > BINA_KUPCA_CATCHUP_DAYS:
++                record(l, skip="kupca-old")
++                quiet_old += 1
++                continue
++        if checks >= BINA_KUPCA_MAX_CHECKS or fail_streak >= OWNER_FETCH_FAIL_STREAK:
++            deferred += 1             # next run (a full read, so it is found again)
++            continue
++        owner, photo = bina_is_owner(l["url"])
++        reason = getattr(bina_is_owner, "last_reason", "")
++        desc = getattr(bina_is_owner, "last_desc", None) or ""
++        checks += 1
++        if PAGE_DELAY:
++            time.sleep(PAGE_DELAY)
++        if owner is None:
++            if reason in ("fetch", "ratelimit"):
++                fail_streak += 1
++                deferred += 1
++                continue
++            fail_streak = 0
++            n = int(tries.get(iid) or 0) + 1
++            if n >= OWNER_MAX_TRIES:
++                tries.pop(iid, None)
++                record(l, skip="kupca-nolabel")
++            else:
++                tries[iid] = n
++                deferred += 1
++            continue
++        fail_streak = 0
++        tries.pop(iid, None)
++        if not owner:
++            record(l, owner=False, kupca_pass=True)
++            agents += 1
++            continue
++        if not kupca_in_text(desc):
++            record(l, skip="no-kupca")    # owner, but no kupça in the text: not wanted
++            no_kupca += 1
++            continue
++        record(l, owner=True, kupca_text=True)
++        age, akind, posted = _bina_age(l, now_ts)
++        if age is not None and age > NEW_MAX_AGE_DAYS:
++            l["_age_days"], l["_age_kind"], l["_posted_ts"] = age, akind, posted
++        if photo:
++            l["photo"] = photo
++        log(f"bina.az: {l['url']} -> OWNER, Cixaris not ticked but the text says kupca; announced")
++        if notify_new_owner_msg(l, name, owner_label):
++            notified += 1
++    for k in list(tries):
++        if prefix + k in seen:
++            tries.pop(k, None)
++    if full and not deferred:
++        state["kupca_full_at"] = now
++    state["kupca_full_next"] = bool(deferred)
++    if first and not deferred:
++        flags[flag] = fp              # catch-up done
++    log(f"bina.az: kupca-in-text read {pages} page(s), {len(cands)} new without Cixaris: "
++        f"checked {checks}, announced {notified}, no kupca in text {no_kupca}, agents {agents}"
++        + (f", older than {BINA_KUPCA_CATCHUP_DAYS:g} days recorded silently {quiet_old}"
++           if quiet_old else "")
++        + (f", next run {deferred}" if deferred else ""))
++    return notified
++
++
+ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
+     """For a price-tracked source that should ALSO announce new OWNER posts (bina):
+     owner-check listings not yet in `seen`. MUST run before process_source seeds them.
+@@ -3109,7 +3301,7 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
+     prefix = source["prefix"]
+     now_ids = {str(l["id"]) for l in items}
+     for k in list(tries_map):
+-        if k not in now_ids or (prefix + k) in seen:
++        if k not in now_ids or ((prefix + k) in seen and not _kupca_unjudged(seen[prefix + k])):
+             tries_map.pop(k, None)
+     checks = notified = 0
+     fail_streak = 0
+@@ -3118,8 +3310,11 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
+     for l in items:
+         iid = str(l["id"])
+         key = prefix + iid
+-        if key in seen:
++        rec0 = seen.get(key)
++        if rec0 is not None and not _kupca_unjudged(rec0):
+             continue                  # already known (price-tracked or checked before)
++        # (a no-Çıxarış ad the kupça pass saw but did not judge, that now HAS the tick,
++        # is checked here like a new ad)
+         if checks >= MAX_OWNER_CHECKS or fail_streak >= OWNER_FETCH_FAIL_STREAK:
+             deferred.add(iid)         # over budget / site refusing -> retry next run
+             continue
+@@ -3150,6 +3345,8 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
+                 tries_map.pop(iid, None)
+                 log(f"{name}: {l['url']} -> no seller label after {n} reads; "
+                     "recorded without announcing")
++                if rec0 is not None:
++                    rec0["skip"] = "nolabel"
+                 continue              # NOT deferred: process_source records it once
+             tries_map[iid] = n
+             deferred.add(iid)
+@@ -3157,6 +3354,9 @@ def process_new_owner_checks(items, source, seen, seeded_flags, tries_map=None):
+         fail_streak = 0
+         tries_map.pop(iid, None)
+         decided[iid] = bool(owner)
++        if rec0 is not None:          # existing record: stamp it here (never sent twice)
++            rec0["owner"] = bool(owner)
++            rec0.pop("skip", None)
+         if not owner:
+             log(f"{name}: {l['url']} -> AGENT (not announced)")
+         if owner:
+@@ -3645,6 +3845,13 @@ def main():
+             if source.get("type") == "bina":
+                 _bina_stamp_tags(items, source, seen)
+                 _BINA_PAGE_CACHE.clear()
++                if BINA_KUPCA_TEXT:
++                    try:
++                        total_notified += bina_kupca_text_pass(
++                            source, seen, state, {str(l["id"]) for l in items})
++                    except Exception as e:
++                        log(f"bina.az: kupca-in-text search failed this run (next run "
++                            f"tries again): {str(e)[:160]}")
+         else:
+             total_notified += process_source(items, source, seen)
+ 

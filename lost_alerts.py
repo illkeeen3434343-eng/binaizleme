@@ -94,6 +94,7 @@ def read_runs(lines):
 
 
 BINA_OWNER_DONE = re.compile(r"^bina\.az: owner-checked \d+ new, announced (\d+)")
+BINA_KUPCA_START = re.compile(r"^bina\.az: kupca-in-text search")
 
 
 def analyse(run, listings):
@@ -115,6 +116,8 @@ def analyse(run, listings):
                 seg = name
         if BINA_OWNER_DONE.match(line):
             bina_phase = "price"
+        if BINA_KUPCA_START.match(line):
+            bina_phase = "owner"           # 2026-11-24-c: owner ads with kupca in the text
         mq, mg = QUEUED.match(line), GAVE_UP.match(line)
         if mq:
             queued.append(mq.group(1))

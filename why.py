@@ -35,6 +35,9 @@ def keys_for(arg):
 def explain(rec):
     if rec.get("recovered"):
         return f"SENT by recover_missed.py on {rec['recovered'][:10]} (was wrongly filed earlier)"
+    if rec.get("owner") is True and rec.get("kupca_text"):
+        return ("SENT as an owner post found by the kupca-in-text search (Cixaris not ticked "
+                "on bina, but the ad's text says kupca). Never sent twice")
     if rec.get("owner") is True:
         return ("SENT as an owner post (never sent twice). If it never arrived in Telegram, "
                 "look for 'Telegram' / 'sendPhoto' failures in the log lines below; from "
@@ -47,6 +50,13 @@ def explain(rec):
         t = rec.get("tries", rec.get("owner_tries", 0))
         return (f"UNDECIDED after {t} read(s) - the page had no clear seller signal"
                 + ("; retried up to 4 reads" if t < 4 else "; gave up"))
+    if rec.get("skip") in ("no-kupca", "kupca-old", "kupca-nolabel"):
+        how = {"no-kupca": "the owner did not tick Cixaris and the text does not say kupca / "
+                           "cixaris (or says 'kupcasi yoxdur', 'hazirlanir'...)",
+               "kupca-old": "it was older than 7 days when the kupca-in-text search started",
+               "kupca-nolabel": "its page showed no seller label after 4 reads"}[rec["skip"]]
+        return ("NOT SENT - no Cixaris tick on bina, seen by the kupca-in-text search: " + how
+                + ". If the owner later ticks Cixaris, the normal search checks it like a new ad")
     if str(rec.get("skip", "")).startswith("area"):
         how = {"area": f"its tags [{rec.get('tags', '')}] have no wanted area",
                "area-old": "it was already old when the tag check was added (2026-11-12-a)",
