@@ -1925,6 +1925,7 @@ def _fake_post(url, **kw):
 
 _rq.post = _fake_post
 time.sleep = lambda s_: slept23.append(s_)
+mt23.TG_MIN_GAP = 0
 try:
     script23[:] = [TR(429, {"ok": False, "parameters": {"retry_after": 3}}), TR(200, {"ok": True})]
     ok23 = mt23.tg_send_message("x")
@@ -1973,6 +1974,15 @@ try:
     with contextlib.redirect_stdout(io.StringIO()):
         mt23.flush_outbox()
     check(st23["outbox"] == [] and not posted23, "a message that failed OUTBOX_MAX_TRIES times is dropped (logged)")
+    mt23.TG_MIN_GAP = 3.1
+    mt23._TG_LAST["t"] = 0.0
+    slept23.clear(); posted23.clear()
+    for _i in range(3):
+        mt23.tg_send_message(f"m{_i}")
+    check(len(posted23) == 3 and len(slept23) == 2 and all(2.5 < x <= 3.1 for x in slept23),
+          "messages are paced ~3 s apart (Telegram allows ~20 a minute in a group; 23 Oct lost 25 to 429)",
+          str(slept23))
+    mt23.TG_MIN_GAP = 0
     st23["outbox"] = [{"text": "old", "photo": None, "key": "k", "n": 9,
                        "t": iso(time.time() - 8 * 86400)}]
     posted23.clear()
@@ -2082,6 +2092,8 @@ LOG27 = "\n".join([
     "Telegram error: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out.",
     "bina.az: owner-checked 2 new, announced 1, deferred 0",
     "price change 6600009: 120000 -> 110000 (-10000)",
+    "price change 6600010: 90000 -> 85000 (-5000)",
+    f"Telegram sendMessage failed: 429 {B502}",
     "Done. notified=2 saved=True(local) records_before=1 records_after=6 elapsed=400s status={}",
     f"monitor.py 2026-11-17-a starting {iso(T0 + 900)}",
     "tap.az: 30 listings", "bina: scanned 70 pages, 1100 matching listings",
@@ -2116,11 +2128,14 @@ check(v27.get("tap:49259520") == "LOST", "tap 49259520: Telegram failed right af
       str(v27))
 check("tap:49259521" not in v27, "the next tap ad (no failure after it) counts as delivered")
 check(v27.get("6637490", "").startswith("maybe") and v27.get("6637491", "").startswith("maybe"),
-      "bina: 1 failure, 2 owner ads in that run -> both 'maybe' (Telegram does not say which)")
+      "bina: 1 owner-ad failure, 2 owner ads in that run -> both 'maybe' (Telegram does not say which)")
+check("1 of 2 bina price-change alert(s) lost" in txt27,
+      "bina: a failure AFTER 'owner-checked ... announced' is a price change, not an owner ad",
+      [ln for ln in txt27.splitlines() if "price-change" in ln][:1])
 check(v27.get("6637600") == "LOST" and "6637700" not in v27,
       "bina: 1 failure, 1 owner ad in that run -> LOST; a run without failures is not listed")
-check("6600009" not in v27 and "price change 120000 -> 110000" in txt27,
-      "price-change alerts are shown but not offered for re-sending (only owner ads)")
+check("6600009" not in v27 and "6600010" not in v27,
+      "price-change alerts are counted but not offered for re-sending (only owner ads)")
 check("Owner ads whose alert was lost: 49259520 6637600" in txt27, "summary line with ids to re-send",
       txt27.strip().splitlines()[-3] if txt27.strip() else "")
 

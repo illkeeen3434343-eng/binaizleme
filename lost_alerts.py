@@ -93,14 +93,28 @@ def read_runs(lines):
     return runs
 
 
+BINA_OWNER_DONE = re.compile(r"^bina\.az: owner-checked \d+ new, announced (\d+)")
+
+
 def analyse(run, listings):
-    """(lost_by_segment, items). items: dicts with key/url/source/what/verdict."""
+    """Which alerts of this run Telegram did not take.
+
+    Order inside a run (monitor.py): tap/lalafo/yeniemlak send each owner ad right after
+    its check (tap logs "... -> OWNER" just before sending); bina first sends its new
+    owner ads, then logs "bina.az: owner-checked N new, announced M", then logs every
+    "price change" line and only THEN sends the price changes. So a failure in the bina
+    part before that summary line was an owner-ad alert, after it a price change.
+    Returns (lost, items, queued, gave_up, price_note)."""
     seg, lost, items, tap_open = "", {}, [], None
     queued, gave_up = [], []
+    bina_phase = "owner"
+    n_price, lost_price = 0, 0
     for _no, line in run["lines"]:
         for rx, name in SEGMENT:
             if rx.match(line):
                 seg = name
+        if BINA_OWNER_DONE.match(line):
+            bina_phase = "price"
         mq, mg = QUEUED.match(line), GAVE_UP.match(line)
         if mq:
             queued.append(mq.group(1))
@@ -119,15 +133,14 @@ def analyse(run, listings):
             items.append({"key": key_of_url(mv.group(2)), "url": mv.group(2), "source": mv.group(1),
                           "what": "old owner ad (VIP/Premium)", "verdict": "?"})
             tap_open = None
-        mp = PRICE.match(line)
-        if mp:
-            k = mp.group(1)
-            items.append({"key": k, "url": (listings.get(k) or {}).get("url", k), "source": seg or "?",
-                          "what": f"price change {mp.group(2)} -> {mp.group(3)}", "verdict": "?"})
+        if PRICE.match(line):
+            n_price += 1
         if FINAL_FAIL.match(line):
             if tap_open is not None and seg == "tap.az":
                 tap_open["verdict"] = "LOST"       # failed right after this ad's check
                 tap_open = None
+            elif seg == "bina.az" and bina_phase == "price":
+                lost_price += 1
             else:
                 lost[seg or "?"] = lost.get(seg or "?", 0) + 1
     # new owner ads of the other sites: decided in this run (first_seen inside the run)
@@ -155,8 +168,12 @@ def analyse(run, listings):
             elif n >= len(same):
                 it["verdict"] = "LOST"
             else:
-                it["verdict"] = f"maybe ({n} of these {len(same)} {src} alerts were lost)"
-    return lost, items, queued, gave_up
+                it["verdict"] = f"maybe ({n} of these {len(same)} {src} owner alerts were lost)"
+    price_note = ""
+    if lost_price:
+        price_note = (f"{lost_price} of {n_price} bina price-change alert(s) lost (not re-sent: "
+                      "the price has moved on; the current price is in the ad)")
+    return lost, items, queued, gave_up, price_note
 
 
 def list_lost(st):
@@ -172,7 +189,7 @@ def list_lost(st):
         has_q = any(QUEUED.match(ln) or GAVE_UP.match(ln) for _n, ln in run["lines"])
         if not n_fail and not has_q:
             continue
-        lost, items, queued, gave_up = analyse(run, listings)
+        lost, items, queued, gave_up, price_note = analyse(run, listings)
         when = baku(run["start"]) if run["start"] else "?"
         print("=" * 72)
         print(f"run {when} Baku ({run['ver']}), log line {run['first']}: "
@@ -185,8 +202,12 @@ def list_lost(st):
         if gave_up:
             print(f"   GAVE UP after many tries: {', '.join(gave_up)}")
         shown = [i for i in items if i["verdict"] != "delivered"]
-        if not shown and n_fail and not queued:
+        if price_note:
+            print("   " + price_note)
+        if not shown and not price_note and n_fail and not queued:
             print("   (no ad alert matched - probably a status message, e.g. a source warning)")
+        elif not shown and n_fail and not queued:
+            print("   no owner-ad alert lost in this run")
         for it in shown:
             if it["url"] in queued:
                 continue

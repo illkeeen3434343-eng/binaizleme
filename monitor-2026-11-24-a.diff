@@ -1,0 +1,42 @@
+diff --git a/monitor.py b/monitor.py
+index 6d9ea04..31f0871 100644
+--- a/monitor.py
++++ b/monitor.py
+@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+ 
+ import requests
+ 
+-VERSION = "2026-11-23-b"   # bump this when you deploy; printed at start of every run
++VERSION = "2026-11-24-a"   # bump this when you deploy; printed at start of every run
+ 
+ try:
+     from curl_cffi import requests as cf_requests   # Chrome-TLS client to beat bot 403s
+@@ -337,6 +337,11 @@ OUTBOX_MAX_TRIES = int(os.environ.get("OUTBOX_MAX_TRIES", "8"))
+ # = never repeat a timed-out message (no doubles, but it can be lost).
+ TG_RESEND_ON_TIMEOUT = os.environ.get("TG_RESEND_ON_TIMEOUT", "1").strip() != "0"
+ _TG_UNSURE = {"v": False}     # a send timed out after it was handed over: may have arrived
++# Telegram lets a bot post about 20 messages a minute into a group. Runs with many bina
++# price changes (57 on 23 Oct, 27 on 13 and 16 Nov 2026) hit "429 Too Many Requests" and
++# lost 25 / 7 / 5 alerts. Keeping TG_MIN_GAP seconds between two messages stays under it.
++TG_MIN_GAP = float(os.environ.get("TG_MIN_GAP", "3.1"))
++_TG_LAST = {"t": 0.0}
+ 
+ 
+ def _tg_post(method, **kw):
+@@ -348,11 +353,16 @@ def _tg_post(method, **kw):
+     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+     r = None
+     for attempt in (1, 2):
++        gap = time.time() - _TG_LAST["t"]
++        if attempt == 1 and TG_MIN_GAP > 0 and gap < TG_MIN_GAP:
++            time.sleep(TG_MIN_GAP - gap)     # pace messages (a retry has already waited)
+         try:
+             r = requests.post(url, **kw)
+         except requests.exceptions.ReadTimeout:
+             _TG_UNSURE["v"] = True
+             raise
++        finally:
++            _TG_LAST["t"] = time.time()
+         if r.status_code != 429 or attempt == 2:
+             return r
+         try:
